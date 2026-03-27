@@ -12,6 +12,7 @@ from django.db import IntegrityError, transaction
 from django.urls import reverse
 
 from .meeting_url_utils import meeting_type_from_url
+from .modal_launcher import modal_external_media_storage_credentials_available
 from .models import (
     Bot,
     BotChatMessageRequest,
@@ -171,6 +172,12 @@ def validate_external_media_storage_settings(external_media_storage_settings, pr
         return None
 
     if not project.credentials.filter(credential_type=Credentials.CredentialTypes.EXTERNAL_MEDIA_STORAGE).exists():
+        recording_upload_uri = external_media_storage_settings.get("recording_upload_uri")
+        if os.getenv("LAUNCH_BOT_METHOD") == "modal":
+            if recording_upload_uri and recording_upload_uri.startswith("r2://") and modal_external_media_storage_credentials_available("r2"):
+                return None
+            if recording_upload_uri and recording_upload_uri.startswith("s3://") and modal_external_media_storage_credentials_available("s3"):
+                return None
         relative_url = reverse("bots:project-credentials", kwargs={"object_id": project.object_id})
         settings_url = build_site_url(relative_url)
         return {"error": f"External media storage credentials are required to upload recordings to an external storage bucket. Please add external media storage credentials at {settings_url}."}

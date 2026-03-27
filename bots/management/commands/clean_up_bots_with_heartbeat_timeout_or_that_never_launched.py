@@ -35,6 +35,8 @@ class Command(BaseCommand):
             self._terminate_kubernetes_pod(bot)
         elif os.getenv("LAUNCH_BOT_METHOD") == "docker-compose-multi-host":
             self._terminate_ephemeral_docker_container(bot)
+        elif os.getenv("LAUNCH_BOT_METHOD") == "modal":
+            self._terminate_modal_call(bot)
 
     def _terminate_kubernetes_pod(self, bot):
         # Initialize kubernetes client
@@ -77,6 +79,15 @@ class Command(BaseCommand):
             pass
         except Exception as e:
             logger.warning(f"Error removing container {container_name}: {e}")
+
+    def _terminate_modal_call(self, bot):
+        from bots.modal_launcher import cancel_modal_bot
+
+        try:
+            cancel_modal_bot((bot.metadata or {}).get("modal_function_call_id"))
+            logger.info(f"Cancelled modal function call for bot {bot.id}")
+        except Exception as e:
+            logger.warning(f"Error cancelling modal function call for bot {bot.id}: {e}")
 
     def handle(self, *args, **options):
         self.terminate_bots_with_heartbeat_timeout()

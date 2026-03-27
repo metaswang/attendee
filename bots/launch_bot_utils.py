@@ -44,6 +44,11 @@ def launch_bot(bot):
         # Assign task to specific queue so that it gets picked up by a worker running in a bot launcher VM.
         run_bot_in_ephemeral_container.apply_async(args=[bot.id], queue="bot_launcher_vm")
         logger.info(f"Bot {bot.object_id} ({bot.id}) launched via run_bot_in_ephemeral_container task in queue bot_launcher_vm")
+    elif os.getenv("LAUNCH_BOT_METHOD") == "modal":
+        from .modal_launcher import launch_bot_via_modal
+
+        call_id = launch_bot_via_modal(bot)
+        logger.info(f"Bot {bot.object_id} ({bot.id}) launched via Modal function call {call_id}")
     else:
         # Default to launching bot via celery
         from .tasks.run_bot_task import run_bot

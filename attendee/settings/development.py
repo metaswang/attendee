@@ -6,16 +6,18 @@ DEBUG = True
 SITE_DOMAIN = "localhost:8000"
 ALLOWED_HOSTS = ["tendee-stripe-hooks.ngrok.io", "localhost"]
 
-DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.postgresql",
-        "NAME": "attendee_development",
-        "USER": "attendee_development_user",
-        "PASSWORD": "attendee_development_user",
-        "HOST": os.getenv("POSTGRES_HOST", "localhost"),
-        "PORT": "5432",
-    }
+_default_db = {
+    "ENGINE": "django.db.backends.postgresql",
+    "NAME": os.getenv("POSTGRES_DB", "attendee_development"),
+    "USER": os.getenv("POSTGRES_USER", "attendee_development_user"),
+    "PASSWORD": os.getenv("POSTGRES_PASSWORD", "attendee_development_user"),
+    "HOST": os.getenv("POSTGRES_HOST", "localhost"),
+    "PORT": os.getenv("POSTGRES_PORT", "5432"),
 }
+if os.getenv("POSTGRES_SSLMODE"):
+    _default_db = {**_default_db, "OPTIONS": {"sslmode": os.getenv("POSTGRES_SSLMODE")}}
+
+DATABASES = {"default": _default_db}
 
 # Log more stuff in development
 LOGGING = {

@@ -19,6 +19,7 @@ from drf_spectacular.utils import (
 from rest_framework import serializers
 
 from .automatic_leave_configuration import AutomaticLeaveConfiguration
+from .modal_launcher import parse_recording_upload_uri
 from .bot_pod_creator.bot_pod_creator import fetch_bot_pod_spec
 from .models import (
     AsyncTranscription,
@@ -1075,8 +1076,19 @@ class VoiceAgentSettingsJSONField(serializers.JSONField):
                 "type": "string",
                 "description": "Optional custom name for the recording file",
             },
+            "storage_scheme": {
+                "type": "string",
+                "description": "Normalized storage scheme derived from recording_upload_uri. Internal use.",
+            },
+            "recording_upload_uri": {
+                "type": "string",
+                "description": "Optional full output URI, e.g. r2://bucket/path/file.mp4 or s3://bucket/path/file.mp4",
+            },
         },
-        "required": ["bucket_name"],
+        "oneOf": [
+            {"required": ["bucket_name"]},
+            {"required": ["recording_upload_uri"]},
+        ],
         "additionalProperties": False,
     }
 )
@@ -1229,8 +1241,17 @@ class CreateBotSerializer(BotValidationMixin, serializers.Serializer):
             "recording_file_name": {
                 "type": "string",
             },
+            "storage_scheme": {
+                "type": "string",
+            },
+            "recording_upload_uri": {
+                "type": "string",
+            },
         },
-        "required": ["bucket_name"],
+        "oneOf": [
+            {"required": ["bucket_name"]},
+            {"required": ["recording_upload_uri"]},
+        ],
         "additionalProperties": False,
     }
 
@@ -1242,6 +1263,14 @@ class CreateBotSerializer(BotValidationMixin, serializers.Serializer):
             jsonschema.validate(instance=value, schema=self.EXTERNAL_MEDIA_STORAGE_SETTINGS_SCHEMA)
         except jsonschema.exceptions.ValidationError as e:
             raise serializers.ValidationError(e.message)
+
+        recording_upload_uri = value.get("recording_upload_uri")
+        if recording_upload_uri:
+            bucket_name, recording_file_name, storage_scheme = parse_recording_upload_uri(recording_upload_uri)
+            value["bucket_name"] = bucket_name
+            value["storage_scheme"] = storage_scheme
+            if recording_file_name:
+                value["recording_file_name"] = recording_file_name
 
         return value
 

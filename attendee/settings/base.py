@@ -13,6 +13,7 @@ https://docs.djangoproject.com/en/5.1/ref/settings/
 import copy
 import os
 from pathlib import Path
+from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
 from dotenv import load_dotenv
 
@@ -163,14 +164,36 @@ STATIC_URL = "static/"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # Redis/Celery Configuration
+# redis-py 5.x: rediss:// URLs must include ssl_cert_reqs (none | optional | required).
+# Default to none when absent so TLS works against managed Redis without local CA bundle
+# (same idea as voxella REDIS__SSL_CERT_REQS / relaxed verification for rediss).
+_redis_url = os.getenv("REDIS_URL") or ""
+_parsed_redis = urlsplit(_redis_url)
+_existing_redis_qs = parse_qs(_parsed_redis.query, keep_blank_values=False)
+_has_ssl_cert_reqs_in_url = bool(_existing_redis_qs.get("ssl_cert_reqs"))
+
 redis_params = {}
 if os.getenv("DISABLE_REDIS_SSL"):  # backward compatibility
     redis_params["ssl_cert_reqs"] = "none"
 elif os.getenv("REDIS_SSL_REQUIREMENTS"):
-    redis_params["ssl_cert_reqs"] = os.getenv("REDIS_SSL_REQUIREMENTS")
-redis_params_query_string = "&".join([f"{key}={value}" for key, value in redis_params.items()])
+    _req = os.getenv("REDIS_SSL_REQUIREMENTS", "").strip().lower()
+    _ssl_req_alias = {"cert_none": "none", "cert_optional": "optional", "cert_required": "required"}
+    redis_params["ssl_cert_reqs"] = _ssl_req_alias.get(_req, _req)
 
-REDIS_URL_WITH_PARAMS = os.getenv("REDIS_URL") + ("?" + redis_params_query_string if redis_params_query_string else "")
+if (
+    _redis_url.startswith("rediss://")
+    and "ssl_cert_reqs" not in redis_params
+    and not _has_ssl_cert_reqs_in_url
+):
+    redis_params["ssl_cert_reqs"] = "none"
+
+_merged_qs = {k: v[:] for k, v in _existing_redis_qs.items()}
+for _k, _v in redis_params.items():
+    _merged_qs[_k] = [_v]
+_new_query = urlencode(_merged_qs, doseq=True)
+REDIS_URL_WITH_PARAMS = urlunsplit(
+    (_parsed_redis.scheme, _parsed_redis.netloc, _parsed_redis.path, _new_query, _parsed_redis.fragment)
+)
 
 CELERY_BROKER_URL = REDIS_URL_WITH_PARAMS
 CELERY_RESULT_BACKEND = REDIS_URL_WITH_PARAMS
@@ -198,7 +221,7 @@ CELERY_TASK_ROUTES = {
     },
 }
 
-if os.getenv("LAUNCH_BOT_METHOD") != "kubernetes" and os.getenv("LAUNCH_BOT_METHOD") != "docker-compose-multi-host":
+if os.getenv("LAUNCH_BOT_METHOD") not in {"kubernetes", "docker-compose-multi-host", "modal"}:
     # This setting means that each celery worker process will be recreated after each task.
     # Needed because latest Zoom SDK has segfault issue unless we recreate the process after each bot.
     CELERY_WORKER_MAX_TASKS_PER_CHILD = 1
