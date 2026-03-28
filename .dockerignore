@@ -1,6 +1,10 @@
 # Created by https://www.gitignore.io
 
 venv
+.venv
+.venv/
+.venv_modal_inspect
+.venv_modal_inspect/
 env.sh
 
 ### OSX ###

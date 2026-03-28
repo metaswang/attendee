@@ -113,10 +113,10 @@ For more details, follow [this guide](https://developers.zoom.us/docs/meeting-sd
 - Edit the `.env` file and enter your AWS information.
 - Start all the services: `docker compose -f dev.docker-compose.yaml up`
 - After the services have started, run migrations in a separate terminal tab: `docker compose -f dev.docker-compose.yaml exec attendee-app-local python manage.py migrate`
-- Goto localhost:8000 in your browser and create an account
-- The confirmation link will be written to the server logs in the terminal where you ran `docker compose -f dev.docker-compose.yaml up`. Should look like `http://localhost:8000/accounts/confirm-email/<key>/`.
+- Goto localhost:8100 in your browser and create an account
+- The confirmation link will be written to the server logs in the terminal where you ran `docker compose -f dev.docker-compose.yaml up`. Should look like `http://localhost:8100/accounts/confirm-email/<key>/`.
 - Paste the link into your browser to confirm your account.
-- You should now be able to log in, input your credentials and obtain an API key. API calls should be directed to http://localhost:8000 instead of https://app.attendee.dev.
+- You should now be able to log in, input your credentials and obtain an API key. API calls should be directed to http://localhost:8100 instead of https://app.attendee.dev.
 
 
 ## Contribute 

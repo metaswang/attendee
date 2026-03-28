@@ -96,6 +96,17 @@ class GoogleMeetBotAdapter(WebBotAdapter, GoogleMeetUIMethods):
     def subclass_specific_after_bot_joined_meeting(self):
         self.after_bot_can_record_meeting()
 
+    def subclass_specific_handle_failed_to_join(self, reason):
+        if not reason:
+            return
+
+        if reason.get("method") == "google_meet_call_error_page_after_joining":
+            # Error page appeared after we were already in the meeting — treat as a disconnection
+            self.send_message_callback({"message": self.Messages.LOST_CONNECTION_AFTER_JOINING})
+        elif reason.get("method") == "google_meet_call_error_page":
+            # Error page appeared before joining — could not connect
+            self.send_message_callback({"message": self.Messages.COULD_NOT_CONNECT_TO_MEETING})
+
     def add_subclass_specific_chrome_options(self, options):
         if self.google_meet_bot_login_should_be_used:
             options.add_argument("--guest")

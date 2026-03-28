@@ -139,9 +139,20 @@ class StyleManager {
         this.silenceCheckInterval = null;
         this.memoryUsageCheckInterval = null;
         this.neededInteractionsInterval = null;
+        this.sentRemovedFromMeetingStatus = false;
+        this.sentGoogleMeetCallErrorStatus = false;
 
         // Stream used which combines the audio tracks from the meeting. Does NOT include the bot's audio
         this.meetingAudioStream = null;
+    }
+
+    googleMeetCallErrorPageIsVisible() {
+        const bodyText = document.body?.innerText || '';
+        return (
+            bodyText.includes("Couldn't start the video call because of an error") &&
+            bodyText.includes("Please try again in a few moments.") &&
+            bodyText.includes("Return to home screen")
+        );
     }
 
     addAudioTrack(audioTrack) {
@@ -215,10 +226,38 @@ class StyleManager {
         // Check if bot has been removed from the meeting
         const removedFromMeetingElement = document.querySelector('.roSPhc');
         if (removedFromMeetingElement && (removedFromMeetingElement.textContent.includes('You\'ve been removed from the meeting') || removedFromMeetingElement.textContent.includes('Your host ended the meeting for everyone'))) {
-            window.ws.sendJson({
-                type: 'MeetingStatusChange',
-                change: 'removed_from_meeting'
-            });
+            if (!this.sentRemovedFromMeetingStatus) {
+                this.sentRemovedFromMeetingStatus = true;
+                window.ws.sendJson({
+                    type: 'MeetingStatusChange',
+                    change: 'removed_from_meeting'
+                });
+            }
+        }
+
+        if (this.googleMeetCallErrorPageIsVisible() && !this.sentGoogleMeetCallErrorStatus) {
+            this.sentGoogleMeetCallErrorStatus = true;
+            if (window.userManager?.everCurrentUserInMeeting) {
+                // If we were in the meeting and then got an error page, it's likely a disconnection/crash
+                // We should report it as a failed_to_join/error instead of meeting_ended if we suspect the meeting might still be going
+                window.ws.sendJson({
+                    type: 'MeetingStatusChange',
+                    change: 'failed_to_join',
+                    reason: {
+                        method: 'google_meet_call_error_page_after_joining',
+                        message: "The meeting connection was lost due to a Google Meet error page appearing after having successfully joined."
+                    }
+                });
+            } else {
+                window.ws.sendJson({
+                    type: 'MeetingStatusChange',
+                    change: 'failed_to_join',
+                    reason: {
+                        method: 'google_meet_call_error_page',
+                        message: "Couldn't start the video call because of an error"
+                    }
+                });
+            }
         }
     }
 
@@ -814,6 +853,7 @@ class UserManager {
         this.currentUsersMap = new Map();
         this.deviceOutputMap = new Map();
         this.currentUserId = null;
+        this.everCurrentUserInMeeting = false;
 
         this.ws = ws;
     }
@@ -968,6 +1008,12 @@ class UserManager {
         }
 
         const updatedUsers = Array.from(updatedUserIds).map(id => this.currentUsersMap.get(id));
+
+        for (const user of newUsersList) {
+            if (user.isCurrentUser && user.humanized_status === 'in_meeting') {
+                this.everCurrentUserInMeeting = true;
+            }
+        }
 
         const newUsersToSend = this.removeScreenshareUsers(newUsers);
         const removedUsersToSend = this.removeScreenshareUsers(removedUsers);
@@ -2008,6 +2054,66 @@ new RTCInterceptor({
         // Log the signaling state changes
         peerConnection.addEventListener('signalingstatechange', () => {
             console.log('Signaling State:', peerConnection.signalingState);
+        });
+
+        // Monitor ICE connection state for early detection of WebRTC failures.
+        // In cloud/container environments the NAT mapping for UDP can expire, causing
+        // ICE to go disconnected/failed even though the meeting is still active.
+        // We attempt restartIce() to re-negotiate the ICE candidates without a full page reload.
+        let iceRestartTimer = null;
+        peerConnection.addEventListener('iceconnectionstatechange', () => {
+            const state = peerConnection.iceConnectionState;
+            console.log('ICE Connection State changed:', state);
+            if (window.ws && window.ws.ws && window.ws.ws.readyState === WebSocket.OPEN) {
+                window.ws.sendJson({
+                    type: 'WebRTCStatusChange',
+                    change: 'iceConnectionStateChange',
+                    state: state,
+                    everInMeeting: !!window.userManager?.everCurrentUserInMeeting,
+                });
+            }
+
+            if (state === 'disconnected') {
+                console.warn('[WebRTC] ICE disconnected – scheduling restartIce() in 4 s if not self-recovered');
+                // Give WebRTC 4 seconds to self-recover (it sends STUN binding requests automatically).
+                // If still disconnected after that, force an ICE restart. This re-gathers candidates
+                // and re-punches through NAT without needing a full page reload.
+                iceRestartTimer = setTimeout(() => {
+                    if (peerConnection.iceConnectionState === 'disconnected' || peerConnection.iceConnectionState === 'failed') {
+                        console.warn('[WebRTC] ICE still', peerConnection.iceConnectionState, '– calling restartIce()');
+                        try {
+                            peerConnection.restartIce();
+                            if (window.ws && window.ws.ws && window.ws.ws.readyState === WebSocket.OPEN) {
+                                window.ws.sendJson({ type: 'WebRTCStatusChange', change: 'iceRestartTriggered', state: peerConnection.iceConnectionState, everInMeeting: !!window.userManager?.everCurrentUserInMeeting });
+                            }
+                        } catch (e) {
+                            console.error('[WebRTC] restartIce() failed:', e);
+                        }
+                    }
+                }, 4000);
+            } else {
+                // ICE recovered (connected/completed) – cancel any pending restart
+                if (iceRestartTimer) {
+                    clearTimeout(iceRestartTimer);
+                    iceRestartTimer = null;
+                }
+                if (state === 'failed') {
+                    console.error('[WebRTC] ICE failed permanently – waiting for error page detection');
+                }
+            }
+        });
+
+        peerConnection.addEventListener('connectionstatechange', () => {
+            const state = peerConnection.connectionState;
+            console.log('Peer Connection State changed:', state);
+            if (window.ws && window.ws.ws && window.ws.ws.readyState === WebSocket.OPEN) {
+                window.ws.sendJson({
+                    type: 'WebRTCStatusChange',
+                    change: 'connectionStateChange',
+                    state: state,
+                    everInMeeting: !!window.userManager?.everCurrentUserInMeeting,
+                });
+            }
         });
 
         // Log the SDP being exchanged

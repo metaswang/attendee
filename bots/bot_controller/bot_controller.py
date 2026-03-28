@@ -189,7 +189,7 @@ class BotController:
             meeting_url=self.bot_in_db.meeting_url,
             add_video_frame_callback=None,
             wants_any_video_frames_callback=None,
-            add_mixed_audio_chunk_callback=self.add_mixed_audio_chunk_callback if self.pipeline_configuration.websocket_stream_audio else None,
+            add_mixed_audio_chunk_callback=self.add_mixed_audio_chunk_callback if self.should_consume_adapter_mixed_audio() else None,
             upsert_caption_callback=self.closed_caption_manager.upsert_caption if self.save_utterances_for_closed_captions() else None,
             upsert_chat_message_callback=self.on_new_chat_message,
             add_participant_event_callback=self.on_new_participant_event,
@@ -222,7 +222,7 @@ class BotController:
             meeting_url=self.bot_in_db.meeting_url,
             add_video_frame_callback=None,
             wants_any_video_frames_callback=None,
-            add_mixed_audio_chunk_callback=self.add_mixed_audio_chunk_callback if self.pipeline_configuration.websocket_stream_audio else None,
+            add_mixed_audio_chunk_callback=self.add_mixed_audio_chunk_callback if self.should_consume_adapter_mixed_audio() else None,
             upsert_caption_callback=self.closed_caption_manager.upsert_caption if self.save_utterances_for_closed_captions() else None,
             upsert_chat_message_callback=self.on_new_chat_message,
             add_participant_event_callback=self.on_new_participant_event,
@@ -292,7 +292,7 @@ class BotController:
             meeting_url=self.bot_in_db.meeting_url,
             add_video_frame_callback=None,
             wants_any_video_frames_callback=None,
-            add_mixed_audio_chunk_callback=self.add_mixed_audio_chunk_callback if self.pipeline_configuration.websocket_stream_audio else None,
+            add_mixed_audio_chunk_callback=self.add_mixed_audio_chunk_callback if self.should_consume_adapter_mixed_audio() else None,
             upsert_caption_callback=self.closed_caption_manager.upsert_caption if self.save_utterances_for_closed_captions() else None,
             upsert_chat_message_callback=self.on_new_chat_message,
             add_participant_event_callback=self.on_new_participant_event,
@@ -365,6 +365,23 @@ class BotController:
         )
 
     def add_mixed_audio_chunk_callback(self, chunk: bytes):
+        if not hasattr(self, "_audio_chunk_count"):
+            self._audio_chunk_count = 0
+        self._audio_chunk_count += 1
+        if self._audio_chunk_count <= 3 or self._audio_chunk_count % 500 == 0:
+            recorder_active = self.screen_and_audio_recorder is not None
+            recorder_uses_ws = recorder_active and self.screen_and_audio_recorder.uses_websocket_mixed_audio_source()
+            logger.info(
+                f"[Audio diag] add_mixed_audio_chunk_callback #{self._audio_chunk_count}: "
+                f"chunk_bytes={len(chunk)} "
+                f"screen_and_audio_recorder={'exists' if recorder_active else 'None'} "
+                f"uses_websocket_mixed_audio_source={recorder_uses_ws} "
+                f"gstreamer_pipeline={'exists' if self.gstreamer_pipeline else 'None'}"
+            )
+
+        if self.screen_and_audio_recorder and self.screen_and_audio_recorder.uses_websocket_mixed_audio_source():
+            self.screen_and_audio_recorder.add_mixed_audio_chunk(chunk)
+
         if self.gstreamer_pipeline:
             self.gstreamer_pipeline.on_mixed_audio_raw_data_received_callback(chunk)
 
@@ -551,7 +568,7 @@ class BotController:
             endpoint_url=settings.RECORDING_STORAGE_BACKEND.get("OPTIONS").get("endpoint_url"),
         )
 
-    def cleanup(self):
+    def cleanup(self, skip_seekable=False):
         if self.cleanup_called:
             logger.info("Cleanup already called, exiting")
             return
@@ -563,11 +580,13 @@ class BotController:
         def terminate_worker():
             import time
 
-            time.sleep(600)
+            # If we're doing a fast cleanup (e.g. SIGTERM), reduce the timeout significantly
+            timeout = 30 if skip_seekable else 600
+            time.sleep(timeout)
             if normal_quitting_process_worked:
                 logger.info("Normal quitting process worked, not force terminating worker")
                 return
-            logger.info("Terminating worker with hard timeout...")
+            logger.info(f"Terminating worker with hard timeout of {timeout}s...")
             os.kill(os.getpid(), signal.SIGKILL)  # Force terminate the worker process
 
         termination_thread = threading.Thread(target=terminate_worker, daemon=True)
@@ -576,6 +595,24 @@ class BotController:
         if self.gstreamer_pipeline:
             logger.info("Telling gstreamer pipeline to cleanup...")
             self.gstreamer_pipeline.cleanup()
+
+        if self.screen_and_audio_recorder:
+            logger.info("Stopping screen and audio recorder...")
+            self.screen_and_audio_recorder.stop_recording()
+            logger.info("Telling media recorder receiver to cleanup...")
+            self.screen_and_audio_recorder.cleanup(skip_seekable=skip_seekable)
+
+        if self.get_recording_file_location():
+            self.upload_recording_to_external_media_storage_if_enabled()
+
+            logger.info("Telling file uploader to upload recording file...")
+            file_uploader = self.get_file_uploader()
+            file_uploader.upload_file(self.get_recording_file_location())
+            file_uploader.wait_for_upload()
+            logger.info("File uploader finished uploading file")
+            file_uploader.delete_file(self.get_recording_file_location())
+            logger.info("File uploader deleted file from local filesystem")
+            self.recording_file_saved(file_uploader.filename)
 
         if self.rtmp_client:
             logger.info("Telling rtmp client to cleanup...")
@@ -590,10 +627,6 @@ class BotController:
         if self.main_loop and self.main_loop.is_running():
             self.main_loop.quit()
 
-        if self.screen_and_audio_recorder:
-            logger.info("Telling media recorder receiver to cleanup...")
-            self.screen_and_audio_recorder.cleanup()
-
         if self.realtime_audio_output_manager:
             logger.info("Telling realtime audio output manager to cleanup...")
             self.realtime_audio_output_manager.cleanup()
@@ -605,18 +638,6 @@ class BotController:
         if self.websocket_client_manager:
             logger.info("Telling websocket client manager to cleanup...")
             self.websocket_client_manager.cleanup()
-
-        if self.get_recording_file_location():
-            self.upload_recording_to_external_media_storage_if_enabled()
-
-            logger.info("Telling file uploader to upload recording file...")
-            file_uploader = self.get_file_uploader()
-            file_uploader.upload_file(self.get_recording_file_location())
-            file_uploader.wait_for_upload()
-            logger.info("File uploader finished uploading file")
-            file_uploader.delete_file(self.get_recording_file_location())
-            logger.info("File uploader deleted file from local filesystem")
-            self.recording_file_saved(file_uploader.filename)
 
         if self.bot_in_db.create_debug_recording():
             self.save_debug_recording()
@@ -751,6 +772,14 @@ class BotController:
     def should_create_websocket_client_manager(self):
         return self.pipeline_configuration.websocket_stream_audio or self.pipeline_configuration.websocket_stream_per_participant_audio
 
+    def should_use_adapter_mixed_audio_for_recording(self):
+        if not self.should_create_screen_and_audio_recorder():
+            return False
+        return self.pipeline_configuration.record_audio
+
+    def should_consume_adapter_mixed_audio(self):
+        return self.pipeline_configuration.websocket_stream_audio or self.should_use_adapter_mixed_audio_for_recording()
+
     def should_create_screen_and_audio_recorder(self):
         # if we're not recording audio or video and not doing rtmp streaming, then we don't need to create a screen and audio recorder
         if not self.pipeline_configuration.record_audio and not self.pipeline_configuration.record_video and not self.pipeline_configuration.rtmp_stream_audio and not self.pipeline_configuration.rtmp_stream_video:
@@ -783,6 +812,34 @@ class BotController:
             return 1  # seconds
         else:
             return 3  # seconds
+
+    def _reconnect_adapter(self):
+        """Attempt to rejoin the meeting after a mid-session WebRTC disconnection.
+
+        repeatedly_attempt_to_join_meeting() handles Chrome restart (via init_driver) internally.
+        Recording (FFmpeg) keeps running throughout – start_recording() is idempotent,
+        so the second BOT_RECORDING_PERMISSION_GRANTED during reconnect is a no-op on FFmpeg.
+        """
+        try:
+            logger.info("_reconnect_adapter: resetting adapter state flags before rejoin")
+            # Reset adapter flags so the join flow runs cleanly on the new Chrome session
+            self.adapter.left_meeting = False
+            self.adapter.could_not_connect_to_meeting = False
+            # Allow after_bot_can_record_meeting() to fire again on successful rejoin
+            self.adapter.recording_permission_granted_at = None
+
+            logger.info("_reconnect_adapter: starting rejoin thread (Chrome will be restarted by init_driver inside repeatedly_attempt_to_join_meeting)")
+            rejoin_thread = threading.Thread(target=self.adapter.repeatedly_attempt_to_join_meeting, daemon=True)
+            rejoin_thread.start()
+        except Exception as e:
+            logger.error(f"_reconnect_adapter: error launching rejoin thread: {e}")
+            # Reconnect setup failed – treat as meeting ended
+            self.flush_utterances()
+            try:
+                BotEventManager.create_event(bot=self.bot_in_db, event_type=BotEventTypes.MEETING_ENDED)
+            except Exception as create_event_error:
+                logger.error(f"_reconnect_adapter: failed to create MEETING_ENDED event: {create_event_error}")
+            self.cleanup()
 
     def run(self):
         if self.run_called:
@@ -841,11 +898,23 @@ class BotController:
             self.gstreamer_pipeline.setup()
 
         self.screen_and_audio_recorder = None
+        use_ws_mixed_audio = self.should_use_adapter_mixed_audio_for_recording()
+        logger.info(
+            f"Pipeline config: record_audio={self.pipeline_configuration.record_audio} "
+            f"record_video={self.pipeline_configuration.record_video} "
+            f"should_create_screen_and_audio_recorder={self.should_create_screen_and_audio_recorder()} "
+            f"use_websocket_mixed_audio_source={use_ws_mixed_audio} "
+            f"should_consume_adapter_mixed_audio={self.should_consume_adapter_mixed_audio()} "
+            f"mixed_audio_sample_rate={self.mixed_audio_sample_rate()}"
+        )
         if self.should_create_screen_and_audio_recorder():
             self.screen_and_audio_recorder = ScreenAndAudioRecorder(
                 file_location=self.get_recording_file_location(),
                 recording_dimensions=self.bot_in_db.recording_dimensions(),
                 audio_only=not (self.pipeline_configuration.record_video or self.pipeline_configuration.rtmp_stream_video),
+                use_websocket_mixed_audio_source=use_ws_mixed_audio,
+                websocket_mixed_audio_sample_rate=self.mixed_audio_sample_rate(),
+                websocket_mixed_audio_channels=1,
             )
 
         self.websocket_client_manager = None
@@ -936,6 +1005,10 @@ class BotController:
         redis_thread = threading.Thread(target=redis_listener, daemon=True)
         redis_thread.start()
 
+        # Track mid-session reconnect attempts (Chrome restart + rejoin) without ending the meeting
+        self._reconnect_attempt_count = 0
+        self._max_reconnect_attempts = 1
+
         # Add timeout just for audio processing
         self.first_timeout_call = True
         GLib.timeout_add(100, self.on_main_loop_timeout)
@@ -956,26 +1029,48 @@ class BotController:
             self.pubsub.close()
 
     def take_action_based_on_bot_in_db(self):
-        if self.bot_in_db.state == BotStates.JOINING:
-            logger.info("take_action_based_on_bot_in_db - JOINING")
-            BotEventManager.set_requested_bot_action_taken_at(self.bot_in_db)
-            self.adapter.init()
-        if self.bot_in_db.state == BotStates.LEAVING:
-            logger.info("take_action_based_on_bot_in_db - LEAVING")
-            BotEventManager.set_requested_bot_action_taken_at(self.bot_in_db)
-            self.adapter.leave()
-        if self.bot_in_db.state == BotStates.STAGED:
-            logger.info(f"take_action_based_on_bot_in_db - STAGED. For now, this is a no-op. join_at = {self.bot_in_db.join_at.isoformat()}")
+        try:
+            if self.bot_in_db.state == BotStates.JOINING:
+                logger.info("take_action_based_on_bot_in_db - JOINING")
+                try:
+                    BotEventManager.set_requested_bot_action_taken_at(self.bot_in_db)
+                except ValueError as e:
+                    logger.warning(f"In take_action_based_on_bot_in_db, action already taken for bot {self.bot_in_db.object_id} in state {self.bot_in_db.state}: {e}. This is likely a container restart/preemption.")
+                self.adapter.init()
+            if self.bot_in_db.state == BotStates.LEAVING:
+                logger.info("take_action_based_on_bot_in_db - LEAVING")
+                try:
+                    BotEventManager.set_requested_bot_action_taken_at(self.bot_in_db)
+                except ValueError as e:
+                    logger.warning(f"In take_action_based_on_bot_in_db, action already taken for bot {self.bot_in_db.object_id} in state {self.bot_in_db.state}: {e}. This is likely a container restart/preemption.")
+                self.adapter.leave()
+            if self.bot_in_db.state == BotStates.STAGED:
+                logger.info(f"take_action_based_on_bot_in_db - STAGED. For now, this is a no-op. join_at = {self.bot_in_db.join_at.isoformat()}")
 
-        # App session states
-        if self.bot_in_db.state == BotStates.CONNECTING:
-            logger.info("take_action_based_on_bot_in_db - CONNECTING")
-            BotEventManager.set_requested_bot_action_taken_at(self.bot_in_db)
-            self.adapter.init()
-        if self.bot_in_db.state == BotStates.DISCONNECTING:
-            logger.info("take_action_based_on_bot_in_db - DISCONNECTING")
-            BotEventManager.set_requested_bot_action_taken_at(self.bot_in_db)
-            self.adapter.disconnect()
+            # App session states
+            if self.bot_in_db.state == BotStates.CONNECTING:
+                logger.info("take_action_based_on_bot_in_db - CONNECTING")
+                try:
+                    BotEventManager.set_requested_bot_action_taken_at(self.bot_in_db)
+                except ValueError as e:
+                    logger.warning(f"In take_action_based_on_bot_in_db, action already taken for bot {self.bot_in_db.object_id} in state {self.bot_in_db.state}: {e}. This is likely a container restart/preemption.")
+                self.adapter.init()
+            if self.bot_in_db.state == BotStates.DISCONNECTING:
+                logger.info("take_action_based_on_bot_in_db - DISCONNECTING")
+                try:
+                    BotEventManager.set_requested_bot_action_taken_at(self.bot_in_db)
+                except ValueError as e:
+                    logger.warning(f"In take_action_based_on_bot_in_db, action already taken for bot {self.bot_in_db.object_id} in state {self.bot_in_db.state}: {e}. This is likely a container restart/preemption.")
+                self.adapter.disconnect()
+
+            # Handle states where the bot is already joined (e.g. after a container restart)
+            if BotEventManager.is_state_that_can_play_media(self.bot_in_db.state) or self.bot_in_db.state == BotStates.WAITING_ROOM:
+                logger.info(f"take_action_based_on_bot_in_db - Bot is in state {self.bot_in_db.state}. This is likely a container restart/preemption. Attempting to rejoin...")
+                self.adapter.init()
+        except Exception as e:
+            logger.error(f"Error in take_action_based_on_bot_in_db for bot {self.bot_in_db.object_id}: {e}")
+            logger.info(traceback.format_exc())
+            raise e
 
     def join_if_staged_and_time_to_join(self):
         if self.bot_in_db.state != BotStates.STAGED:
@@ -1104,7 +1199,7 @@ class BotController:
             self.adapter.update_closed_captions_language(self.bot_in_db.transcription_settings.google_meet_closed_captions_language())
 
     def handle_glib_shutdown(self):
-        logger.info("handle_glib_shutdown called")
+        logger.info("handle_glib_shutdown called due to SIGTERM/SIGINT")
 
         try:
             BotEventManager.create_event(
@@ -1115,7 +1210,9 @@ class BotController:
         except Exception as e:
             logger.warning(f"Error creating FATAL_ERROR event: {e}")
 
-        self.cleanup()
+        # Use skip_seekable=True when receiving a signal since we're probably being preempted or stopped
+        # and we want to ensure the recording is uploaded as fast as possible.
+        self.cleanup(skip_seekable=True)
         return False
 
     def handle_redis_message(self, message):
@@ -1703,6 +1800,27 @@ class BotController:
             self.cleanup()
             return
 
+        if message.get("message") == BotAdapter.Messages.LOST_CONNECTION_AFTER_JOINING:
+            if self._reconnect_attempt_count < self._max_reconnect_attempts:
+                self._reconnect_attempt_count += 1
+                logger.info(
+                    f"Connection lost after joining. Attempting reconnect "
+                    f"#{self._reconnect_attempt_count}/{self._max_reconnect_attempts} "
+                    f"(Chrome restart + rejoin, recording keeps running)"
+                )
+                threading.Thread(target=self._reconnect_adapter, daemon=True).start()
+                return
+
+            logger.info(
+                f"Connection lost after joining and reconnect attempts exhausted "
+                f"({self._reconnect_attempt_count}/{self._max_reconnect_attempts}). Treating as meeting ended."
+            )
+            self.flush_utterances()
+            new_bot_event = BotEventManager.create_event(bot=self.bot_in_db, event_type=BotEventTypes.MEETING_ENDED)
+            self.save_debug_artifacts(message, new_bot_event)
+            self.cleanup()
+            return
+
         if message.get("message") == BotAdapter.Messages.BLOCKED_BY_CAPTCHA:
             logger.info("Received message that captcha/verification is required to join")
             BotEventManager.create_event(
@@ -1951,6 +2069,13 @@ class BotController:
                 BotEventManager.create_event(bot=self.bot_in_db, event_type=BotEventTypes.BOT_LEFT_BREAKOUT_ROOM)
                 return
 
+            if self._reconnect_attempt_count > 0 and BotEventManager.is_state_that_can_play_media(self.bot_in_db.state):
+                logger.info(
+                    f"Received BOT_JOINED_MEETING during reconnect (state={self.bot_in_db.state}). "
+                    f"Skipping state machine event — bot is already considered joined."
+                )
+                return
+
             logger.info("Received message that bot joined meeting")
             BotEventManager.create_event(bot=self.bot_in_db, event_type=BotEventTypes.BOT_JOINED_MEETING)
             return
@@ -1971,7 +2096,15 @@ class BotController:
             logger.info("Received message that bot recording permission granted")
 
             # The internal pipeline needs to start or resume recording.
+            # During reconnect start_recording is idempotent (FFmpeg already running).
             self.start_or_resume_recording_for_pipeline_objects_raise_on_failure()
+
+            if self._reconnect_attempt_count > 0 and BotEventManager.is_state_that_can_play_media(self.bot_in_db.state):
+                logger.info(
+                    f"Received BOT_RECORDING_PERMISSION_GRANTED during reconnect (state={self.bot_in_db.state}). "
+                    f"Skipping state machine event — recording already in progress."
+                )
+                return
 
             BotEventManager.create_event(
                 bot=self.bot_in_db,

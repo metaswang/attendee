@@ -112,6 +112,7 @@ class WebBotAdapter(BotAdapter):
         self.ready_to_send_chat_messages = False
 
         self.recording_paused = False
+        self.could_not_connect_to_meeting = False
 
     def pause_recording(self):
         self.recording_paused = True
@@ -231,11 +232,20 @@ class WebBotAdapter(BotAdapter):
             # Convert float32 to PCM 16-bit by multiplying by 32768.0
             audio_data = (audio_data * 32768.0).astype(np.int16)
 
-            # Only mark last_audio_message_processed_time if the audio data has at least one non-zero value
-            if np.any(audio_data):
-                self.last_audio_message_processed_time = time.time()
-
-            if (self.wants_any_video_frames_callback is None or self.wants_any_video_frames_callback()) and self.send_frames:
+            can_send = (self.wants_any_video_frames_callback is None or self.wants_any_video_frames_callback()) and self.send_frames
+            if not hasattr(self, "_mixed_audio_frame_count"):
+                self._mixed_audio_frame_count = 0
+            self._mixed_audio_frame_count += 1
+            if self._mixed_audio_frame_count <= 3 or self._mixed_audio_frame_count % 500 == 0:
+                has_audio = bool(np.any(audio_data))
+                logger.info(
+                    f"[Audio diag] process_mixed_audio_frame #{self._mixed_audio_frame_count}: "
+                    f"samples={len(audio_data)} has_nonzero={has_audio} "
+                    f"can_send={can_send} send_frames={self.send_frames} "
+                    f"recording_paused={self.recording_paused} "
+                    f"callback={'set' if self.add_mixed_audio_chunk_callback else 'None'}"
+                )
+            if can_send:
                 self.add_mixed_audio_chunk_callback(chunk=audio_data.tobytes())
 
     def process_per_participant_audio_frame(self, message):
@@ -285,6 +295,9 @@ class WebBotAdapter(BotAdapter):
             self.only_one_participant_in_meeting_at = None
 
     def handle_removed_from_meeting(self):
+        if self.could_not_connect_to_meeting:
+            logger.info("Ignoring removed_from_meeting because we already handled could_not_connect_to_meeting")
+            return
         self.left_meeting = True
         self.send_message_callback({"message": self.Messages.MEETING_ENDED})
 
@@ -294,6 +307,7 @@ class WebBotAdapter(BotAdapter):
 
     def handle_failed_to_join(self, reason):
         logger.info(f"failed to join meeting with reason {reason}")
+        self.could_not_connect_to_meeting = True
         self.subclass_specific_handle_failed_to_join(reason)
 
     def handle_caption_update(self, json_data):
@@ -380,6 +394,14 @@ class WebBotAdapter(BotAdapter):
                             if json_data.get("change") == "ready_to_send":
                                 self.ready_to_send_chat_messages = True
                                 self.send_message_callback({"message": self.Messages.READY_TO_SEND_CHAT_MESSAGE})
+
+                        elif json_data.get("type") == "WebRTCStatusChange":
+                            change = json_data.get("change")
+                            state = json_data.get("state")
+                            ever_in_meeting = json_data.get("everInMeeting", False)
+                            logger.info(
+                                f"[WebRTC] {change}: state={state} everInMeeting={ever_in_meeting}"
+                            )
 
                         elif json_data.get("type") == "MeetingStatusChange":
                             if json_data.get("change") == "removed_from_meeting":
@@ -563,6 +585,16 @@ class WebBotAdapter(BotAdapter):
         options.add_argument("--disable-blink-features=AutomationControlled")
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
 
+        # WebRTC stability in container/cloud environments:
+        # Restrict ICE candidates to the default public network interface to avoid
+        # advertising container-internal addresses that become unreachable from Google's servers.
+        options.add_argument("--webrtc-ip-handling-policy=default_public_interface_only")
+        # Allow WebRTC to gather TCP candidates in addition to UDP.
+        # If the cloud NAT drops the UDP mapping, Chrome can fall back to TCP via Google's TURN relays.
+        options.add_argument("--enable-webrtc-srtp-aes-gcm")
+        # Prevent Chrome's network quality estimator from aggressively throttling WebRTC on "slow" links
+        options.add_argument("--disable-features=WebRtcHideLocalIpsWithMdns")
+
         if os.getenv("ENABLE_CHROME_SANDBOX", "false").lower() != "true":
             options.add_argument("--no-sandbox")
             options.add_argument("--disable-setuid-sandbox")
@@ -594,7 +626,13 @@ class WebBotAdapter(BotAdapter):
         self.driver = webdriver.Chrome(options=options, service=Service(executable_path="/usr/local/bin/chromedriver"))
         logger.info(f"web driver server initialized at port {self.driver.service.port}")
 
-        initial_data_code = f"window.initialData = {{websocketPort: {self.websocket_port}, videoFrameWidth: {self.video_frame_size[0]}, videoFrameHeight: {self.video_frame_size[1]}, botName: {json.dumps(self.display_name)}, addClickRipple: {'true' if self.should_create_debug_recording else 'false'}, recordingView: '{self.recording_view}', sendMixedAudio: {'true' if self.add_mixed_audio_chunk_callback else 'false'}, sendPerParticipantAudio: {'true' if self.add_audio_chunk_callback else 'false'}, collectCaptions: {'true' if self.upsert_caption_callback else 'false'}, recordParticipantSpeechStartStopEvents: {'true' if self.record_participant_speech_start_stop_events else 'false'}}}"
+        send_mixed_audio = bool(self.add_mixed_audio_chunk_callback)
+        send_per_participant_audio = bool(self.add_audio_chunk_callback)
+        logger.info(
+            f"[Audio diag] init_driver: sendMixedAudio={send_mixed_audio} sendPerParticipantAudio={send_per_participant_audio} "
+            f"add_mixed_audio_chunk_callback={'set' if self.add_mixed_audio_chunk_callback else 'None'}"
+        )
+        initial_data_code = f"window.initialData = {{websocketPort: {self.websocket_port}, videoFrameWidth: {self.video_frame_size[0]}, videoFrameHeight: {self.video_frame_size[1]}, botName: {json.dumps(self.display_name)}, addClickRipple: {'true' if self.should_create_debug_recording else 'false'}, recordingView: '{self.recording_view}', sendMixedAudio: {'true' if send_mixed_audio else 'false'}, sendPerParticipantAudio: {'true' if send_per_participant_audio else 'false'}, collectCaptions: {'true' if self.upsert_caption_callback else 'false'}, recordParticipantSpeechStartStopEvents: {'true' if self.record_participant_speech_start_stop_events else 'false'}}}"
 
         # Define the CDN libraries needed
         CDN_LIBRARIES = ["https://cdnjs.cloudflare.com/ajax/libs/protobufjs/7.4.0/protobuf.min.js", "https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js"]
@@ -812,11 +850,14 @@ class WebBotAdapter(BotAdapter):
         screenshot_path_right_before_leave = None
         mhtml_file_path_right_before_leave = None
         try:
-            logger.info("disable media sending")
-            self.driver.execute_script("window.ws?.disableMediaSending();")
+            if self.driver:
+                logger.info("disable media sending")
+                self.driver.execute_script("window.ws?.disableMediaSending();")
 
-            screenshot_path_right_before_leave, mhtml_file_path_right_before_leave, _ = self.capture_screenshot_and_mhtml_file()
-            self.click_leave_button()
+                screenshot_path_right_before_leave, mhtml_file_path_right_before_leave, _ = self.capture_screenshot_and_mhtml_file()
+                self.click_leave_button()
+            else:
+                logger.info("Driver is None, skipping leave logic")
         except Exception as e:
             logger.warning(f"Error during leave: {e}")
         finally:
@@ -841,7 +882,8 @@ class WebBotAdapter(BotAdapter):
 
         try:
             logger.info("disable media sending")
-            self.driver.execute_script("window.ws?.disableMediaSending();")
+            if self.driver:
+                self.driver.execute_script("window.ws?.disableMediaSending();")
         except Exception as e:
             logger.warning(f"Error during media sending disable: {e}")
 

@@ -79,6 +79,19 @@ Modal function `run_bot_on_modal` 支持这些参数：
 
 服务端在 `launch_bot()` 时会把这些值一并传给 Modal，用于运行前校正 bot 配置与外部存储凭证。
 
+容器资源与并发策略由 `.env.modal` 控制：
+
+- `MODAL_BOT__CPU`
+- `MODAL_BOT__MAX_UPTIME_SECONDS`
+- `MODAL_BOT__MAX_CONTAINERS`
+
+当前约束：
+
+- 单个 container 只处理一个会议：`single_use_containers=True`
+- 默认 CPU: `1`
+- 并发时通过 scale out 新 container 处理
+- 最大 container 数: `50`
+
 ## 5. 实验命令
 
 为验证完整 launch 流程，新增实验命令：

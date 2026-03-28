@@ -22,6 +22,7 @@ class BotAdapter:
         LOGIN_REQUIRED = "Login required"
         LOGIN_ATTEMPT_FAILED = "Login attempt failed"
         COULD_NOT_CONNECT_TO_MEETING = "Could not connect to meeting"
+        LOST_CONNECTION_AFTER_JOINING = "Lost connection to meeting after successfully joining"
         BLOCKED_BY_CAPTCHA = "Blocked by captcha"
         JOINING_BREAKOUT_ROOM = "Joining breakout room"
         LEAVING_BREAKOUT_ROOM = "Leaving breakout room"

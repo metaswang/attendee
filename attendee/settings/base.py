@@ -17,9 +17,11 @@ from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
 from dotenv import load_dotenv
 
+from modal_settings import ModalSettings
 from attendee.sentry import init_sentry
 
 load_dotenv()
+ModalSettings.from_env().apply_sdk_auth_env()
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent.parent

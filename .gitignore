@@ -95,6 +95,7 @@ __pycache__/
 local_settings.py
 
 .env
+.env.modal
 db.sqlite3
 
 custom/

@@ -1,5 +1,6 @@
 services:
   attendee-worker-local:
+    platform: linux/amd64
     build: ./
     env_file:
       - .env
@@ -13,6 +14,7 @@ services:
     command: "celery -A attendee worker -l INFO"
 
   attendee-scheduler-local:
+    platform: linux/amd64
     build: ./
     env_file:
       - .env
@@ -22,10 +24,10 @@ services:
       - attendee_network
     environment:
       DJANGO_SETTINGS_MODULE: attendee.settings.development
-    command: "python manage.py run_scheduler"
-    entrypoint: []
+    command: "uv run python manage.py run_scheduler"
 
   attendee-app-local:
+    platform: linux/amd64
     build: ./
     env_file:
       - .env
@@ -34,15 +36,15 @@ services:
     networks:
       - attendee_network
     ports:
-      - "8000:8000"
+      - "8100:8100" 
     environment:
       DJANGO_SETTINGS_MODULE: attendee.settings.development
     command: >-
-      sh -c "python manage.py migrate --noinput &&
-      python manage.py runserver 0.0.0.0:8000"
-    entrypoint: []
+      sh -c "uv run python manage.py migrate --noinput &&
+      uv run python manage.py runserver 0.0.0.0:8100"
 
   attendee-webpage-streamer-local:
+    platform: linux/amd64
     build: ./
     env_file:
       - .env
@@ -51,11 +53,11 @@ services:
     networks:
       - attendee_network
     ports:
-      - "8001:8000"
+      - "8001:8100"
     environment:
       DJANGO_SETTINGS_MODULE: attendee.settings.development
       ENABLE_CHROME_SANDBOX: "true"
-    command: "python bots/webpage_streamer/run_webpage_streamer.py"
+    command: "uv run python bots/webpage_streamer/run_webpage_streamer.py"
     security_opt:
       - seccomp=./bots/web_bot_adapter/chrome_seccomp.json
     profiles:

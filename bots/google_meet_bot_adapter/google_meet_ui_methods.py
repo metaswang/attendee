@@ -282,6 +282,11 @@ class GoogleMeetUIMethods:
                 self.click_others_may_see_your_meeting_differently_button("click_captions_button")
                 self.check_if_waiting_room_timeout_exceeded(waiting_room_timeout_started_at, "click_captions_button")
 
+                current_user = next((participant for participant in self.participants_info.values() if participant.get("isCurrentUser")), None)
+                if current_user and current_user.get("active"):
+                    logger.info("Captions button not found, but bot is already marked in_meeting via websocket. Continuing join flow without enabling captions.")
+                    return
+
                 last_check_timed_out = attempt_to_look_for_captions_button_index == num_attempts_to_look_for_captions_button - 1
                 if last_check_timed_out:
                     self.look_for_asking_to_be_let_in_element_after_waiting_period_expired("click_captions_button")
