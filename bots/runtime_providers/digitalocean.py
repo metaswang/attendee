@@ -105,7 +105,7 @@ class DigitalOceanDropletProvider:
             "  - mkdir -p /etc/attendee\n"
             "write_files:\n"
             "  - path: /etc/attendee/runtime.env\n"
-            "    permissions: '0600'\n"
+            "    permissions: '0644'\n"
             "    owner: root:root\n"
             "    content: |\n"
             f"      {env_contents}\n"

@@ -6,6 +6,11 @@ BOT_RUNTIME_IMAGE="${BOT_RUNTIME_IMAGE:-attendee-bot-runner:latest}"
 BOT_RUNTIME_CONTAINER_NAME_PREFIX="${BOT_RUNTIME_CONTAINER_NAME_PREFIX:-attendee-bot}"
 ATTENDEE_CONTAINER_WORKDIR="${ATTENDEE_CONTAINER_WORKDIR:-/attendee}"
 METADATA_URL="${DROPLET_METADATA_ID_URL:-http://169.254.169.254/metadata/v1/id}"
+RUNNER_LOG_DIR="${RUNNER_LOG_DIR:-/var/log/attendee}"
+RUNNER_LOG_PATH="${RUNNER_LOG_PATH:-${RUNNER_LOG_DIR}/runner.log}"
+CONTAINER_LOG_PATH="${CONTAINER_LOG_PATH:-${RUNNER_LOG_DIR}/container.log}"
+RUNNER_STATE_PATH="${RUNNER_STATE_PATH:-${RUNNER_LOG_DIR}/state.log}"
+LOG_TAIL_LINES="${LOG_TAIL_LINES:-120}"
 
 if [[ -f "$RUNTIME_ENV_PATH" ]]; then
   set -a
@@ -14,17 +19,37 @@ if [[ -f "$RUNTIME_ENV_PATH" ]]; then
   set +a
 fi
 
+mkdir -p "$RUNNER_LOG_DIR"
+touch "$RUNNER_LOG_PATH" "$CONTAINER_LOG_PATH" "$RUNNER_STATE_PATH"
+
+timestamp() {
+  date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
+log_runner() {
+  printf '%s %s\n' "$(timestamp)" "$*" | tee -a "$RUNNER_LOG_PATH" >&2
+}
+
+json_escape() {
+  python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'
+}
+
 if [[ -z "${BOT_ID:-}" ]]; then
-  echo "BOT_ID is required" >&2
+  log_runner "BOT_ID is required"
   exit 1
 fi
 
 if ! command -v docker >/dev/null 2>&1; then
-  echo "docker is required" >&2
+  log_runner "docker is required"
   exit 1
 fi
 
 CONTAINER_NAME="${BOT_RUNTIME_CONTAINER_NAME_PREFIX}-${BOT_ID}"
+CONTAINER_ENV_PATH="${CONTAINER_ENV_PATH:-${RUNNER_LOG_DIR}/runtime.env}"
+log_runner "Starting runner for bot ${BOT_ID} with image ${BOT_RUNTIME_IMAGE}"
+
+cp "$RUNTIME_ENV_PATH" "$CONTAINER_ENV_PATH"
+chmod 0644 "$CONTAINER_ENV_PATH"
 
 set +e
 docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
@@ -32,21 +57,44 @@ docker run \
   --rm \
   --name "$CONTAINER_NAME" \
   --network host \
+  --user root \
   --security-opt seccomp=unconfined \
   --shm-size=1g \
-  -v "$RUNTIME_ENV_PATH:/run/attendee/runtime.env:ro" \
+  -v "$CONTAINER_ENV_PATH:/run/attendee/runtime.env:ro" \
   "$BOT_RUNTIME_IMAGE" \
-  bash -lc "set -a; source /run/attendee/runtime.env; set +a; cd \"$ATTENDEE_CONTAINER_WORKDIR\"; python manage.py run_bot --botid \"$BOT_ID\""
+  bash -lc "set -euo pipefail; set -a; source /run/attendee/runtime.env; set +a; cd \"$ATTENDEE_CONTAINER_WORKDIR\"; export DJANGO_SETTINGS_MODULE=\"\${DJANGO_SETTINGS_MODULE:-attendee.settings.production}\"; exec python manage.py run_bot --botid \"$BOT_ID\"" \
+  2>&1 | tee -a "$CONTAINER_LOG_PATH"
 EXIT_CODE=$?
 set -e
+
+printf '%s exit_code=%s\n' "$(timestamp)" "$EXIT_CODE" >> "$RUNNER_STATE_PATH"
+log_runner "Container finished with exit_code=${EXIT_CODE}"
 
 DROPLET_ID=""
 if command -v curl >/dev/null 2>&1; then
   DROPLET_ID="$(curl -fsS --max-time 2 "$METADATA_URL" || true)"
 fi
 
+FINAL_STATE="succeeded"
+if [[ "$EXIT_CODE" -ne 0 ]]; then
+  FINAL_STATE="failed"
+fi
+
+LOG_TAIL="$(tail -n "$LOG_TAIL_LINES" "$CONTAINER_LOG_PATH" 2>/dev/null || true)"
+if [[ -z "$LOG_TAIL" ]]; then
+  LOG_TAIL="$(tail -n "$LOG_TAIL_LINES" "$RUNNER_LOG_PATH" 2>/dev/null || true)"
+fi
+
 if [[ -n "${LEASE_CALLBACK_URL:-}" && -n "${LEASE_SHUTDOWN_TOKEN:-}" ]]; then
-  CALLBACK_PAYLOAD="$(printf '{"bot_id":"%s","droplet_id":"%s","exit_code":%s,"reason":"process_exit"}' "${BOT_ID}" "${DROPLET_ID}" "${EXIT_CODE}")"
+  LOG_TAIL_JSON="$(printf '%s' "$LOG_TAIL" | json_escape)"
+  CALLBACK_PAYLOAD="$(printf '{"bot_id":"%s","droplet_id":"%s","exit_code":%s,"final_state":"%s","reason":"process_exit","log_tail":%s,"runner_log_path":"%s","container_log_path":"%s"}' \
+    "${BOT_ID}" \
+    "${DROPLET_ID}" \
+    "${EXIT_CODE}" \
+    "${FINAL_STATE}" \
+    "${LOG_TAIL_JSON}" \
+    "${RUNNER_LOG_PATH}" \
+    "${CONTAINER_LOG_PATH}")"
   curl -fsS \
     -X POST \
     -H "Authorization: Bearer ${LEASE_SHUTDOWN_TOKEN}" \

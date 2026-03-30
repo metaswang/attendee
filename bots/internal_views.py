@@ -1,5 +1,6 @@
 import json
 import logging
+from textwrap import shorten
 
 from django.http import HttpResponseNotAllowed, JsonResponse
 from django.utils.decorators import method_decorator
@@ -49,13 +50,24 @@ class BotRuntimeLeaseCompletionView(View):
             lease.mark_failed(str(exc))
             return JsonResponse({"error": "Failed to delete runtime instance", "details": str(exc)}, status=502)
 
+        exit_code = payload.get("exit_code")
+        final_state = payload.get("final_state")
+        reason = payload.get("reason")
+        log_tail = (payload.get("log_tail") or "").strip()
+        if exit_code not in (None, 0) or final_state == "failed":
+            summary_parts = [f"exit_code={exit_code}", f"final_state={final_state}", f"reason={reason}"]
+            if log_tail:
+                summary_parts.append(f"log_tail={log_tail}")
+            lease.last_error = shorten(" | ".join(summary_parts), width=4000, placeholder="...")
+            lease.save(update_fields=["last_error", "updated_at"])
+
         logger.info(
             "Lease %s completion accepted for bot %s with exit_code=%s final_state=%s reason=%s",
             lease.id,
             lease.bot.object_id,
-            payload.get("exit_code"),
-            payload.get("final_state"),
-            payload.get("reason"),
+            exit_code,
+            final_state,
+            reason,
         )
         return JsonResponse({"status": lease.status, "provider_instance_id": lease.provider_instance_id})
 

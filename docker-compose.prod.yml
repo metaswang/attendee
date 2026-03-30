@@ -24,6 +24,34 @@ services:
     expose:
       - "8000"
 
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: attendee-worker
+    restart: unless-stopped
+    env_file:
+      - scripts/digitalocean/myvps.env
+    environment:
+      DJANGO_SETTINGS_MODULE: attendee.settings.production
+      ENABLE_CHROME_SANDBOX: "false"
+      PYTHONUNBUFFERED: "1"
+    command: /opt/venv/bin/celery -A attendee worker -l INFO
+
+  scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: attendee-scheduler
+    restart: unless-stopped
+    env_file:
+      - scripts/digitalocean/myvps.env
+    environment:
+      DJANGO_SETTINGS_MODULE: attendee.settings.production
+      PYTHONUNBUFFERED: "1"
+    entrypoint: []
+    command: /opt/venv/bin/python manage.py run_scheduler
+
   nginx:
     image: nginx:1.27-alpine
     container_name: attendee-nginx
@@ -36,4 +64,3 @@ services:
     volumes:
       - ./deploy/nginx/meetbot.conf:/etc/nginx/conf.d/default.conf:ro
       - ./deploy/nginx/ssl:/etc/nginx/ssl:ro
-
