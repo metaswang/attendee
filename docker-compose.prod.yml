@@ -1,0 +1,39 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: attendee-app
+    restart: unless-stopped
+    env_file:
+      - scripts/digitalocean/myvps.env
+    environment:
+      DJANGO_SETTINGS_MODULE: attendee.settings.production
+      ENABLE_CHROME_SANDBOX: "false"
+      PYTHONUNBUFFERED: "1"
+    command: >
+      bash -lc "
+      /opt/venv/bin/python manage.py collectstatic --noinput &&
+      /opt/venv/bin/gunicorn attendee.wsgi:application
+      --bind 0.0.0.0:8000
+      --workers 3
+      --timeout 120
+      --access-logfile -
+      --error-logfile -
+      "
+    expose:
+      - "8000"
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: attendee-nginx
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/nginx/meetbot.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./deploy/nginx/ssl:/etc/nginx/ssl:ro
+

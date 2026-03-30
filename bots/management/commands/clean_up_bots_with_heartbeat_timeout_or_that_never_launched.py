@@ -9,6 +9,7 @@ from django.utils import timezone
 from kubernetes import client, config
 
 from bots.models import Bot, BotEventManager, BotEventSubTypes, BotEventTypes
+from bots.runtime_providers import get_runtime_provider
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,8 @@ class Command(BaseCommand):
         # There isn't really a safe way to terminate the bot if it's running as a celery task
         if os.getenv("LAUNCH_BOT_METHOD") == "kubernetes":
             self._terminate_kubernetes_pod(bot)
+        elif os.getenv("LAUNCH_BOT_METHOD") == "digitalocean-droplet":
+            self._terminate_digitalocean_droplet(bot)
         elif os.getenv("LAUNCH_BOT_METHOD") == "docker-compose-multi-host":
             self._terminate_ephemeral_docker_container(bot)
 
@@ -77,6 +80,16 @@ class Command(BaseCommand):
             pass
         except Exception as e:
             logger.warning(f"Error removing container {container_name}: {e}")
+
+    def _terminate_digitalocean_droplet(self, bot):
+        lease = getattr(bot, "runtime_lease", None)
+        if lease is None:
+            return
+        try:
+            provider = get_runtime_provider(lease.provider)
+            provider.delete_lease(lease)
+        except Exception as e:
+            logger.warning(f"Error deleting DigitalOcean Droplet for bot {bot.object_id}: {e}")
 
     def handle(self, *args, **options):
         self.terminate_bots_with_heartbeat_timeout()

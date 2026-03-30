@@ -1,0 +1,65 @@
+import json
+import logging
+
+from django.http import HttpResponseNotAllowed, JsonResponse
+from django.utils.decorators import method_decorator
+from django.views import View
+from django.views.decorators.csrf import csrf_exempt
+
+from bots.models import BotRuntimeLease
+from bots.runtime_providers import get_runtime_provider
+
+logger = logging.getLogger(__name__)
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class BotRuntimeLeaseCompletionView(View):
+    http_method_names = ["post"]
+
+    def post(self, request, lease_id: int):
+        try:
+            lease = BotRuntimeLease.objects.select_related("bot").get(id=lease_id)
+        except BotRuntimeLease.DoesNotExist:
+            return JsonResponse({"error": "Lease not found"}, status=404)
+
+        auth_header = request.headers.get("Authorization", "")
+        expected_auth_header = f"Bearer {lease.shutdown_token}"
+        if auth_header != expected_auth_header:
+            return JsonResponse({"error": "Unauthorized"}, status=401)
+
+        try:
+            payload = json.loads(request.body.decode("utf-8") or "{}")
+        except json.JSONDecodeError:
+            return JsonResponse({"error": "Invalid JSON body"}, status=400)
+
+        droplet_id = str(payload.get("droplet_id") or "").strip()
+        if droplet_id and lease.provider_instance_id and droplet_id != lease.provider_instance_id:
+            return JsonResponse({"error": "droplet_id does not match lease"}, status=400)
+
+        provider = get_runtime_provider(lease.provider)
+
+        if droplet_id and not lease.provider_instance_id:
+            lease.provider_instance_id = droplet_id
+            lease.save(update_fields=["provider_instance_id", "updated_at"])
+
+        try:
+            provider.delete_lease(lease)
+        except Exception as exc:
+            logger.exception("Failed to delete runtime lease %s for bot %s", lease.id, lease.bot.object_id)
+            lease.mark_failed(str(exc))
+            return JsonResponse({"error": "Failed to delete runtime instance", "details": str(exc)}, status=502)
+
+        logger.info(
+            "Lease %s completion accepted for bot %s with exit_code=%s final_state=%s reason=%s",
+            lease.id,
+            lease.bot.object_id,
+            payload.get("exit_code"),
+            payload.get("final_state"),
+            payload.get("reason"),
+        )
+        return JsonResponse({"status": lease.status, "provider_instance_id": lease.provider_instance_id})
+
+    def dispatch(self, request, *args, **kwargs):
+        if request.method.lower() != "post":
+            return HttpResponseNotAllowed(["POST"])
+        return super().dispatch(request, *args, **kwargs)

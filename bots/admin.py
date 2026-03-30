@@ -9,7 +9,7 @@ from django.db.models.functions import Extract
 from django.utils import timezone
 from django.utils.html import format_html
 
-from .models import Bot, BotEvent, Calendar, CalendarEvent, CalendarNotificationChannel, Utterance, WebhookDeliveryAttempt, WebhookSubscription
+from .models import Bot, BotEvent, BotRuntimeLease, Calendar, CalendarEvent, CalendarNotificationChannel, Utterance, WebhookDeliveryAttempt, WebhookSubscription
 
 
 # Create an inline for BotEvent to show on the Bot admin page
@@ -132,6 +132,37 @@ class BotAdmin(admin.ModelAdmin):
         ("Settings", {"fields": ("settings",)}),
         ("Metadata", {"fields": ("created_at", "updated_at", "version")}),
     )
+
+
+@admin.register(BotRuntimeLease)
+class BotRuntimeLeaseAdmin(admin.ModelAdmin):
+    list_display = ("id", "bot", "provider", "status", "provider_instance_id", "region", "updated_at")
+    list_filter = ("provider", "status", "region")
+    search_fields = ("bot__object_id", "provider_instance_id", "provider_name")
+    readonly_fields = (
+        "bot",
+        "provider",
+        "status",
+        "provider_instance_id",
+        "provider_name",
+        "region",
+        "size_class",
+        "snapshot_id",
+        "shutdown_token",
+        "metadata",
+        "last_error",
+        "created_at",
+        "updated_at",
+        "active_at",
+        "delete_requested_at",
+        "deleted_at",
+    )
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
 
 
 @admin.register(WebhookDeliveryAttempt)

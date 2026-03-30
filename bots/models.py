@@ -541,6 +541,18 @@ class SessionTypes(models.IntegerChoices):
     APP_SESSION = 2, "App Session"
 
 
+class BotRuntimeProviderTypes(models.TextChoices):
+    DIGITALOCEAN_DROPLET = "digitalocean_droplet", "DigitalOcean Droplet"
+
+
+class BotRuntimeLeaseStatuses(models.TextChoices):
+    PROVISIONING = "provisioning", "Provisioning"
+    ACTIVE = "active", "Active"
+    DELETE_REQUESTED = "delete_requested", "Delete Requested"
+    DELETED = "deleted", "Deleted"
+    FAILED = "failed", "Failed"
+
+
 class TranscriptionSettings:
     def __init__(self, settings: dict):
         self._settings = settings or {}
@@ -1026,6 +1038,9 @@ class Bot(models.Model):
     def ephemeral_container_name(self):
         return f"bot-{self.id}-{self.object_id}".lower().replace("_", "-")
 
+    def digitalocean_droplet_name(self):
+        return f"attendee-bot-{self.id}-{self.object_id}".lower().replace("_", "-")[:64]
+
     def k8s_pod_name(self):
         return f"bot-pod-{self.id}-{self.object_id}".lower().replace("_", "-")
 
@@ -1049,6 +1064,52 @@ class Bot(models.Model):
         constraints = [
             models.UniqueConstraint(fields=["project", "deduplication_key"], name="unique_bot_deduplication_key", condition=~models.Q(state__in=BotStates.post_meeting_states())),
         ]
+
+
+class BotRuntimeLease(models.Model):
+    bot = models.OneToOneField(Bot, on_delete=models.CASCADE, related_name="runtime_lease")
+    provider = models.CharField(max_length=64, choices=BotRuntimeProviderTypes.choices)
+    status = models.CharField(max_length=32, choices=BotRuntimeLeaseStatuses.choices, default=BotRuntimeLeaseStatuses.PROVISIONING)
+    provider_instance_id = models.CharField(max_length=64, null=True, blank=True)
+    provider_name = models.CharField(max_length=255, null=True, blank=True)
+    region = models.CharField(max_length=64, null=True, blank=True)
+    size_class = models.CharField(max_length=64, null=True, blank=True)
+    snapshot_id = models.CharField(max_length=64, null=True, blank=True)
+    shutdown_token = models.CharField(max_length=64, unique=True, editable=False)
+    metadata = models.JSONField(default=dict, blank=True)
+    last_error = models.TextField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    active_at = models.DateTimeField(null=True, blank=True)
+    delete_requested_at = models.DateTimeField(null=True, blank=True)
+    deleted_at = models.DateTimeField(null=True, blank=True)
+
+    def save(self, *args, **kwargs):
+        if not self.shutdown_token:
+            self.shutdown_token = get_random_string(48)
+        super().save(*args, **kwargs)
+
+    def mark_active(self):
+        if self.active_at is None:
+            self.active_at = timezone.now()
+        self.status = BotRuntimeLeaseStatuses.ACTIVE
+        self.last_error = None
+        self.save(update_fields=["status", "active_at", "last_error", "updated_at"])
+
+    def mark_delete_requested(self):
+        self.status = BotRuntimeLeaseStatuses.DELETE_REQUESTED
+        self.delete_requested_at = timezone.now()
+        self.save(update_fields=["status", "delete_requested_at", "updated_at"])
+
+    def mark_deleted(self):
+        self.status = BotRuntimeLeaseStatuses.DELETED
+        self.deleted_at = timezone.now()
+        self.save(update_fields=["status", "deleted_at", "updated_at"])
+
+    def mark_failed(self, error_message: str):
+        self.status = BotRuntimeLeaseStatuses.FAILED
+        self.last_error = error_message
+        self.save(update_fields=["status", "last_error", "updated_at"])
 
 
 class CreditTransaction(models.Model):

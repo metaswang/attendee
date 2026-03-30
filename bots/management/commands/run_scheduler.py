@@ -14,7 +14,8 @@ from django.db.models import Q
 from django.utils import timezone
 
 from accounts.models import Organization
-from bots.models import Bot, BotStates, Calendar, CalendarStates, ZoomOAuthConnection, ZoomOAuthConnectionStates
+from bots.models import Bot, BotRuntimeLease, BotRuntimeLeaseStatuses, BotRuntimeProviderTypes, BotStates, Calendar, CalendarStates, ZoomOAuthConnection, ZoomOAuthConnectionStates
+from bots.runtime_providers import get_runtime_provider
 from bots.tasks.autopay_charge_task import enqueue_autopay_charge_task
 from bots.tasks.launch_scheduled_bot_task import launch_scheduled_bot
 from bots.tasks.refresh_zoom_oauth_connection_task import enqueue_refresh_zoom_oauth_connection_task
@@ -82,6 +83,7 @@ class Command(BaseCommand):
             try:
                 self._log_celery_queue_sizes()
                 self._run_scheduled_bots()
+                self._reconcile_bot_runtime_leases()
                 self._run_periodic_calendar_syncs()
                 self._run_periodic_zoom_oauth_connection_syncs()
                 self._run_periodic_zoom_oauth_connection_token_refreshs()
@@ -291,3 +293,23 @@ class Command(BaseCommand):
             enqueue_autopay_charge_task(organization)
 
         log.info("Enqueued %d autopay tasks", len(organizations))
+
+    def _reconcile_bot_runtime_leases(self):
+        if os.getenv("LAUNCH_BOT_METHOD") != "digitalocean-droplet":
+            return
+
+        leases = BotRuntimeLease.objects.select_related("bot").filter(provider=BotRuntimeProviderTypes.DIGITALOCEAN_DROPLET).exclude(status=BotRuntimeLeaseStatuses.DELETED)
+
+        for lease in leases:
+            provider = get_runtime_provider(lease.provider)
+            try:
+                if lease.bot.first_heartbeat_timestamp and lease.status == BotRuntimeLeaseStatuses.PROVISIONING:
+                    lease.mark_active()
+
+                if lease.bot.state in BotStates.post_meeting_states():
+                    provider.delete_lease(lease)
+                    continue
+
+                provider.sync_lease(lease)
+            except Exception:
+                log.exception("Failed to reconcile runtime lease %s for bot %s", lease.id, lease.bot.object_id)

@@ -3,7 +3,7 @@ import os
 from .base import *
 
 DEBUG = True
-SITE_DOMAIN = "localhost:8000"
+SITE_DOMAIN = os.getenv("SITE_DOMAIN", "localhost:8100")
 ALLOWED_HOSTS = ["tendee-stripe-hooks.ngrok.io", "localhost"]
 
 DATABASES = {

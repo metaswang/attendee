@@ -1,4 +1,5 @@
 import logging
+import os
 import signal
 import time
 
@@ -10,6 +11,7 @@ from kubernetes import client, config
 
 from bots.launch_bot_utils import launch_bot
 from bots.models import Bot, BotEventTypes, BotStates
+from bots.runtime_providers import get_runtime_provider
 
 logger = logging.getLogger(__name__)
 
@@ -29,19 +31,21 @@ class Command(BaseCommand):
 
     # Graceful shutdown flags
     _keep_running = True
+    launch_method = None
 
     def _graceful_exit(self, signum, frame):
         logger.info("Received %s, shutting down after current cycle", signum)
         self._keep_running = False
 
     def handle(self, *args, **opts):
-        # Initialize kubernetes client
-        try:
-            config.load_incluster_config()
-        except config.ConfigException:
-            config.load_kube_config()
-        self.v1 = client.CoreV1Api()
-        self.namespace = settings.BOT_POD_NAMESPACE
+        self.launch_method = os.getenv("LAUNCH_BOT_METHOD")
+        if self.launch_method == "kubernetes":
+            try:
+                config.load_incluster_config()
+            except config.ConfigException:
+                config.load_kube_config()
+            self.v1 = client.CoreV1Api()
+            self.namespace = settings.BOT_POD_NAMESPACE
 
         # Trap SIGINT / SIGTERM so Kubernetes or Heroku can stop the container cleanly
         signal.signal(signal.SIGINT, self._graceful_exit)
@@ -95,6 +99,17 @@ class Command(BaseCommand):
                 return False
             raise
 
+    def runtime_is_active(self, bot: Bot) -> bool:
+        if self.launch_method == "kubernetes":
+            return self.bot_pod_is_active(bot.k8s_pod_name())
+        if self.launch_method == "digitalocean-droplet":
+            lease = getattr(bot, "runtime_lease", None)
+            if lease is None:
+                return False
+            provider = get_runtime_provider(lease.provider)
+            return provider.fetch_lease_state(lease) is not None
+        return False
+
     def _correct_failed_bot_launches(self):
         logger.info("Looking for bots created in last 5 minutes that failed to launch...")
 
@@ -118,8 +133,8 @@ class Command(BaseCommand):
             # Re-launch each bot
             for bot in problem_non_scheduled_bots:
                 try:
-                    if self.bot_pod_is_active(bot.k8s_pod_name()):
-                        logger.info(f"Bot {bot.object_id} already has a pod, skipping re-launch")
+                    if self.runtime_is_active(bot):
+                        logger.info(f"Bot {bot.object_id} already has runtime resources, skipping re-launch")
                         continue
                     if bot.should_launch_webpage_streamer():
                         logger.info(f"Bot {bot.object_id} should launch a webpage streamer, skipping re-launch")
@@ -138,8 +153,8 @@ class Command(BaseCommand):
 
             for bot in problem_scheduled_bots:
                 try:
-                    if self.bot_pod_is_active(bot.k8s_pod_name()):
-                        logger.info(f"Bot {bot.object_id} already has a pod, skipping re-launch")
+                    if self.runtime_is_active(bot):
+                        logger.info(f"Bot {bot.object_id} already has runtime resources, skipping re-launch")
                         continue
                     if bot.should_launch_webpage_streamer():
                         logger.info(f"Bot {bot.object_id} should launch a webpage streamer, skipping re-launch")

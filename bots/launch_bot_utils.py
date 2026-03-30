@@ -11,7 +11,26 @@ def launch_bot(bot):
     # If this instance is running in Kubernetes, use the Kubernetes pod creator
     # which spins up a new pod for the bot
     logger.info(f"Launching bot {bot.object_id} ({bot.id}) with method {os.getenv('LAUNCH_BOT_METHOD', 'celery')}")
-    if os.getenv("LAUNCH_BOT_METHOD") == "kubernetes":
+    if os.getenv("LAUNCH_BOT_METHOD") == "digitalocean-droplet":
+        from .models import BotEventManager, BotEventSubTypes, BotEventTypes
+        from .runtime_providers import DigitalOceanDropletProvider
+
+        try:
+            provider = DigitalOceanDropletProvider()
+            lease = provider.provision_bot(bot)
+            logger.info(f"Bot {bot.object_id} ({bot.id}) launched via DigitalOcean Droplet lease {lease.id} instance {lease.provider_instance_id}")
+        except Exception as exc:
+            logger.error(f"Bot {bot.object_id} ({bot.id}) failed to launch via DigitalOcean Droplet: {exc}", exc_info=True)
+            lease = getattr(bot, "runtime_lease", None)
+            if lease is not None:
+                lease.mark_failed(str(exc))
+            BotEventManager.create_event(
+                bot=bot,
+                event_type=BotEventTypes.FATAL_ERROR,
+                event_sub_type=BotEventSubTypes.FATAL_ERROR_BOT_NOT_LAUNCHED,
+                event_metadata={"launch_error": str(exc)},
+            )
+    elif os.getenv("LAUNCH_BOT_METHOD") == "kubernetes":
         from .bot_pod_creator import BotPodCreator
 
         bot_pod_creator = BotPodCreator()

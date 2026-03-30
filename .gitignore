@@ -95,6 +95,9 @@ __pycache__/
 local_settings.py
 
 .env
+.env.local
+myvps.env
+scripts/digitalocean/myvps.env
 db.sqlite3
 
 custom/
