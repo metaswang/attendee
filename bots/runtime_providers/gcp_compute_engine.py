@@ -38,6 +38,7 @@ class GCPComputeInstanceProvider:
         "BOT_MAX_SIMULTANEOUS_BOTS",
         "DROPLET_API_KEY",
         "GCP_APPLICATION_CREDENTIALS_JSON",
+        "GOOGLE_APPLICATION_CREDENTIALS",
         "PULSE_RUNTIME_PATH",
         "PULSE_SERVER",
         "XDG_RUNTIME_DIR",
@@ -116,8 +117,6 @@ class GCPComputeInstanceProvider:
                 env_contents,
                 "EOF",
                 "chmod 0644 /etc/attendee/runtime.env",
-                "systemctl daemon-reload || true",
-                "systemctl enable attendee-bot-runner.service",
                 "systemctl restart attendee-bot-runner.service",
             ]
         )

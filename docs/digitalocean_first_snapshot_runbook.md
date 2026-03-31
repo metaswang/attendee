@@ -2,6 +2,10 @@
 
 This is the command-by-command sequence for building the first bot snapshot and wiring `myvps`.
 
+`scripts/digitalocean/myvps.env` is the DigitalOcean bootstrap env for the snapshot workflow only.
+Production compose on `myvps` reads `deploy/production/myvps.env`.
+To seed a new production env from the template, copy `deploy/production/myvps.env.example` to `deploy/production/myvps.env`.
+
 ## 1. Prepare the `myvps` env file
 
 ```bash
@@ -81,7 +85,7 @@ DO_BOT_SNAPSHOT_ID=<snapshot-id-from-step-4>
 LAUNCH_BOT_METHOD=digitalocean-droplet
 ```
 
-Then copy the same values into your real production `.env` on `myvps`.
+Then copy the same values into `deploy/production/myvps.env` on `myvps`.
 
 ## 6. Restart the control plane
 

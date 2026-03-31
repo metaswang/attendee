@@ -5,7 +5,7 @@ from django.test import Client, TestCase, override_settings
 from accounts.models import Organization
 from bots.bots_api_utils import BotCreationSource, create_bot
 from bots.management.commands.clean_up_bots_with_heartbeat_timeout_or_that_never_launched import Command as CleanupCommand
-from bots.models import ApiKey, BotRuntimeLease, BotRuntimeProviderTypes, BotStates, Project, RuntimeCapacityProviders, RuntimeCapacitySnapshot
+from bots.models import ApiKey, Bot, BotRuntimeLease, BotRuntimeLeaseStatuses, BotRuntimeProviderTypes, BotStates, Project, RuntimeCapacityProviders, RuntimeCapacitySnapshot
 from bots.runtime_providers.gcp_compute_engine import GCPComputeInstanceProvider
 
 
@@ -83,6 +83,59 @@ class TestGCPRuntime(TestCase):
             provider._source_image(),
             "projects/shared-images/global/images/family/attendee-bot-golden",
         )
+
+    @patch.dict(
+        "os.environ",
+        {
+            "GCP_PROJECT_ID": "test-project",
+            "GCP_BOT_SOURCE_IMAGE_FAMILY": "attendee-bot-golden",
+        },
+        clear=False,
+    )
+    @patch("bots.runtime_providers.gcp_compute_engine.compute_v1")
+    def test_startup_script_only_writes_runtime_env_and_restarts_service(self, mock_compute_v1):
+        mock_compute_v1.InstancesClient.return_value = MagicMock()
+        mock_compute_v1.ZoneOperationsClient.return_value = MagicMock()
+
+        provider = GCPComputeInstanceProvider()
+        lease = BotRuntimeLease.objects.create(
+            bot=self.bot,
+            provider=BotRuntimeProviderTypes.GCP_COMPUTE_INSTANCE,
+            status=BotRuntimeLeaseStatuses.PROVISIONING,
+        )
+
+        startup_script = provider._startup_script(self.bot, lease)
+
+        self.assertIn("cat >/etc/attendee/runtime.env <<'EOF'", startup_script)
+        self.assertIn("systemctl restart attendee-bot-runner.service", startup_script)
+        self.assertNotIn("systemctl enable attendee-bot-runner.service", startup_script)
+        self.assertNotIn("systemctl daemon-reload", startup_script)
+
+    @patch.dict(
+        "os.environ",
+        {
+            "GCP_PROJECT_ID": "test-project",
+            "GCP_BOT_SOURCE_IMAGE_FAMILY": "attendee-bot-golden",
+            "GOOGLE_APPLICATION_CREDENTIALS": "/var/lib/attendee-gcloud/application_default_credentials.json",
+        },
+        clear=False,
+    )
+    @patch("bots.runtime_providers.gcp_compute_engine.compute_v1")
+    def test_startup_script_does_not_leak_google_application_credentials(self, mock_compute_v1):
+        mock_compute_v1.InstancesClient.return_value = MagicMock()
+        mock_compute_v1.ZoneOperationsClient.return_value = MagicMock()
+
+        provider = GCPComputeInstanceProvider()
+        lease = BotRuntimeLease.objects.create(
+            bot=self.bot,
+            provider=BotRuntimeProviderTypes.GCP_COMPUTE_INSTANCE,
+            status=BotRuntimeLeaseStatuses.PROVISIONING,
+        )
+
+        startup_script = provider._startup_script(self.bot, lease)
+
+        self.assertNotIn("GOOGLE_APPLICATION_CREDENTIALS", startup_script)
+        self.assertNotIn("/var/lib/attendee-gcloud/application_default_credentials.json", startup_script)
 
     @patch("bots.internal_views.get_runtime_provider")
     def test_completion_callback_accepts_provider_instance_id(self, mock_get_runtime_provider):

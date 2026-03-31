@@ -6,11 +6,16 @@ services:
     container_name: attendee-app
     restart: unless-stopped
     env_file:
-      - scripts/digitalocean/myvps.env
+      # Production control-plane env; DO snapshot workflow config stays separate.
+      - deploy/production/myvps.env
     environment:
       DJANGO_SETTINGS_MODULE: attendee.settings.production
       ENABLE_CHROME_SANDBOX: "false"
+      HOME: /home/app
       PYTHONUNBUFFERED: "1"
+    volumes:
+      # Keep GCP ADC outside HOME so PulseAudio can still create ~/.config/pulse.
+      - /var/lib/attendee-gcloud:/var/lib/attendee-gcloud:ro
     command: >
       bash -lc "
       /opt/venv/bin/python manage.py collectstatic --noinput &&
@@ -31,11 +36,14 @@ services:
     container_name: attendee-worker
     restart: unless-stopped
     env_file:
-      - scripts/digitalocean/myvps.env
+      - deploy/production/myvps.env
     environment:
       DJANGO_SETTINGS_MODULE: attendee.settings.production
       ENABLE_CHROME_SANDBOX: "false"
+      HOME: /home/app
       PYTHONUNBUFFERED: "1"
+    volumes:
+      - /var/lib/attendee-gcloud:/var/lib/attendee-gcloud:ro
     command: /opt/venv/bin/celery -A attendee worker -l INFO
 
   scheduler:
@@ -45,10 +53,13 @@ services:
     container_name: attendee-scheduler
     restart: unless-stopped
     env_file:
-      - scripts/digitalocean/myvps.env
+      - deploy/production/myvps.env
     environment:
       DJANGO_SETTINGS_MODULE: attendee.settings.production
+      HOME: /home/app
       PYTHONUNBUFFERED: "1"
+    volumes:
+      - /var/lib/attendee-gcloud:/var/lib/attendee-gcloud:ro
     entrypoint: []
     command: /opt/venv/bin/python manage.py run_scheduler
 

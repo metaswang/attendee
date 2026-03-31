@@ -98,6 +98,7 @@ local_settings.py
 .env.local
 myvps.env
 scripts/digitalocean/myvps.env
+deploy/production/myvps.env
 db.sqlite3
 
 custom/

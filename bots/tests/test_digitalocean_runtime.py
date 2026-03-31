@@ -59,6 +59,25 @@ class TestDigitalOceanRuntime(TestCase):
         self.assertIn("user_data", kwargs["json"])
         self.assertIn("LEASE_CALLBACK_URL", kwargs["json"]["user_data"])
 
+    @patch.dict(
+        "os.environ",
+        {
+            "GOOGLE_APPLICATION_CREDENTIALS": "/var/lib/attendee-gcloud/application_default_credentials.json",
+        },
+        clear=False,
+    )
+    def test_user_data_does_not_leak_google_application_credentials(self):
+        provider = DigitalOceanDropletProvider()
+        lease = BotRuntimeLease.objects.create(
+            bot=self.bot,
+            provider=BotRuntimeProviderTypes.DIGITALOCEAN_DROPLET,
+        )
+
+        user_data = provider._user_data(self.bot, lease)
+
+        self.assertNotIn("GOOGLE_APPLICATION_CREDENTIALS", user_data)
+        self.assertNotIn("/var/lib/attendee-gcloud/application_default_credentials.json", user_data)
+
     @patch("bots.internal_views.get_runtime_provider")
     def test_completion_callback_requires_token_and_requests_deletion(self, mock_get_runtime_provider):
         lease = BotRuntimeLease.objects.create(

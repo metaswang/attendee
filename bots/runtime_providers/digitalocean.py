@@ -31,6 +31,7 @@ class DigitalOceanDropletProvider:
         "BOT_HOST_CODE_PATH",
         "BOT_MAX_SIMULTANEOUS_BOTS",
         "DROPLET_API_KEY",
+        "GOOGLE_APPLICATION_CREDENTIALS",
         "PULSE_RUNTIME_PATH",
         "PULSE_SERVER",
         "XDG_RUNTIME_DIR",
