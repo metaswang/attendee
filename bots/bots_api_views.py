@@ -40,6 +40,7 @@ from .models import (
     ParticipantEvent,
     Recording,
     RecordingViews,
+    RuntimeCapacitySnapshot,
     Utterance,
 )
 from .serializers import (
@@ -304,6 +305,39 @@ class BotListCreateView(GenericAPIView):
             launch_bot(bot)
 
         return Response(BotSerializer(bot).data, status=status.HTTP_201_CREATED)
+
+
+class RuntimeCapacityView(APIView):
+    authentication_classes = [ApiKeyAuthentication]
+
+    @extend_schema(
+        operation_id="List Runtime Capacity",
+        summary="List cached runtime capacity",
+        description="Returns cached runtime capacity snapshots for self-hosted bot providers. This endpoint never performs live cloud quota calls.",
+        responses={200: OpenApiResponse(description="Cached runtime capacity snapshots")},
+        parameters=TokenHeaderParameter,
+        tags=["Bots"],
+    )
+    def get(self, request):
+        provider = request.query_params.get("provider")
+        snapshots = RuntimeCapacitySnapshot.objects.order_by("provider", "region")
+        if provider:
+            snapshots = snapshots.filter(provider=provider)
+
+        payload = [
+            {
+                "provider": snapshot.provider,
+                "region": snapshot.region,
+                "quota_limit": snapshot.quota_limit,
+                "quota_usage": snapshot.quota_usage,
+                "soft_cap": snapshot.soft_cap,
+                "effective_available": snapshot.effective_available,
+                "last_synced_at": snapshot.last_synced_at,
+                "metadata": snapshot.metadata,
+            }
+            for snapshot in snapshots
+        ]
+        return Response(payload)
 
 
 class SpeechView(APIView):

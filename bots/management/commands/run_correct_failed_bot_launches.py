@@ -102,7 +102,7 @@ class Command(BaseCommand):
     def runtime_is_active(self, bot: Bot) -> bool:
         if self.launch_method == "kubernetes":
             return self.bot_pod_is_active(bot.k8s_pod_name())
-        if self.launch_method == "digitalocean-droplet":
+        if self.launch_method in {"digitalocean-droplet", "gcp-compute-engine"}:
             lease = getattr(bot, "runtime_lease", None)
             if lease is None:
                 return False

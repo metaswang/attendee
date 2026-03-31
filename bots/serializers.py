@@ -1123,6 +1123,10 @@ class KubernetesSettingsJSONField(serializers.JSONField):
     pass
 
 
+class RuntimeSettingsJSONField(serializers.JSONField):
+    pass
+
+
 class CreateAsyncTranscriptionSerializer(serializers.Serializer):
     transcription_settings = TranscriptionSettingsJSONField(help_text="The transcription settings to use for the async transcription.", required=True)
 
@@ -1188,6 +1192,12 @@ class CreateBotSerializer(BotValidationMixin, serializers.Serializer):
 
     voice_agent_settings = VoiceAgentSettingsJSONField(
         help_text="Settings for the voice agent that the bot should load.",
+        required=False,
+        default=None,
+    )
+
+    runtime_settings = RuntimeSettingsJSONField(
+        help_text="Runtime-specific settings for self-hosted bot execution, e.g. {'region': 'asia-southeast1'}.",
         required=False,
         default=None,
     )
@@ -1661,6 +1671,33 @@ class CreateBotSerializer(BotValidationMixin, serializers.Serializer):
 
         if not fetch_bot_pod_spec(bot_pod_spec_type):
             raise serializers.ValidationError(f"Invalid bot pod spec type: {bot_pod_spec_type}. Bot pod spec type not found in environment variables.")
+
+        return value
+
+    RUNTIME_SETTINGS_SCHEMA = {
+        "type": "object",
+        "properties": {
+            "region": {
+                "type": "string",
+                "minLength": 1,
+            },
+        },
+        "required": [],
+        "additionalProperties": False,
+    }
+
+    def validate_runtime_settings(self, value):
+        if value is None:
+            return value
+
+        try:
+            jsonschema.validate(instance=value, schema=self.RUNTIME_SETTINGS_SCHEMA)
+        except jsonschema.exceptions.ValidationError as e:
+            raise serializers.ValidationError(e.message)
+
+        region = (value.get("region") or "").strip()
+        if region:
+            value["region"] = region
 
         return value
 

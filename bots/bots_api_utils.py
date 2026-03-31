@@ -27,6 +27,8 @@ from .models import (
     MeetingTypes,
     Project,
     Recording,
+    RuntimeCapacityProviders,
+    RuntimeCapacitySnapshot,
     TranscriptionProviders,
     TranscriptionSettings,
     TranscriptionTypes,
@@ -43,6 +45,42 @@ from .serializers import (
 from .utils import transcription_provider_from_bot_creation_data
 
 logger = logging.getLogger(__name__)
+
+
+def _supported_gcp_regions() -> list[str]:
+    raw_value = os.getenv("GCP_BOT_REGIONS", "")
+    return [item.strip() for item in raw_value.split(",") if item.strip()]
+
+
+def _default_gcp_region() -> str | None:
+    return os.getenv("GCP_BOT_DEFAULT_REGION") or os.getenv("GCP_BOT_REGION")
+
+
+def validate_runtime_settings_for_create_bot(runtime_settings: dict | None) -> dict | None:
+    if os.getenv("LAUNCH_BOT_METHOD") != "gcp-compute-engine":
+        return runtime_settings
+
+    runtime_settings = runtime_settings or {}
+    region = (runtime_settings.get("region") or _default_gcp_region() or "").strip()
+    if not region:
+        raise ValidationError("runtime_settings.region is required when LAUNCH_BOT_METHOD=gcp-compute-engine")
+
+    supported_regions = _supported_gcp_regions()
+    if supported_regions and region not in supported_regions:
+        raise ValidationError(f"Unsupported runtime region: {region}. Allowed regions are: {', '.join(supported_regions)}")
+
+    snapshot = RuntimeCapacitySnapshot.objects.filter(provider=RuntimeCapacityProviders.GCP_COMPUTE_INSTANCE, region=region).first()
+    if snapshot and snapshot.effective_available <= 0:
+        raise ValidationError(f"Runtime capacity for region {region} is exhausted. Please choose a different region.")
+
+    runtime_settings["region"] = region
+    logger.info(
+        "Validated runtime settings for GCP bot create region=%s snapshot_found=%s effective_available=%s",
+        region,
+        snapshot is not None,
+        snapshot.effective_available if snapshot else None,
+    )
+    return runtime_settings
 
 
 def build_site_url(path=""):
@@ -226,6 +264,7 @@ def create_bot(data: dict, source: BotCreationSource, project: Project) -> tuple
     external_media_storage_settings = serializer.validated_data["external_media_storage_settings"]
     voice_agent_settings = serializer.validated_data["voice_agent_settings"]
     kubernetes_settings = serializer.validated_data["kubernetes_settings"]
+    runtime_settings = validate_runtime_settings_for_create_bot(serializer.validated_data["runtime_settings"])
     initial_state = BotStates.SCHEDULED if join_at else BotStates.READY
 
     error = validate_external_media_storage_settings(external_media_storage_settings, project)
@@ -250,10 +289,19 @@ def create_bot(data: dict, source: BotCreationSource, project: Project) -> tuple
         "external_media_storage_settings": external_media_storage_settings,
         "voice_agent_settings": voice_agent_settings,
         "kubernetes_settings": kubernetes_settings,
+        "runtime_settings": runtime_settings,
     }
 
     try:
         with transaction.atomic():
+            logger.info(
+                "Creating bot for project=%s source=%s meeting_url=%s runtime_region=%s launch_method=%s",
+                project.object_id,
+                source,
+                meeting_url,
+                (runtime_settings or {}).get("region"),
+                os.getenv("LAUNCH_BOT_METHOD", "celery"),
+            )
             bot = Bot.objects.create(
                 project=project,
                 meeting_url=meeting_url,

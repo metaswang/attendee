@@ -33,17 +33,24 @@ class BotRuntimeLeaseCompletionView(View):
         except json.JSONDecodeError:
             return JsonResponse({"error": "Invalid JSON body"}, status=400)
 
-        droplet_id = str(payload.get("droplet_id") or "").strip()
-        if droplet_id and lease.provider_instance_id and droplet_id != lease.provider_instance_id:
-            return JsonResponse({"error": "droplet_id does not match lease"}, status=400)
+        provider_instance_id = str(payload.get("provider_instance_id") or payload.get("droplet_id") or "").strip()
+        if provider_instance_id and lease.provider_instance_id and provider_instance_id != lease.provider_instance_id:
+            return JsonResponse({"error": "provider_instance_id does not match lease"}, status=400)
 
         provider = get_runtime_provider(lease.provider)
 
-        if droplet_id and not lease.provider_instance_id:
-            lease.provider_instance_id = droplet_id
+        if provider_instance_id and not lease.provider_instance_id:
+            lease.provider_instance_id = provider_instance_id
             lease.save(update_fields=["provider_instance_id", "updated_at"])
 
         try:
+            logger.info(
+                "Received runtime lease completion for lease=%s bot=%s provider=%s provider_instance_id=%s",
+                lease.id,
+                lease.bot.object_id,
+                lease.provider,
+                provider_instance_id or lease.provider_instance_id,
+            )
             provider.delete_lease(lease)
         except Exception as exc:
             logger.exception("Failed to delete runtime lease %s for bot %s", lease.id, lease.bot.object_id)

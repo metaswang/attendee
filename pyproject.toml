@@ -36,6 +36,7 @@ dependencies = [
     "gdown",
     "google-api-core==2.24.1",
     "google-auth==2.38.0",
+    "google-cloud-compute==1.32.0",
     "google-cloud-texttospeech==2.24.0",
     "googleapis-common-protos==1.66.0",
     "grpcio==1.70.0",

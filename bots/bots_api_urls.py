@@ -3,6 +3,7 @@ from django.urls import path
 from . import bots_api_views
 
 urlpatterns = [
+    path("runtime_capacity", bots_api_views.RuntimeCapacityView.as_view(), name="runtime-capacity"),
     path("bots", bots_api_views.BotListCreateView.as_view(), name="bot-list-create"),
     path(
         "bots/<str:object_id>",

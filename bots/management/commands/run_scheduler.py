@@ -8,13 +8,14 @@ import time
 
 import redis
 from django.conf import settings
+from django.core.management import call_command
 from django.core.management.base import BaseCommand
 from django.db import connection, models, transaction
 from django.db.models import Q
 from django.utils import timezone
 
 from accounts.models import Organization
-from bots.models import Bot, BotRuntimeLease, BotRuntimeLeaseStatuses, BotRuntimeProviderTypes, BotStates, Calendar, CalendarStates, ZoomOAuthConnection, ZoomOAuthConnectionStates
+from bots.models import Bot, BotRuntimeLease, BotRuntimeLeaseStatuses, BotStates, Calendar, CalendarStates, ZoomOAuthConnection, ZoomOAuthConnectionStates
 from bots.runtime_providers import get_runtime_provider
 from bots.tasks.autopay_charge_task import enqueue_autopay_charge_task
 from bots.tasks.launch_scheduled_bot_task import launch_scheduled_bot
@@ -84,6 +85,7 @@ class Command(BaseCommand):
                 self._log_celery_queue_sizes()
                 self._run_scheduled_bots()
                 self._reconcile_bot_runtime_leases()
+                self._sync_runtime_capacity_if_enabled()
                 self._run_periodic_calendar_syncs()
                 self._run_periodic_zoom_oauth_connection_syncs()
                 self._run_periodic_zoom_oauth_connection_token_refreshs()
@@ -110,6 +112,14 @@ class Command(BaseCommand):
                 log.warning(f"Scheduler cycle took {elapsed}s, which is longer than the interval of {interval}s")
 
         log.info("Scheduler daemon exited")
+
+    def _sync_runtime_capacity_if_enabled(self):
+        if os.getenv("LAUNCH_BOT_METHOD") != "gcp-compute-engine":
+            return
+        if os.getenv("GCP_RUNTIME_CAPACITY_SYNC_ON_SCHEDULER", "false").lower() != "true":
+            return
+        log.info("Syncing GCP runtime capacity snapshots")
+        call_command("sync_gcp_runtime_capacity")
 
     def _run_periodic_calendar_syncs(self):
         """
@@ -295,18 +305,20 @@ class Command(BaseCommand):
         log.info("Enqueued %d autopay tasks", len(organizations))
 
     def _reconcile_bot_runtime_leases(self):
-        if os.getenv("LAUNCH_BOT_METHOD") != "digitalocean-droplet":
+        if os.getenv("LAUNCH_BOT_METHOD") not in {"digitalocean-droplet", "gcp-compute-engine"}:
             return
 
-        leases = BotRuntimeLease.objects.select_related("bot").filter(provider=BotRuntimeProviderTypes.DIGITALOCEAN_DROPLET).exclude(status=BotRuntimeLeaseStatuses.DELETED)
+        leases = BotRuntimeLease.objects.select_related("bot").exclude(status=BotRuntimeLeaseStatuses.DELETED)
 
         for lease in leases:
             provider = get_runtime_provider(lease.provider)
             try:
                 if lease.bot.first_heartbeat_timestamp and lease.status == BotRuntimeLeaseStatuses.PROVISIONING:
                     lease.mark_active()
+                    log.info("Marked runtime lease %s for bot %s as active via heartbeat", lease.id, lease.bot.object_id)
 
                 if lease.bot.state in BotStates.post_meeting_states():
+                    log.info("Deleting runtime lease %s for bot %s because bot is in post-meeting state %s", lease.id, lease.bot.object_id, lease.bot.state)
                     provider.delete_lease(lease)
                     continue
 

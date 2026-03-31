@@ -11,16 +11,28 @@ def launch_bot(bot):
     # If this instance is running in Kubernetes, use the Kubernetes pod creator
     # which spins up a new pod for the bot
     logger.info(f"Launching bot {bot.object_id} ({bot.id}) with method {os.getenv('LAUNCH_BOT_METHOD', 'celery')}")
-    if os.getenv("LAUNCH_BOT_METHOD") == "digitalocean-droplet":
+    if os.getenv("LAUNCH_BOT_METHOD") in {"digitalocean-droplet", "gcp-compute-engine"}:
         from .models import BotEventManager, BotEventSubTypes, BotEventTypes
-        from .runtime_providers import DigitalOceanDropletProvider
+        from .runtime_providers import get_runtime_provider
 
         try:
-            provider = DigitalOceanDropletProvider()
+            provider_name = {
+                "digitalocean-droplet": "digitalocean_droplet",
+                "gcp-compute-engine": "gcp_compute_instance",
+            }[os.getenv("LAUNCH_BOT_METHOD")]
+            provider = get_runtime_provider(provider_name)
             lease = provider.provision_bot(bot)
-            logger.info(f"Bot {bot.object_id} ({bot.id}) launched via DigitalOcean Droplet lease {lease.id} instance {lease.provider_instance_id}")
+            logger.info(
+                "Bot %s (%s) launched via %s lease %s instance %s region=%s",
+                bot.object_id,
+                bot.id,
+                provider_name,
+                lease.id,
+                lease.provider_instance_id,
+                lease.region,
+            )
         except Exception as exc:
-            logger.error(f"Bot {bot.object_id} ({bot.id}) failed to launch via DigitalOcean Droplet: {exc}", exc_info=True)
+            logger.error(f"Bot {bot.object_id} ({bot.id}) failed to launch via {os.getenv('LAUNCH_BOT_METHOD')}: {exc}", exc_info=True)
             lease = getattr(bot, "runtime_lease", None)
             if lease is not None:
                 lease.mark_failed(str(exc))

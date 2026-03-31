@@ -543,6 +543,7 @@ class SessionTypes(models.IntegerChoices):
 
 class BotRuntimeProviderTypes(models.TextChoices):
     DIGITALOCEAN_DROPLET = "digitalocean_droplet", "DigitalOcean Droplet"
+    GCP_COMPUTE_INSTANCE = "gcp_compute_instance", "GCP Compute Instance"
 
 
 class BotRuntimeLeaseStatuses(models.TextChoices):
@@ -551,6 +552,10 @@ class BotRuntimeLeaseStatuses(models.TextChoices):
     DELETE_REQUESTED = "delete_requested", "Delete Requested"
     DELETED = "deleted", "Deleted"
     FAILED = "failed", "Failed"
+
+
+class RuntimeCapacityProviders(models.TextChoices):
+    GCP_COMPUTE_INSTANCE = "gcp_compute_instance", "GCP Compute Instance"
 
 
 class TranscriptionSettings:
@@ -890,6 +895,37 @@ class Bot(models.Model):
             os.getenv("DO_BOT_SIZE_SLUG", os.getenv("DO_BOT_SIZE_CLASS", class_default)),
         ) or class_default
 
+    def runtime_settings(self):
+        return self.settings.get("runtime_settings") or {}
+
+    def runtime_region(self, default_region: str | None = None):
+        runtime_settings = self.runtime_settings()
+        region = runtime_settings.get("region")
+        if region:
+            return region
+        return default_region
+
+    def gcp_machine_type(self):
+        runtime_class = self.runtime_resource_class()
+        class_default = {
+            "transcription_only": "e2-standard-2",
+            "audio_only": "e2-standard-2",
+            "web_av_standard": "e2-standard-4",
+            "web_av_heavy": "e2-standard-8",
+        }[runtime_class]
+        return os.getenv(f"BOT_RUNTIME_CLASS_{runtime_class.upper()}_GCP_MACHINE_TYPE", os.getenv("GCP_BOT_MACHINE_TYPE", class_default)) or class_default
+
+    def gcp_boot_disk_size_gb(self):
+        runtime_class = self.runtime_resource_class()
+        class_default = {
+            "transcription_only": 20,
+            "audio_only": 20,
+            "web_av_standard": 30,
+            "web_av_heavy": 50,
+        }[runtime_class]
+        raw_value = os.getenv(f"BOT_RUNTIME_CLASS_{runtime_class.upper()}_GCP_BOOT_DISK_GB", os.getenv("GCP_BOT_BOOT_DISK_GB", str(class_default))) or str(class_default)
+        return int(raw_value)
+
     @property
     def transcription_settings(self):
         return TranscriptionSettings(self.settings.get("transcription_settings"))
@@ -1125,6 +1161,9 @@ class Bot(models.Model):
     def digitalocean_droplet_name(self):
         return f"attendee-bot-{self.id}-{self.object_id}".lower().replace("_", "-")[:64]
 
+    def gcp_instance_name(self):
+        return f"attendee-bot-{self.id}-{self.object_id}".lower().replace("_", "-")[:63]
+
     def k8s_pod_name(self):
         return f"bot-pod-{self.id}-{self.object_id}".lower().replace("_", "-")
 
@@ -1194,6 +1233,24 @@ class BotRuntimeLease(models.Model):
         self.status = BotRuntimeLeaseStatuses.FAILED
         self.last_error = error_message
         self.save(update_fields=["status", "last_error", "updated_at"])
+
+
+class RuntimeCapacitySnapshot(models.Model):
+    provider = models.CharField(max_length=64, choices=RuntimeCapacityProviders.choices)
+    region = models.CharField(max_length=64)
+    quota_limit = models.IntegerField(default=0)
+    quota_usage = models.IntegerField(default=0)
+    soft_cap = models.IntegerField(null=True, blank=True)
+    effective_available = models.IntegerField(default=0)
+    last_synced_at = models.DateTimeField(null=True, blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["provider", "region"], name="unique_runtime_capacity_snapshot_provider_region"),
+        ]
 
 
 class CreditTransaction(models.Model):

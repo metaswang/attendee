@@ -34,8 +34,8 @@ class Command(BaseCommand):
         # There isn't really a safe way to terminate the bot if it's running as a celery task
         if os.getenv("LAUNCH_BOT_METHOD") == "kubernetes":
             self._terminate_kubernetes_pod(bot)
-        elif os.getenv("LAUNCH_BOT_METHOD") == "digitalocean-droplet":
-            self._terminate_digitalocean_droplet(bot)
+        elif os.getenv("LAUNCH_BOT_METHOD") in {"digitalocean-droplet", "gcp-compute-engine"}:
+            self._terminate_runtime_lease(bot)
         elif os.getenv("LAUNCH_BOT_METHOD") == "docker-compose-multi-host":
             self._terminate_ephemeral_docker_container(bot)
 
@@ -81,15 +81,16 @@ class Command(BaseCommand):
         except Exception as e:
             logger.warning(f"Error removing container {container_name}: {e}")
 
-    def _terminate_digitalocean_droplet(self, bot):
+    def _terminate_runtime_lease(self, bot):
         lease = getattr(bot, "runtime_lease", None)
         if lease is None:
             return
         try:
             provider = get_runtime_provider(lease.provider)
+            logger.info("Deleting runtime lease %s for bot %s via provider %s", lease.id, bot.object_id, lease.provider)
             provider.delete_lease(lease)
         except Exception as e:
-            logger.warning(f"Error deleting DigitalOcean Droplet for bot {bot.object_id}: {e}")
+            logger.warning(f"Error deleting runtime lease for bot {bot.object_id}: {e}")
 
     def handle(self, *args, **options):
         self.terminate_bots_with_heartbeat_timeout()
