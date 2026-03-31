@@ -22,6 +22,25 @@
 - `GCP_BOT_REGIONS`
 - `GCP_BOT_REGION_ZONES_JSON`
 
+## Docker image builder 要求
+
+当前镜像构建依赖以下前提：
+
+- builder 平台必须是 `linux/amd64`
+- Python 版本必须是 `3.11`
+- `zoom-meeting-sdk==0.0.27` 必须走 PyPI 上的 manylinux x86_64 wheel
+
+仓库里的 [Dockerfile](./../Dockerfile) 已做了显式保护：
+
+- `uv sync` 时跳过 `zoom-meeting-sdk`
+- 再单独用 wheel-only 方式安装 `zoom-meeting-sdk`
+
+这样做的原因是：
+
+- `zoom-meeting-sdk` 的 source tarball 缺少 `src/zoomsdk/h/zoom_sdk.h`
+- 如果在不支持的本地环境里回退到 source build，会直接失败
+- GCP N2 VM 上的标准 `linux/amd64` builder 不应走 source build 路径
+
 ### 网络
 
 以下二选一至少配置一个：
