@@ -63,6 +63,27 @@ class TestGCPRuntime(TestCase):
         self.assertEqual(kwargs["zone"], "asia-southeast1-b")
         self.assertIn("request_id", kwargs)
 
+    @patch.dict(
+        "os.environ",
+        {
+            "GCP_PROJECT_ID": "test-project",
+            "GCP_BOT_SOURCE_IMAGE_FAMILY": "attendee-bot-golden",
+            "GCP_BOT_SOURCE_IMAGE_PROJECT": "shared-images",
+        },
+        clear=False,
+    )
+    @patch("bots.runtime_providers.gcp_compute_engine.compute_v1")
+    def test_source_image_uses_family_when_configured(self, mock_compute_v1):
+        mock_compute_v1.InstancesClient.return_value = MagicMock()
+        mock_compute_v1.ZoneOperationsClient.return_value = MagicMock()
+
+        provider = GCPComputeInstanceProvider()
+
+        self.assertEqual(
+            provider._source_image(),
+            "projects/shared-images/global/images/family/attendee-bot-golden",
+        )
+
     @patch("bots.internal_views.get_runtime_provider")
     def test_completion_callback_accepts_provider_instance_id(self, mock_get_runtime_provider):
         lease = BotRuntimeLease.objects.create(

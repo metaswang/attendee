@@ -78,6 +78,8 @@ class GCPComputeInstanceProvider:
         return labels
 
     def _serialized_runtime_env(self, bot, lease: BotRuntimeLease) -> str:
+        region = bot.runtime_region(self._default_region())
+        zone = ((lease.metadata or {}).get("instance") or {}).get("zone") or ""
         env_vars = {}
         for key, value in os.environ.items():
             if key in self.ENV_EXCLUDES:
@@ -90,7 +92,10 @@ class GCPComputeInstanceProvider:
             {
                 "BOT_ID": str(bot.id),
                 "BOT_OBJECT_ID": bot.object_id,
+                "BOT_LAUNCH_REQUESTED_AT": timezone.now().isoformat(),
                 "BOT_RUNTIME_PROVIDER": BotRuntimeProviderTypes.GCP_COMPUTE_INSTANCE,
+                "BOT_RUNTIME_REGION": region,
+                "BOT_RUNTIME_ZONE": zone,
                 "GCP_INSTANCE_NAME": bot.gcp_instance_name(),
                 "IS_GCP_BOT_RUNNER": "true",
                 "LEASE_CALLBACK_URL": self._runtime_callback_url(lease),
@@ -140,6 +145,18 @@ class GCPComputeInstanceProvider:
                 return subnet_map[region]
         return os.getenv("GCP_BOT_SUBNETWORK")
 
+    def _source_image(self) -> str:
+        source_image = os.getenv("GCP_BOT_SOURCE_IMAGE")
+        if source_image:
+            return source_image
+
+        image_family = os.getenv("GCP_BOT_SOURCE_IMAGE_FAMILY")
+        image_project = os.getenv("GCP_BOT_SOURCE_IMAGE_PROJECT") or self.project_id
+        if image_family:
+            return f"projects/{image_project}/global/images/family/{image_family}"
+
+        raise GCPComputeEngineError("GCP_BOT_SOURCE_IMAGE or GCP_BOT_SOURCE_IMAGE_FAMILY must be set")
+
     def _build_instance(self, bot, lease: BotRuntimeLease, zone: str, region: str):
         machine_type_name = bot.gcp_machine_type()
         machine_type = f"zones/{zone}/machineTypes/{machine_type_name}"
@@ -148,13 +165,11 @@ class GCPComputeInstanceProvider:
             boot=True,
             type_=compute_v1.AttachedDisk.Type.PERSISTENT.name,
             initialize_params=compute_v1.AttachedDiskInitializeParams(
-                source_image=os.getenv("GCP_BOT_SOURCE_IMAGE"),
+                source_image=self._source_image(),
                 disk_size_gb=bot.gcp_boot_disk_size_gb(),
                 disk_type=f"zones/{zone}/diskTypes/{os.getenv('GCP_BOT_DISK_TYPE', 'pd-balanced')}",
             ),
         )
-        if not os.getenv("GCP_BOT_SOURCE_IMAGE"):
-            raise GCPComputeEngineError("GCP_BOT_SOURCE_IMAGE is not set")
 
         network_interface = compute_v1.NetworkInterface()
         subnetwork = self._subnetwork_for_region(region)
@@ -206,7 +221,7 @@ class GCPComputeInstanceProvider:
                 "provider": BotRuntimeProviderTypes.GCP_COMPUTE_INSTANCE,
                 "region": region,
                 "size_class": bot.gcp_machine_type(),
-                "snapshot_id": os.getenv("GCP_BOT_SOURCE_IMAGE"),
+                "snapshot_id": self._source_image(),
             },
         )
         return lease
@@ -246,7 +261,7 @@ class GCPComputeInstanceProvider:
                 lease.provider_name = created_instance.name
                 lease.region = region
                 lease.size_class = bot.gcp_machine_type()
-                lease.snapshot_id = os.getenv("GCP_BOT_SOURCE_IMAGE")
+                lease.snapshot_id = self._source_image()
                 lease.metadata = {
                     "instance": {
                         "id": str(created_instance.id),

@@ -6,6 +6,7 @@ BOT_RUNTIME_IMAGE="${BOT_RUNTIME_IMAGE:-attendee-bot-runner:latest}"
 BOT_RUNTIME_CONTAINER_NAME_PREFIX="${BOT_RUNTIME_CONTAINER_NAME_PREFIX:-attendee-bot}"
 ATTENDEE_CONTAINER_WORKDIR="${ATTENDEE_CONTAINER_WORKDIR:-/attendee}"
 METADATA_URL="${DROPLET_METADATA_ID_URL:-http://169.254.169.254/metadata/v1/id}"
+PROVIDER_INSTANCE_ID_METADATA_URL="${PROVIDER_INSTANCE_ID_METADATA_URL:-$METADATA_URL}"
 RUNNER_LOG_DIR="${RUNNER_LOG_DIR:-/var/log/attendee}"
 RUNNER_LOG_PATH="${RUNNER_LOG_PATH:-${RUNNER_LOG_DIR}/runner.log}"
 CONTAINER_LOG_PATH="${CONTAINER_LOG_PATH:-${RUNNER_LOG_DIR}/container.log}"
@@ -21,9 +22,18 @@ fi
 
 mkdir -p "$RUNNER_LOG_DIR"
 touch "$RUNNER_LOG_PATH" "$CONTAINER_LOG_PATH" "$RUNNER_STATE_PATH"
+RUNNER_STARTED_AT="$(timestamp)"
+RUNNER_STARTED_AT_MS="$(epoch_ms)"
 
 timestamp() {
   date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
+epoch_ms() {
+  python3 - <<'PY'
+import time
+print(int(time.time() * 1000))
+PY
 }
 
 log_runner() {
@@ -50,9 +60,12 @@ log_runner "Starting runner for bot ${BOT_ID} with image ${BOT_RUNTIME_IMAGE}"
 
 cp "$RUNTIME_ENV_PATH" "$CONTAINER_ENV_PATH"
 chmod 0644 "$CONTAINER_ENV_PATH"
+printf '%s runner_started_at=%s runner_started_at_ms=%s\n' "$(timestamp)" "$RUNNER_STARTED_AT" "$RUNNER_STARTED_AT_MS" >> "$RUNNER_STATE_PATH"
 
 set +e
 docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+CONTAINER_START_AT="$(timestamp)"
+CONTAINER_START_AT_MS="$(epoch_ms)"
 docker run \
   --rm \
   --name "$CONTAINER_NAME" \
@@ -67,12 +80,14 @@ docker run \
 EXIT_CODE=$?
 set -e
 
-printf '%s exit_code=%s\n' "$(timestamp)" "$EXIT_CODE" >> "$RUNNER_STATE_PATH"
+CONTAINER_FINISHED_AT="$(timestamp)"
+CONTAINER_FINISHED_AT_MS="$(epoch_ms)"
+printf '%s container_start_at=%s container_start_at_ms=%s container_finished_at=%s container_finished_at_ms=%s exit_code=%s\n' "$(timestamp)" "$CONTAINER_START_AT" "$CONTAINER_START_AT_MS" "$CONTAINER_FINISHED_AT" "$CONTAINER_FINISHED_AT_MS" "$EXIT_CODE" >> "$RUNNER_STATE_PATH"
 log_runner "Container finished with exit_code=${EXIT_CODE}"
 
-DROPLET_ID=""
+PROVIDER_INSTANCE_ID=""
 if command -v curl >/dev/null 2>&1; then
-  DROPLET_ID="$(curl -fsS --max-time 2 "$METADATA_URL" || true)"
+  PROVIDER_INSTANCE_ID="$(curl -fsS --max-time 2 "$PROVIDER_INSTANCE_ID_METADATA_URL" || true)"
 fi
 
 FINAL_STATE="succeeded"
@@ -87,14 +102,22 @@ fi
 
 if [[ -n "${LEASE_CALLBACK_URL:-}" && -n "${LEASE_SHUTDOWN_TOKEN:-}" ]]; then
   LOG_TAIL_JSON="$(printf '%s' "$LOG_TAIL" | json_escape)"
-  CALLBACK_PAYLOAD="$(printf '{"bot_id":"%s","droplet_id":"%s","exit_code":%s,"final_state":"%s","reason":"process_exit","log_tail":%s,"runner_log_path":"%s","container_log_path":"%s"}' \
+  CALLBACK_PAYLOAD="$(printf '{"bot_id":"%s","provider_instance_id":"%s","droplet_id":"%s","exit_code":%s,"final_state":"%s","reason":"process_exit","log_tail":%s,"runner_log_path":"%s","container_log_path":"%s","runner_started_at":"%s","runner_started_at_ms":%s,"container_start_at":"%s","container_start_at_ms":%s,"container_finished_at":"%s","container_finished_at_ms":%s,"bot_launch_requested_at":"%s"}' \
     "${BOT_ID}" \
-    "${DROPLET_ID}" \
+    "${PROVIDER_INSTANCE_ID}" \
+    "${PROVIDER_INSTANCE_ID}" \
     "${EXIT_CODE}" \
     "${FINAL_STATE}" \
     "${LOG_TAIL_JSON}" \
     "${RUNNER_LOG_PATH}" \
-    "${CONTAINER_LOG_PATH}")"
+    "${CONTAINER_LOG_PATH}" \
+    "${RUNNER_STARTED_AT}" \
+    "${RUNNER_STARTED_AT_MS}" \
+    "${CONTAINER_START_AT}" \
+    "${CONTAINER_START_AT_MS}" \
+    "${CONTAINER_FINISHED_AT}" \
+    "${CONTAINER_FINISHED_AT_MS}" \
+    "${BOT_LAUNCH_REQUESTED_AT:-}")"
   curl -fsS \
     -X POST \
     -H "Authorization: Bearer ${LEASE_SHUTDOWN_TOKEN}" \
