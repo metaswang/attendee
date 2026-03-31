@@ -30,6 +30,40 @@ class CallbackHTTPError(CallbackError):
         self.response_body = response_body
 
 
+def make_signed_callback_request(url: str, payload: Dict, signing_secret: bytes | str, timeout_seconds: int = 30) -> Dict:
+    secret_bytes = signing_secret.encode("utf-8") if isinstance(signing_secret, str) else signing_secret
+    signature = sign_payload(payload, secret_bytes)
+    try:
+        response = requests.post(
+            url,
+            json=payload,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "Attendee-Callback/1.0",
+                "X-Webhook-Signature": signature,
+            },
+            timeout=timeout_seconds,
+        )
+        if not (200 <= response.status_code < 300):
+            response_body = response.text[:1000]
+            raise CallbackHTTPError(
+                f"Callback request failed with status {response.status_code}",
+                status_code=response.status_code,
+                response_body=response_body,
+            )
+        if not response.content:
+            return {}
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise CallbackError(f"Invalid JSON response from callback: {exc}") from exc
+    except requests.RequestException as exc:
+        error_msg = f"Network error during callback request: {str(exc)}"
+        if isinstance(exc, requests.Timeout):
+            raise CallbackTimeoutError(error_msg) from exc
+        raise CallbackError(error_msg) from exc
+
+
 def make_callback_request(url: str, bot, callback_type: str, additional_data: Optional[Dict] = None) -> Dict:
     """
     Make a callback request to an external server.
@@ -65,50 +99,10 @@ def make_callback_request(url: str, bot, callback_type: str, additional_data: Op
     active_secret = bot.project.webhook_secrets.filter().order_by("-created_at").first()
 
     # Sign the payload
-    signature = sign_payload(callback_data, active_secret.get_secret())
-
-    try:
-        logger.info(f"Making {callback_type} callback request for bot {bot.object_id} to {url}")
-
-        response = requests.post(
-            url,
-            json=callback_data,
-            headers={
-                "Content-Type": "application/json",
-                "User-Agent": "Attendee-Callback/1.0",
-                "X-Webhook-Signature": signature,
-            },
-            timeout=30,  # 30-second timeout
-        )
-
-        # Log the response for debugging
-        logger.info(f"Callback response status: {response.status_code}")
-
-        # Check if the request was successful (2xx status code)
-        if not (200 <= response.status_code < 300):
-            error_msg = f"Callback request failed with status {response.status_code}"
-            response_body = response.text[:1000]  # Limit response body logging
-            logger.error(f"{error_msg}. Response: {response_body}")
-            raise CallbackHTTPError(error_msg, status_code=response.status_code, response_body=response_body)
-
-        # Parse the JSON response
-        try:
-            response_data = response.json()
-        except ValueError as e:
-            error_msg = f"Invalid JSON response from callback: {str(e)}"
-            logger.error(error_msg)
-            raise CallbackError(error_msg)
-
-        logger.info(f"Callback request successful for bot {bot.object_id}")
-        return response_data
-
-    except requests.RequestException as e:
-        error_msg = f"Network error during callback request: {str(e)}"
-        logger.error(error_msg)
-        if isinstance(e, requests.Timeout):
-            raise CallbackTimeoutError(error_msg)
-        else:
-            raise CallbackError(error_msg)
+    logger.info(f"Making {callback_type} callback request for bot {bot.object_id} to {url}")
+    response_data = make_signed_callback_request(url=url, payload=callback_data, signing_secret=active_secret.get_secret())
+    logger.info(f"Callback request successful for bot {bot.object_id}")
+    return response_data
 
 
 def get_zoom_tokens(bot) -> Dict[str, str]:

@@ -1164,7 +1164,8 @@ class WebSocketClient {
         VIDEO: 2,  // Reserved for future use
         AUDIO: 3,   // Reserved for future use
         ENCODED_MP4_CHUNK: 4,
-        PER_PARTICIPANT_AUDIO: 5
+        PER_PARTICIPANT_AUDIO: 5,
+        ENCODED_AUDIO_CHUNK: 6
     };
   
     constructor() {
@@ -1190,6 +1191,8 @@ class WebSocketClient {
         };
   
         this.mediaSendingEnabled = false;
+        this.audioChunkRecorder = null;
+        this.audioChunkFlushInterval = null;
         /*
         We no longer need this because we're not using MediaStreamTrackProcessor's
         this.lastVideoFrameTime = performance.now();
@@ -1239,11 +1242,15 @@ class WebSocketClient {
         window.receiverManager.startPollingReceivers();
         window.styleManager.start();
         window.callManager.syncParticipants();
+        if (window.initialData.sendEncodedAudioChunks) {
+            this.startAudioChunkRecording();
+        }
         // No longer need this because we're not using MediaStreamTrackProcessor's
         //this.startBlackFrameTimer();
     }
 
     async disableMediaSending() {
+        await this.stopAudioChunkRecording();
         window.styleManager.stop();
         //window.fullCaptureManager.stop();
         // Give the media recorder a bit of time to send the final data
@@ -1307,6 +1314,70 @@ class WebSocketClient {
             type: 'CaptionUpdate',
             caption: item
         });
+    }
+
+    sendEncodedAudioChunk(encodedAudioData) {
+        if (this.ws.readyState !== originalWebSocket.OPEN || !this.mediaSendingEnabled) {
+            return;
+        }
+        try {
+            const headerBuffer = new ArrayBuffer(4);
+            const headerView = new DataView(headerBuffer);
+            headerView.setInt32(0, WebSocketClient.MESSAGE_TYPES.ENCODED_AUDIO_CHUNK, true);
+            this.ws.send(new Blob([headerBuffer, encodedAudioData]));
+        } catch (error) {
+            console.error('Error sending WebSocket audio chunk:', error);
+        }
+    }
+
+    startAudioChunkRecording() {
+        if (this.audioChunkRecorder && this.audioChunkRecorder.state !== 'inactive') {
+            return;
+        }
+        const audioStream = window.styleManager?.getMeetingAudioStream?.();
+        if (!audioStream || audioStream.getAudioTracks().length === 0) {
+            console.warn('No meeting audio stream available for audio chunk recording');
+            return;
+        }
+        const preferredMimeTypes = ['audio/webm;codecs=opus', 'audio/webm'];
+        const selectedMimeType = preferredMimeTypes.find((mime) => window.MediaRecorder && MediaRecorder.isTypeSupported(mime));
+        this.audioChunkRecorder = selectedMimeType ? new MediaRecorder(audioStream, { mimeType: selectedMimeType }) : new MediaRecorder(audioStream);
+        this.audioChunkRecorder.ondataavailable = (event) => {
+            if (event.data && event.data.size > 0) {
+                this.sendEncodedAudioChunk(event.data);
+            }
+        };
+        this.audioChunkRecorder.start();
+        this.audioChunkFlushInterval = setInterval(() => {
+            try {
+                if (this.audioChunkRecorder?.state === 'recording') {
+                    this.audioChunkRecorder.requestData();
+                }
+            } catch (error) {
+                console.warn('Audio chunk recorder requestData failed', error);
+            }
+        }, window.initialData.recordingChunkIntervalMs || 5000);
+    }
+
+    async stopAudioChunkRecording() {
+        if (this.audioChunkFlushInterval) {
+            clearInterval(this.audioChunkFlushInterval);
+            this.audioChunkFlushInterval = null;
+        }
+        if (!this.audioChunkRecorder || this.audioChunkRecorder.state === 'inactive') {
+            return;
+        }
+        await new Promise((resolve) => {
+            const recorder = this.audioChunkRecorder;
+            recorder.addEventListener('stop', () => resolve(), { once: true });
+            try {
+                recorder.requestData();
+            } catch (error) {
+                console.warn('Final audio chunk requestData failed', error);
+            }
+            recorder.stop();
+        });
+        this.audioChunkRecorder = null;
     }
 
     sendMixedAudio(timestamp, audioData) {

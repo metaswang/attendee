@@ -518,6 +518,14 @@ class BotValidationMixin:
         if view not in [RecordingViews.SPEAKER_VIEW, RecordingViews.GALLERY_VIEW, RecordingViews.SPEAKER_VIEW_NO_SIDEBAR, None]:
             raise serializers.ValidationError({"view": "View must be speaker_view or gallery_view or speaker_view_no_sidebar"})
 
+        transport = value.get("transport", "local_file")
+        if transport not in ["local_file", "r2_chunks"]:
+            raise serializers.ValidationError({"transport": "Transport must be local_file or r2_chunks"})
+
+        chunk_interval_ms = value.get("chunk_interval_ms")
+        if chunk_interval_ms is not None and (not isinstance(chunk_interval_ms, int) or chunk_interval_ms < 1000 or chunk_interval_ms > 120000):
+            raise serializers.ValidationError({"chunk_interval_ms": "chunk_interval_ms must be an integer between 1000 and 120000"})
+
         # You can only reserve additional storage if you're using Kubernetes to launch the bot
         if value.get("reserve_additional_storage") and os.getenv("LAUNCH_BOT_METHOD") != "kubernetes":
             raise serializers.ValidationError({"reserve_additional_storage": "Not supported unless using Kubernetes"})
@@ -625,12 +633,14 @@ class RTMPSettingsJSONField(serializers.JSONField):
 
 BOT_RECORDING_SETTINGS_DEFAULT_VALUES = {
     "format": RecordingFormats.MP4,
+    "transport": "local_file",
     "view": RecordingViews.SPEAKER_VIEW,
     "resolution": RecordingResolutions.HD_1080P,
     "record_chat_messages_when_paused": False,
     "record_async_transcription_audio_chunks": False,
     "record_participant_speech_start_stop_events": False,
     "reserve_additional_storage": False,
+    "chunk_interval_ms": 5000,
 }
 BOT_RECORDING_SETTINGS_SCHEMA = {
     "type": "object",
@@ -638,6 +648,12 @@ BOT_RECORDING_SETTINGS_SCHEMA = {
         "format": {
             "type": "string",
             "description": "The format of the recording to save. The supported formats are 'mp4', 'mp3' and 'none'. Defaults to 'mp4'.",
+        },
+        "transport": {
+            "type": "string",
+            "enum": ["local_file", "r2_chunks"],
+            "description": "Recording transport mode. 'local_file' keeps legacy ffmpeg/file upload behavior. 'r2_chunks' uploads browser-recorded chunks directly to object storage.",
+            "default": "local_file",
         },
         "view": {
             "type": "string",
@@ -667,6 +683,25 @@ BOT_RECORDING_SETTINGS_SCHEMA = {
             "type": "boolean",
             "description": "Whether to reserve extra space to store the recording. Only needed when the bot will record video for longer than 6 hours. Defaults to false.",
             "default": False,
+        },
+        "audio_chunk_prefix": {
+            "type": "string",
+            "description": "Object storage prefix for uploaded audio chunks. Required when transport='r2_chunks'.",
+        },
+        "audio_raw_path": {
+            "type": "string",
+            "description": "Canonical object path for the merged audio artifact. Required when transport='r2_chunks'.",
+        },
+        "video_chunk_prefix": {
+            "type": "string",
+            "description": "Object storage prefix for uploaded video chunks. Reserved for future A/V chunk transport.",
+        },
+        "chunk_interval_ms": {
+            "type": "integer",
+            "minimum": 1000,
+            "maximum": 120000,
+            "description": "Chunk flush interval in milliseconds when transport='r2_chunks'. Defaults to 5000.",
+            "default": 5000,
         },
     },
     "additionalProperties": False,
@@ -1199,6 +1234,21 @@ class CreateBotSerializer(BotValidationMixin, serializers.Serializer):
                 "type": "string",
                 "pattern": "^https://.*",
             },
+            "recording_complete": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "pattern": "^https://.*",
+                    },
+                    "signing_secret": {
+                        "type": "string",
+                        "minLength": 1,
+                    },
+                },
+                "required": ["url", "signing_secret"],
+                "additionalProperties": False,
+            },
         },
         "required": [],
         "additionalProperties": False,
@@ -1217,6 +1267,11 @@ class CreateBotSerializer(BotValidationMixin, serializers.Serializer):
         zoom_tokens_url = value.get("zoom_tokens_url")
         if zoom_tokens_url and not zoom_tokens_url.lower().startswith("https://"):
             raise serializers.ValidationError({"zoom_tokens_url": "URL must start with https://"})
+
+        recording_complete = value.get("recording_complete") or {}
+        recording_complete_url = recording_complete.get("url")
+        if recording_complete_url and not recording_complete_url.lower().startswith("https://"):
+            raise serializers.ValidationError({"recording_complete": {"url": "URL must start with https://"}})
 
         return value
 
@@ -1622,6 +1677,46 @@ class CreateBotSerializer(BotValidationMixin, serializers.Serializer):
 
         if unexpected_fields:
             raise serializers.ValidationError(f"Unexpected field(s): {', '.join(sorted(unexpected_fields))}. Allowed fields are: {', '.join(sorted(expected_fields))}")
+
+        recording_settings = data.get("recording_settings") or {}
+        callback_settings = data.get("callback_settings") or {}
+        transport = recording_settings.get("transport", "local_file")
+
+        if transport == "r2_chunks":
+            meeting_type = meeting_type_from_url(data.get("meeting_url", ""))
+            zoom_settings = data.get("zoom_settings") or {}
+            is_supported_web_adapter = (
+                meeting_type in [MeetingTypes.GOOGLE_MEET, MeetingTypes.TEAMS]
+                or (meeting_type == MeetingTypes.ZOOM and zoom_settings.get("sdk", "native") == "web")
+            )
+            if not is_supported_web_adapter:
+                raise serializers.ValidationError({"recording_settings": {"transport": "transport='r2_chunks' is only supported for web meeting adapters"}})
+
+            if recording_settings.get("format") != RecordingFormats.MP3:
+                raise serializers.ValidationError({"recording_settings": {"format": "transport='r2_chunks' currently supports audio-only recording (format='mp3')"}})
+
+            audio_chunk_prefix = recording_settings.get("audio_chunk_prefix")
+            audio_raw_path = recording_settings.get("audio_raw_path")
+            video_chunk_prefix = recording_settings.get("video_chunk_prefix")
+
+            if not audio_chunk_prefix:
+                raise serializers.ValidationError({"recording_settings": {"audio_chunk_prefix": "Required when transport='r2_chunks'"}})
+            if not audio_raw_path:
+                raise serializers.ValidationError({"recording_settings": {"audio_raw_path": "Required when transport='r2_chunks'"}})
+            if video_chunk_prefix:
+                raise serializers.ValidationError({"recording_settings": {"video_chunk_prefix": "Must be absent for audio-only r2_chunks recording"}})
+
+            audio_prefix_parts = audio_chunk_prefix.split("/")
+            if len(audio_prefix_parts) != 4 or audio_prefix_parts[0] != "customer_audio" or audio_prefix_parts[3] != "chunks":
+                raise serializers.ValidationError({"recording_settings": {"audio_chunk_prefix": "Must follow customer_audio/{user_id}/{session_id}/chunks"}})
+
+            audio_raw_parts = audio_raw_path.split("/")
+            if len(audio_raw_parts) != 4 or audio_raw_parts[0] != "customer_audio" or audio_raw_parts[3] != "original.m4a":
+                raise serializers.ValidationError({"recording_settings": {"audio_raw_path": "Must follow customer_audio/{user_id}/{session_id}/original.m4a"}})
+
+            recording_complete = callback_settings.get("recording_complete") or {}
+            if not recording_complete.get("url") or not recording_complete.get("signing_secret"):
+                raise serializers.ValidationError({"callback_settings": {"recording_complete": "recording_complete callback is required when transport='r2_chunks'"}})
 
         return data
 

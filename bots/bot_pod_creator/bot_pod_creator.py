@@ -217,8 +217,9 @@ class BotPodCreator:
 
     def get_bot_container(self):
         cpu_request = self.bot_cpu_request or os.getenv("BOT_CPU_REQUEST", "4")
-        memory_request = os.getenv("BOT_MEMORY_REQUEST", "4Gi")
-        memory_limit = os.getenv("BOT_MEMORY_LIMIT", "4Gi")
+        bot = getattr(self, "bot", None)
+        memory_request = getattr(bot, "memory_request", lambda: os.getenv("BOT_MEMORY_REQUEST", "4Gi"))()
+        memory_limit = getattr(bot, "memory_limit", lambda: os.getenv("BOT_MEMORY_LIMIT", "4Gi"))()
         ephemeral_storage_request = os.getenv("BOT_EPHEMERAL_STORAGE_REQUEST", "10Gi")
 
         args = ["python", "manage.py", "run_bot", "--botid", str(self.bot_id)]
@@ -293,6 +294,7 @@ class BotPodCreator:
     def create_bot_pod(
         self,
         bot_id: int,
+        bot=None,
         bot_name: Optional[str] = None,
         bot_cpu_request: Optional[int] = None,
         add_webpage_streamer: Optional[bool] = False,
@@ -315,6 +317,7 @@ class BotPodCreator:
             bot_name = f"bot-{bot_id}-{uuid.uuid4().hex[:8]}"
 
         self.bot_id = bot_id
+        self.bot = bot
         self.bot_cpu_request = bot_cpu_request
         self.add_persistent_storage = add_persistent_storage
 

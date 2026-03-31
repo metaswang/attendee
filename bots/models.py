@@ -822,6 +822,18 @@ class Bot(models.Model):
         return math.ceil(centicredits_active)
 
     def cpu_request(self):
+        runtime_class = self.runtime_resource_class()
+        class_cpu_default = {
+            "transcription_only": "2",
+            "audio_only": "2",
+            "web_av_standard": "4",
+            "web_av_heavy": "8",
+        }[runtime_class]
+
+        class_env_value = os.getenv(f"BOT_RUNTIME_CLASS_{runtime_class.upper()}_CPU_REQUEST")
+        if class_env_value:
+            return class_env_value
+
         from bots.meeting_url_utils import meeting_type_from_url
 
         bot_meeting_type = meeting_type_from_url(self.meeting_url)
@@ -839,11 +851,44 @@ class Bot(models.Model):
 
         env_var_name = f"{meeting_type_env_var_substring}_{recording_mode_env_var_substring}_BOT_CPU_REQUEST"
 
-        default_cpu_request = os.getenv("BOT_CPU_REQUEST", "4") or "4"
+        default_cpu_request = os.getenv("BOT_CPU_REQUEST", class_cpu_default) or class_cpu_default
         value_from_env_var = os.getenv(env_var_name, default_cpu_request)
         if not value_from_env_var:
             return default_cpu_request
         return value_from_env_var
+
+    def memory_request(self):
+        runtime_class = self.runtime_resource_class()
+        class_default = {
+            "transcription_only": "4Gi",
+            "audio_only": "4Gi",
+            "web_av_standard": "8Gi",
+            "web_av_heavy": "16Gi",
+        }[runtime_class]
+        return os.getenv(f"BOT_RUNTIME_CLASS_{runtime_class.upper()}_MEMORY_REQUEST", os.getenv("BOT_MEMORY_REQUEST", class_default)) or class_default
+
+    def memory_limit(self):
+        runtime_class = self.runtime_resource_class()
+        class_default = {
+            "transcription_only": "4Gi",
+            "audio_only": "4Gi",
+            "web_av_standard": "8Gi",
+            "web_av_heavy": "16Gi",
+        }[runtime_class]
+        return os.getenv(f"BOT_RUNTIME_CLASS_{runtime_class.upper()}_MEMORY_LIMIT", os.getenv("BOT_MEMORY_LIMIT", class_default)) or class_default
+
+    def runtime_size_slug(self):
+        runtime_class = self.runtime_resource_class()
+        class_default = {
+            "transcription_only": "s-2vcpu-4gb",
+            "audio_only": "s-2vcpu-4gb",
+            "web_av_standard": "s-4vcpu-8gb",
+            "web_av_heavy": "s-8vcpu-16gb",
+        }[runtime_class]
+        return os.getenv(
+            f"BOT_RUNTIME_CLASS_{runtime_class.upper()}_DO_SIZE_SLUG",
+            os.getenv("DO_BOT_SIZE_SLUG", os.getenv("DO_BOT_SIZE_CLASS", class_default)),
+        ) or class_default
 
     @property
     def transcription_settings(self):
@@ -924,11 +969,41 @@ class Bot(models.Model):
             callback_settings = {}
         return callback_settings.get("zoom_tokens_url", None)
 
+    def recording_complete_callback_url(self):
+        callback_settings = self.settings.get("callback_settings", {}) or {}
+        recording_complete = callback_settings.get("recording_complete") or {}
+        return recording_complete.get("url")
+
+    def recording_complete_signing_secret(self):
+        callback_settings = self.settings.get("callback_settings", {}) or {}
+        recording_complete = callback_settings.get("recording_complete") or {}
+        return recording_complete.get("signing_secret")
+
     def recording_format(self):
         recording_settings = self.settings.get("recording_settings", {})
         if recording_settings is None:
             recording_settings = {}
         return recording_settings.get("format", RecordingFormats.MP4)
+
+    def recording_transport(self):
+        recording_settings = self.settings.get("recording_settings", {}) or {}
+        return recording_settings.get("transport", "local_file")
+
+    def recording_chunk_interval_ms(self):
+        recording_settings = self.settings.get("recording_settings", {}) or {}
+        return int(recording_settings.get("chunk_interval_ms", 5000))
+
+    def audio_chunk_prefix(self):
+        recording_settings = self.settings.get("recording_settings", {}) or {}
+        return recording_settings.get("audio_chunk_prefix")
+
+    def audio_raw_path(self):
+        recording_settings = self.settings.get("recording_settings", {}) or {}
+        return recording_settings.get("audio_raw_path")
+
+    def video_chunk_prefix(self):
+        recording_settings = self.settings.get("recording_settings", {}) or {}
+        return recording_settings.get("video_chunk_prefix")
 
     def record_chat_messages_when_paused(self):
         recording_settings = self.settings.get("recording_settings", {})
@@ -968,6 +1043,22 @@ class Bot(models.Model):
         else:
             raise ValueError(f"Invalid recording format: {recording_format}")
 
+    def runtime_resource_class(self):
+        if self.recording_type() == RecordingTypes.NO_RECORDING:
+            return "web_av_heavy" if self._uses_heavy_runtime_features() else "transcription_only"
+        if self.recording_type() == RecordingTypes.AUDIO_ONLY:
+            return "web_av_heavy" if self._uses_heavy_runtime_features() else "audio_only"
+        return "web_av_heavy" if self._uses_heavy_runtime_features() else "web_av_standard"
+
+    def _uses_heavy_runtime_features(self):
+        return bool(
+            self.should_launch_webpage_streamer()
+            or self.websocket_audio_url()
+            or self.websocket_per_participant_audio_url()
+            or self.record_async_transcription_audio_chunks()
+            or self.record_participant_speech_start_stop_events()
+        )
+
     def recording_dimensions(self):
         recording_settings = self.settings.get("recording_settings", {})
         if recording_settings is None:
@@ -987,13 +1078,6 @@ class Bot(models.Model):
 
     def create_debug_recording(self):
         if os.getenv("SAVE_DEBUG_RECORDINGS", "false") == "true":
-            return True
-
-        from bots.meeting_url_utils import meeting_type_from_url
-
-        # Temporarily enabling this for all google meet meetings
-        bot_meeting_type = meeting_type_from_url(self.meeting_url)
-        if (bot_meeting_type == MeetingTypes.GOOGLE_MEET or bot_meeting_type == MeetingTypes.TEAMS or (bot_meeting_type == MeetingTypes.ZOOM and self.use_zoom_web_adapter())) and self.recording_type() == RecordingTypes.AUDIO_AND_VIDEO:
             return True
 
         debug_settings = self.settings.get("debug_settings", {})

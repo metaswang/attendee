@@ -121,7 +121,7 @@ class DigitalOceanDropletProvider:
             defaults={
                 "provider": BotRuntimeProviderTypes.DIGITALOCEAN_DROPLET,
                 "region": os.getenv("DO_BOT_REGION", "sgp1"),
-                "size_class": os.getenv("DO_BOT_SIZE_SLUG", os.getenv("DO_BOT_SIZE_CLASS", "s-4vcpu-8gb")),
+                "size_class": bot.runtime_size_slug(),
                 "snapshot_id": os.getenv("DO_BOT_SNAPSHOT_ID"),
             },
         )
@@ -140,7 +140,7 @@ class DigitalOceanDropletProvider:
         payload = {
             "name": bot.digitalocean_droplet_name(),
             "region": os.getenv("DO_BOT_REGION", "sgp1"),
-            "size": os.getenv("DO_BOT_SIZE_SLUG", os.getenv("DO_BOT_SIZE_CLASS", "s-4vcpu-8gb")),
+            "size": bot.runtime_size_slug(),
             "image": snapshot_id,
             "tags": self._tags(bot),
             "user_data": self._user_data(bot, lease),

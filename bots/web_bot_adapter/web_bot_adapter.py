@@ -42,6 +42,7 @@ class WebBotAdapter(BotAdapter):
         add_audio_chunk_callback,
         add_mixed_audio_chunk_callback,
         add_encoded_mp4_chunk_callback,
+        add_encoded_audio_chunk_callback,
         upsert_caption_callback,
         upsert_chat_message_callback,
         add_participant_event_callback,
@@ -54,6 +55,7 @@ class WebBotAdapter(BotAdapter):
         record_chat_messages_when_paused: bool,
         disable_incoming_video: bool,
         record_participant_speech_start_stop_events: bool,
+        recording_chunk_interval_ms: int,
     ):
         self.display_name = display_name
         self.send_message_callback = send_message_callback
@@ -62,6 +64,7 @@ class WebBotAdapter(BotAdapter):
         self.add_video_frame_callback = add_video_frame_callback
         self.wants_any_video_frames_callback = wants_any_video_frames_callback
         self.add_encoded_mp4_chunk_callback = add_encoded_mp4_chunk_callback
+        self.add_encoded_audio_chunk_callback = add_encoded_audio_chunk_callback
         self.upsert_caption_callback = upsert_caption_callback
         self.upsert_chat_message_callback = upsert_chat_message_callback
         self.add_participant_event_callback = add_participant_event_callback
@@ -71,6 +74,7 @@ class WebBotAdapter(BotAdapter):
         self.record_chat_messages_when_paused = record_chat_messages_when_paused
         self.disable_incoming_video = disable_incoming_video
         self.record_participant_speech_start_stop_events = record_participant_speech_start_stop_events
+        self.recording_chunk_interval_ms = recording_chunk_interval_ms
         self.meeting_url = meeting_url
 
         # This is an internal ID that comes from the platform. It is currently only used for MS Teams.
@@ -128,6 +132,17 @@ class WebBotAdapter(BotAdapter):
             encoded_mp4_data = message[4:]
             logger.info(f"encoded mp4 data length {len(encoded_mp4_data)}")
             self.add_encoded_mp4_chunk_callback(encoded_mp4_data)
+
+    def process_encoded_audio_chunk(self, message):
+        if self.recording_paused:
+            return
+        if not self.add_encoded_audio_chunk_callback:
+            return
+
+        self.last_media_message_processed_time = time.time()
+        if len(message) > 4:
+            encoded_audio_data = message[4:]
+            self.add_encoded_audio_chunk_callback(encoded_audio_data)
 
     def get_participant(self, participant_id):
         if participant_id in self.participants_info:
@@ -407,6 +422,8 @@ class WebBotAdapter(BotAdapter):
                     self.process_encoded_mp4_chunk(message)
                 elif message_type == 5:  # PER_PARTICIPANT_AUDIO
                     self.process_per_participant_audio_frame(message)
+                elif message_type == 6:  # ENCODED_AUDIO_CHUNK
+                    self.process_encoded_audio_chunk(message)
 
                 self.last_websocket_message_processed_time = time.time()
         except Exception as e:
@@ -594,7 +611,22 @@ class WebBotAdapter(BotAdapter):
         self.driver = webdriver.Chrome(options=options, service=Service(executable_path="/usr/local/bin/chromedriver"))
         logger.info(f"web driver server initialized at port {self.driver.service.port}")
 
-        initial_data_code = f"window.initialData = {{websocketPort: {self.websocket_port}, videoFrameWidth: {self.video_frame_size[0]}, videoFrameHeight: {self.video_frame_size[1]}, botName: {json.dumps(self.display_name)}, addClickRipple: {'true' if self.should_create_debug_recording else 'false'}, recordingView: '{self.recording_view}', sendMixedAudio: {'true' if self.add_mixed_audio_chunk_callback else 'false'}, sendPerParticipantAudio: {'true' if self.add_audio_chunk_callback else 'false'}, collectCaptions: {'true' if self.upsert_caption_callback else 'false'}, recordParticipantSpeechStartStopEvents: {'true' if self.record_participant_speech_start_stop_events else 'false'}}}"
+        initial_data_code = (
+            "window.initialData = {"
+            f"websocketPort: {self.websocket_port}, "
+            f"videoFrameWidth: {self.video_frame_size[0]}, "
+            f"videoFrameHeight: {self.video_frame_size[1]}, "
+            f"botName: {json.dumps(self.display_name)}, "
+            f"addClickRipple: {'true' if self.should_create_debug_recording else 'false'}, "
+            f"recordingView: '{self.recording_view}', "
+            f"sendMixedAudio: {'true' if self.add_mixed_audio_chunk_callback else 'false'}, "
+            f"sendPerParticipantAudio: {'true' if self.add_audio_chunk_callback else 'false'}, "
+            f"sendEncodedAudioChunks: {'true' if self.add_encoded_audio_chunk_callback else 'false'}, "
+            f"recordingChunkIntervalMs: {self.recording_chunk_interval_ms}, "
+            f"collectCaptions: {'true' if self.upsert_caption_callback else 'false'}, "
+            f"recordParticipantSpeechStartStopEvents: {'true' if self.record_participant_speech_start_stop_events else 'false'}"
+            "}"
+        )
 
         # Define the CDN libraries needed
         CDN_LIBRARIES = ["https://cdnjs.cloudflare.com/ajax/libs/protobufjs/7.4.0/protobuf.min.js", "https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js"]

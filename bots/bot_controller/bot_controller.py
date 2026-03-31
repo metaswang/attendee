@@ -5,6 +5,7 @@ import signal
 import threading
 import time
 import traceback
+import uuid
 from base64 import b64decode
 from datetime import timedelta
 
@@ -20,7 +21,7 @@ from bots.bot_adapter import BotAdapter
 from bots.bot_controller.bot_websocket_client_manager import BotWebsocketClientManager
 from bots.bot_sso_utils import create_google_meet_sign_in_session
 from bots.bots_api_utils import BotCreationSource
-from bots.external_callback_utils import get_zoom_tokens
+from bots.external_callback_utils import get_zoom_tokens, make_signed_callback_request
 from bots.meeting_url_utils import meeting_type_from_url, parse_zoom_registrant_token
 from bots.models import (
     AudioChunk,
@@ -73,6 +74,7 @@ from .per_participant_non_streaming_audio_input_manager import PerParticipantNon
 from .per_participant_streaming_audio_input_manager import PerParticipantStreamingAudioInputManager
 from .pipeline_configuration import PipelineConfiguration
 from .realtime_audio_output_manager import RealtimeAudioOutputManager
+from .recording_chunk_uploader import RecordingChunkUploader
 from .rtmp_client import RTMPClient
 from .s3_file_uploader import S3FileUploader
 from .screen_and_audio_recorder import ScreenAndAudioRecorder
@@ -195,6 +197,7 @@ class BotController:
             add_participant_event_callback=self.on_new_participant_event,
             automatic_leave_configuration=self.automatic_leave_configuration,
             add_encoded_mp4_chunk_callback=None,
+            add_encoded_audio_chunk_callback=self.on_recording_audio_chunk_from_adapter if self.uses_recording_chunks_transport() else None,
             recording_view=self.bot_in_db.recording_view(),
             google_meet_closed_captions_language=self.bot_in_db.transcription_settings.google_meet_closed_captions_language(),
             should_create_debug_recording=self.bot_in_db.create_debug_recording(),
@@ -204,6 +207,7 @@ class BotController:
             record_chat_messages_when_paused=self.bot_in_db.record_chat_messages_when_paused(),
             disable_incoming_video=self.disable_incoming_video_for_web_bots(),
             record_participant_speech_start_stop_events=self.bot_in_db.record_participant_speech_start_stop_events(),
+            recording_chunk_interval_ms=self.bot_in_db.recording_chunk_interval_ms(),
             modify_dom_for_video_recording=self.should_modify_dom_for_video_recording_for_web_bots(),
             google_meet_bot_login_is_available=self.google_meet_bot_login_is_available(),
             google_meet_bot_login_should_be_used=self.bot_in_db.google_meet_login_mode_is_always(),
@@ -228,6 +232,7 @@ class BotController:
             add_participant_event_callback=self.on_new_participant_event,
             automatic_leave_configuration=self.automatic_leave_configuration,
             add_encoded_mp4_chunk_callback=None,
+            add_encoded_audio_chunk_callback=self.on_recording_audio_chunk_from_adapter if self.uses_recording_chunks_transport() else None,
             recording_view=self.bot_in_db.recording_view(),
             teams_closed_captions_language=self.bot_in_db.transcription_settings.teams_closed_captions_language(),
             should_create_debug_recording=self.bot_in_db.create_debug_recording(),
@@ -239,6 +244,7 @@ class BotController:
             record_chat_messages_when_paused=self.bot_in_db.record_chat_messages_when_paused(),
             record_participant_speech_start_stop_events=self.bot_in_db.record_participant_speech_start_stop_events(),
             disable_incoming_video=self.disable_incoming_video_for_web_bots(),
+            recording_chunk_interval_ms=self.bot_in_db.recording_chunk_interval_ms(),
             modify_dom_for_video_recording=self.should_modify_dom_for_video_recording_for_web_bots(),
         )
 
@@ -298,6 +304,7 @@ class BotController:
             add_participant_event_callback=self.on_new_participant_event,
             automatic_leave_configuration=self.automatic_leave_configuration,
             add_encoded_mp4_chunk_callback=None,
+            add_encoded_audio_chunk_callback=self.on_recording_audio_chunk_from_adapter if self.uses_recording_chunks_transport() else None,
             recording_view=self.bot_in_db.recording_view(),
             should_create_debug_recording=self.bot_in_db.create_debug_recording(),
             start_recording_screen_callback=self.screen_and_audio_recorder.start_recording if self.screen_and_audio_recorder else None,
@@ -308,6 +315,7 @@ class BotController:
             should_ask_for_recording_permission=self.pipeline_configuration.record_audio or self.pipeline_configuration.rtmp_stream_audio or self.pipeline_configuration.websocket_stream_audio or self.pipeline_configuration.record_video or self.pipeline_configuration.rtmp_stream_video,
             record_chat_messages_when_paused=self.bot_in_db.record_chat_messages_when_paused(),
             disable_incoming_video=self.disable_incoming_video_for_web_bots(),
+            recording_chunk_interval_ms=self.bot_in_db.recording_chunk_interval_ms(),
             modify_dom_for_video_recording=self.should_modify_dom_for_video_recording_for_web_bots(),
             record_participant_speech_start_stop_events=self.bot_in_db.record_participant_speech_start_stop_events(),
             zoom_tokens=zoom_tokens,
@@ -460,6 +468,16 @@ class BotController:
         elif meeting_type == MeetingTypes.TEAMS:
             return self.get_teams_bot_adapter()
 
+    def uses_recording_chunks_transport(self):
+        return self.bot_in_db.recording_transport() == "r2_chunks"
+
+    def recording_complete_provider(self):
+        return {
+            MeetingTypes.GOOGLE_MEET: "google",
+            MeetingTypes.TEAMS: "microsoft",
+            MeetingTypes.ZOOM: "zoom",
+        }.get(self.get_meeting_type())
+
     def get_first_buffer_timestamp_ms(self):
         if self.screen_and_audio_recorder:
             return self.adapter.get_first_buffer_timestamp_ms()
@@ -474,6 +492,67 @@ class BotController:
         recording.file = s3_storage_key
         recording.first_buffer_timestamp_ms = self.get_first_buffer_timestamp_ms()
         recording.save()
+
+    def recording_chunk_duration_sec(self):
+        if not self.recording_chunks_started_at:
+            return 0
+        return max(1, int(time.time() - self.recording_chunks_started_at))
+
+    def recording_session_id(self):
+        raw_path = self.bot_in_db.audio_raw_path() or ""
+        parts = raw_path.split("/")
+        if len(parts) >= 4:
+            return parts[2]
+        return None
+
+    def on_recording_audio_chunk_from_adapter(self, chunk_bytes):
+        if not self.recording_chunk_uploader:
+            logger.warning("Received recording audio chunk but no recording chunk uploader is configured")
+            return
+        self.recording_chunk_uploader.enqueue_chunk(chunk_bytes)
+
+    def deliver_recording_complete_callback(self):
+        if not self.uses_recording_chunks_transport():
+            return
+        if not self.recording_chunk_uploader:
+            raise RuntimeError("Recording chunk uploader is not configured")
+
+        uploaded_chunk_paths = self.recording_chunk_uploader.wait_for_uploads()
+        if not uploaded_chunk_paths:
+            raise RuntimeError("No recording chunks were uploaded")
+
+        session_id = self.recording_session_id()
+        if not session_id:
+            raise RuntimeError("Could not determine recording session id from audio_raw_path")
+
+        callback_url = self.bot_in_db.recording_complete_callback_url()
+        callback_secret = self.bot_in_db.recording_complete_signing_secret()
+        if not callback_url or not callback_secret:
+            raise RuntimeError("Recording completion callback settings are missing")
+
+        payload = {
+            "idempotency_key": str(uuid.uuid4()),
+            "trigger": "recording.complete",
+            "bot_id": self.bot_in_db.object_id,
+            "provider": self.recording_complete_provider(),
+            "data": {
+                "session_id": session_id,
+                "audio": {
+                    "chunk_paths": uploaded_chunk_paths,
+                    "chunk_count": len(uploaded_chunk_paths),
+                    "chunk_ext": "webm",
+                    "chunk_mime_type": "audio/webm;codecs=opus",
+                    "chunk_interval_ms": self.bot_in_db.recording_chunk_interval_ms(),
+                    "duration_sec": self.recording_chunk_duration_sec(),
+                    "raw_path": self.bot_in_db.audio_raw_path(),
+                },
+            },
+        }
+        make_signed_callback_request(
+            url=callback_url,
+            payload=payload,
+            signing_secret=callback_secret,
+        )
 
     def get_recording_transcription_provider(self):
         recording = Recording.objects.get(bot=self.bot_in_db, is_default_recording=True)
@@ -606,7 +685,10 @@ class BotController:
             logger.info("Telling websocket client manager to cleanup...")
             self.websocket_client_manager.cleanup()
 
-        if self.get_recording_file_location():
+        if self.uses_recording_chunks_transport():
+            logger.info("Flushing browser recording chunks and delivering completion callback...")
+            self.deliver_recording_complete_callback()
+        elif self.get_recording_file_location():
             self.upload_recording_to_external_media_storage_if_enabled()
 
             logger.info("Telling file uploader to upload recording file...")
@@ -621,11 +703,13 @@ class BotController:
         if self.bot_in_db.create_debug_recording():
             self.save_debug_recording()
 
+        if self.recording_chunk_uploader:
+            self.recording_chunk_uploader.shutdown()
+
         if self.audio_chunk_uploader:
             self.audio_chunk_uploader.shutdown()
 
         if self.bot_in_db.state == BotStates.POST_PROCESSING:
-            self.wait_until_all_utterances_are_terminated()
             BotEventManager.create_event(bot=self.bot_in_db, event_type=BotEventTypes.POST_PROCESSING_COMPLETED)
 
         normal_quitting_process_worked = True
@@ -653,6 +737,8 @@ class BotController:
         self.bot_in_db = Bot.objects.get(id=bot_id)
         self.cleanup_called = False
         self.run_called = False
+        self.recording_chunks_started_at = None
+        self.recording_chunk_uploader = None
 
         self.redis_client = None
         self.pubsub = None
@@ -752,6 +838,9 @@ class BotController:
         return self.pipeline_configuration.websocket_stream_audio or self.pipeline_configuration.websocket_stream_per_participant_audio
 
     def should_create_screen_and_audio_recorder(self):
+        if self.uses_recording_chunks_transport():
+            return False
+
         # if we're not recording audio or video and not doing rtmp streaming, then we don't need to create a screen and audio recorder
         if not self.pipeline_configuration.record_audio and not self.pipeline_configuration.record_video and not self.pipeline_configuration.rtmp_stream_audio and not self.pipeline_configuration.rtmp_stream_video:
             return False
@@ -846,6 +935,13 @@ class BotController:
                 file_location=self.get_recording_file_location(),
                 recording_dimensions=self.bot_in_db.recording_dimensions(),
                 audio_only=not (self.pipeline_configuration.record_video or self.pipeline_configuration.rtmp_stream_video),
+            )
+
+        if self.uses_recording_chunks_transport():
+            self.recording_chunk_uploader = RecordingChunkUploader(
+                chunk_prefix=self.bot_in_db.audio_chunk_prefix(),
+                chunk_ext="webm",
+                chunk_mime_type="audio/webm;codecs=opus",
             )
 
         self.websocket_client_manager = None
@@ -1972,6 +2068,8 @@ class BotController:
 
             # The internal pipeline needs to start or resume recording.
             self.start_or_resume_recording_for_pipeline_objects_raise_on_failure()
+            if self.uses_recording_chunks_transport() and self.recording_chunks_started_at is None:
+                self.recording_chunks_started_at = time.time()
 
             BotEventManager.create_event(
                 bot=self.bot_in_db,
