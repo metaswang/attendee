@@ -36,7 +36,12 @@ class Command(BaseCommand):
         client = compute_v1.RegionsClient()
 
         for region in regions:
-            region_resource = client.get(project=project_id, region=region)
+            try:
+                region_resource = client.get(project=project_id, region=region)
+            except Exception as exc:
+                logger.warning("Skipping GCP runtime capacity sync for region %s: %s", region, exc)
+                continue
+
             quota = next((item for item in region_resource.quotas if item.metric == metric_name), None)
             if quota is None:
                 logger.warning("Region %s does not expose quota metric %s; skipping", region, metric_name)

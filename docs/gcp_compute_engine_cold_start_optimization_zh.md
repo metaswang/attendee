@@ -158,6 +158,10 @@ startup script 只保留：
 - `GCP_BOT_SOURCE_IMAGE_FAMILY=attendee-bot-golden`
 - `GCP_BOT_SOURCE_IMAGE_PROJECT=<image-project>`
 
+执行细节可直接参考：
+
+- [GCP N2 Golden Image 执行手册](./gcp_n2_golden_image_runbook_zh.md)
+
 ## 监控与验收
 
 至少记录以下分段耗时：

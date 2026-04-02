@@ -2,7 +2,7 @@
 set -euo pipefail
 
 DOMAIN="${1:-meetbot.voxstudio.me}"
-SSL_DIR="${2:-deploy/nginx/ssl}"
+SSL_DIR="${2:-/mnt/HC_Volume_105273825/voxstudio/attendee/nginx/ssl}"
 CRT_PATH="${SSL_DIR}/${DOMAIN}.crt"
 KEY_PATH="${SSL_DIR}/${DOMAIN}.key"
 

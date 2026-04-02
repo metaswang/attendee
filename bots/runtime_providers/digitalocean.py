@@ -30,8 +30,14 @@ class DigitalOceanDropletProvider:
     ENV_EXCLUDES = {
         "BOT_HOST_CODE_PATH",
         "BOT_MAX_SIMULTANEOUS_BOTS",
+        "DATABASE_URL",
         "DROPLET_API_KEY",
         "GOOGLE_APPLICATION_CREDENTIALS",
+        "PGDATABASE",
+        "PGHOST",
+        "PGPASSWORD",
+        "PGPORT",
+        "PGUSER",
         "PULSE_RUNTIME_PATH",
         "PULSE_SERVER",
         "XDG_RUNTIME_DIR",
@@ -76,6 +82,12 @@ class DigitalOceanDropletProvider:
     def _runtime_callback_url(self, lease: BotRuntimeLease) -> str:
         return build_site_url(reverse("bots_internal:bot-runtime-lease-complete", args=[lease.id]))
 
+    def _runtime_bootstrap_url(self, lease: BotRuntimeLease) -> str:
+        return build_site_url(reverse("bots_internal:bot-runtime-lease-bootstrap", args=[lease.id]))
+
+    def _runtime_control_url(self, lease: BotRuntimeLease) -> str:
+        return build_site_url(reverse("bots_internal:bot-runtime-lease-control", args=[lease.id]))
+
     def _serialized_runtime_env(self, bot, lease: BotRuntimeLease) -> str:
         env_vars = {}
         for key, value in os.environ.items():
@@ -90,6 +102,9 @@ class DigitalOceanDropletProvider:
                 "BOT_ID": str(bot.id),
                 "BOT_OBJECT_ID": bot.object_id,
                 "BOT_RUNTIME_PROVIDER": BotRuntimeProviderTypes.DIGITALOCEAN_DROPLET,
+                "BOT_RUNTIME_BOOTSTRAP_URL": self._runtime_bootstrap_url(lease),
+                "BOT_RUNTIME_CONTROL_URL": self._runtime_control_url(lease),
+                "DJANGO_SETTINGS_MODULE": "attendee.settings.bot_runtime",
                 "IS_DROPLET_BOT_RUNNER": "true",
                 "LEASE_CALLBACK_URL": self._runtime_callback_url(lease),
                 "LEASE_ID": str(lease.id),

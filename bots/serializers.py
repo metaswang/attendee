@@ -518,9 +518,9 @@ class BotValidationMixin:
         if view not in [RecordingViews.SPEAKER_VIEW, RecordingViews.GALLERY_VIEW, RecordingViews.SPEAKER_VIEW_NO_SIDEBAR, None]:
             raise serializers.ValidationError({"view": "View must be speaker_view or gallery_view or speaker_view_no_sidebar"})
 
-        transport = value.get("transport", "local_file")
-        if transport not in ["local_file", "r2_chunks"]:
-            raise serializers.ValidationError({"transport": "Transport must be local_file or r2_chunks"})
+        transport = value.get("transport")
+        if transport is not None and transport != "r2_chunks":
+            raise serializers.ValidationError({"transport": "Transport must be r2_chunks"})
 
         chunk_interval_ms = value.get("chunk_interval_ms")
         if chunk_interval_ms is not None and (not isinstance(chunk_interval_ms, int) or chunk_interval_ms < 1000 or chunk_interval_ms > 120000):
@@ -633,7 +633,6 @@ class RTMPSettingsJSONField(serializers.JSONField):
 
 BOT_RECORDING_SETTINGS_DEFAULT_VALUES = {
     "format": RecordingFormats.MP4,
-    "transport": "local_file",
     "view": RecordingViews.SPEAKER_VIEW,
     "resolution": RecordingResolutions.HD_1080P,
     "record_chat_messages_when_paused": False,
@@ -651,9 +650,8 @@ BOT_RECORDING_SETTINGS_SCHEMA = {
         },
         "transport": {
             "type": "string",
-            "enum": ["local_file", "r2_chunks"],
-            "description": "Recording transport mode. 'local_file' keeps legacy ffmpeg/file upload behavior. 'r2_chunks' uploads browser-recorded chunks directly to object storage.",
-            "default": "local_file",
+            "enum": ["r2_chunks"],
+            "description": "Recording transport mode. Only 'r2_chunks' is supported and uploads browser-recorded chunks directly to object storage.",
         },
         "view": {
             "type": "string",
@@ -1717,7 +1715,9 @@ class CreateBotSerializer(BotValidationMixin, serializers.Serializer):
 
         recording_settings = data.get("recording_settings") or {}
         callback_settings = data.get("callback_settings") or {}
-        transport = recording_settings.get("transport", "local_file")
+        transport = recording_settings.get("transport")
+        if transport is not None and transport != "r2_chunks":
+            raise serializers.ValidationError({"recording_settings": {"transport": "transport must be r2_chunks"}})
 
         if transport == "r2_chunks":
             meeting_type = meeting_type_from_url(data.get("meeting_url", ""))

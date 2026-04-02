@@ -68,6 +68,8 @@ def sign_payload(payload, secret):
     """
     # Convert the payload to a canonical JSON string
     payload_json = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    if isinstance(secret, str):
+        secret = secret.encode("utf-8")
 
     # Create the signature
     signature = hmac.new(secret, payload_json.encode("utf-8"), hashlib.sha256).digest()

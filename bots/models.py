@@ -1021,10 +1021,6 @@ class Bot(models.Model):
             recording_settings = {}
         return recording_settings.get("format", RecordingFormats.MP4)
 
-    def recording_transport(self):
-        recording_settings = self.settings.get("recording_settings", {}) or {}
-        return recording_settings.get("transport", "local_file")
-
     def recording_chunk_interval_ms(self):
         recording_settings = self.settings.get("recording_settings", {}) or {}
         return int(recording_settings.get("chunk_interval_ms", 5000))
@@ -1197,7 +1193,7 @@ class BotRuntimeLease(models.Model):
     provider_name = models.CharField(max_length=255, null=True, blank=True)
     region = models.CharField(max_length=64, null=True, blank=True)
     size_class = models.CharField(max_length=64, null=True, blank=True)
-    snapshot_id = models.CharField(max_length=64, null=True, blank=True)
+    snapshot_id = models.CharField(max_length=255, null=True, blank=True)
     shutdown_token = models.CharField(max_length=64, unique=True, editable=False)
     metadata = models.JSONField(default=dict, blank=True)
     last_error = models.TextField(null=True, blank=True)

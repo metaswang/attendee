@@ -1,3 +1,5 @@
+import datetime
+import json
 import logging
 import threading
 from queue import Queue
@@ -9,13 +11,26 @@ logger = logging.getLogger(__name__)
 
 
 class RecordingChunkUploader:
-    def __init__(self, *, chunk_prefix: str, chunk_ext: str, chunk_mime_type: str, worker_count: int = 2, max_queue_size: int = 8):
+    def __init__(
+        self,
+        *,
+        chunk_prefix: str,
+        chunk_ext: str,
+        chunk_mime_type: str,
+        raw_path: str | None = None,
+        chunk_interval_ms: int | None = None,
+        worker_count: int = 2,
+        max_queue_size: int = 8,
+    ):
         self.chunk_prefix = chunk_prefix.rstrip("/")
         self.chunk_ext = chunk_ext.lstrip(".")
         self.chunk_mime_type = chunk_mime_type
+        self.raw_path = raw_path
+        self.chunk_interval_ms = chunk_interval_ms
         self.queue = Queue(maxsize=max_queue_size)
         self.upload_errors = []
         self.uploaded_chunk_paths = []
+        self._upload_result = None
         self._lock = threading.Lock()
         self._next_chunk_index = 0
         self._workers = []
@@ -58,6 +73,11 @@ class RecordingChunkUploader:
             self._next_chunk_index += 1
         return f"{self.chunk_prefix}/chunk_{chunk_index:04d}.{self.chunk_ext}"
 
+    def _manifest_path(self):
+        if self.chunk_prefix.endswith("/chunks"):
+            return f"{self.chunk_prefix.rsplit('/chunks', 1)[0]}/manifest.json"
+        return f"{self.chunk_prefix}/manifest.json"
+
     def enqueue_chunk(self, data: bytes):
         chunk_path = self._next_chunk_path()
         self.queue.put((chunk_path, data))
@@ -80,6 +100,38 @@ class RecordingChunkUploader:
             ContentType=self.chunk_mime_type,
         )
 
+    def _upload_manifest(self, chunk_paths: list[str]):
+        manifest_path = self._manifest_path()
+        manifest_payload = {
+            "transport": "r2_chunks",
+            "chunk_prefix": self.chunk_prefix,
+            "chunk_paths": chunk_paths,
+            "chunk_count": len(chunk_paths),
+            "chunk_ext": self.chunk_ext,
+            "chunk_mime_type": self.chunk_mime_type,
+            "chunk_interval_ms": self.chunk_interval_ms,
+            "raw_path": self.raw_path,
+            "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }
+        manifest_bytes = json.dumps(manifest_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+        if self._azure_service_client is not None:
+            blob_client = self._azure_service_client.get_blob_client(container=self._azure_container, blob=manifest_path)
+            blob_client.upload_blob(
+                manifest_bytes,
+                overwrite=True,
+                content_settings=self._azure_content_settings_class(content_type="application/json"),
+            )
+            return manifest_path
+
+        self._s3_client.put_object(
+            Bucket=self._s3_bucket,
+            Key=manifest_path,
+            Body=manifest_bytes,
+            ContentType="application/json",
+        )
+        return manifest_path
+
     def _upload_worker(self):
         while True:
             item = self.queue.get()
@@ -99,10 +151,21 @@ class RecordingChunkUploader:
                 self.queue.task_done()
 
     def wait_for_uploads(self):
+        if self._upload_result is not None:
+            return self._upload_result
+
         self.queue.join()
         if self.upload_errors:
             raise RuntimeError(str(self.upload_errors[0]))
-        return list(self.uploaded_chunk_paths)
+        chunk_paths = sorted(self.uploaded_chunk_paths)
+        if not chunk_paths:
+            raise RuntimeError("No recording chunks were uploaded")
+        manifest_path = self._upload_manifest(chunk_paths)
+        self._upload_result = {
+            "chunk_paths": chunk_paths,
+            "manifest_path": manifest_path,
+        }
+        return self._upload_result
 
     def shutdown(self):
         self.wait_for_uploads()

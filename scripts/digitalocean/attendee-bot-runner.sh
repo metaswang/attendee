@@ -4,6 +4,7 @@ set -euo pipefail
 RUNTIME_ENV_PATH="${RUNTIME_ENV_PATH:-/etc/attendee/runtime.env}"
 BOT_RUNTIME_IMAGE="${BOT_RUNTIME_IMAGE:-attendee-bot-runner:latest}"
 BOT_RUNTIME_CONTAINER_NAME_PREFIX="${BOT_RUNTIME_CONTAINER_NAME_PREFIX:-attendee-bot}"
+ATTENDEE_REPO_DIR="${ATTENDEE_REPO_DIR:-/opt/attendee}"
 ATTENDEE_CONTAINER_WORKDIR="${ATTENDEE_CONTAINER_WORKDIR:-/attendee}"
 METADATA_URL="${DROPLET_METADATA_ID_URL:-http://169.254.169.254/metadata/v1/id}"
 PROVIDER_INSTANCE_ID_METADATA_URL="${PROVIDER_INSTANCE_ID_METADATA_URL:-$METADATA_URL}"
@@ -20,11 +21,6 @@ if [[ -f "$RUNTIME_ENV_PATH" ]]; then
   set +a
 fi
 
-mkdir -p "$RUNNER_LOG_DIR"
-touch "$RUNNER_LOG_PATH" "$CONTAINER_LOG_PATH" "$RUNNER_STATE_PATH"
-RUNNER_STARTED_AT="$(timestamp)"
-RUNNER_STARTED_AT_MS="$(epoch_ms)"
-
 timestamp() {
   date -u +"%Y-%m-%dT%H:%M:%SZ"
 }
@@ -36,16 +32,21 @@ print(int(time.time() * 1000))
 PY
 }
 
-log_runner() {
-  printf '%s %s\n' "$(timestamp)" "$*" | tee -a "$RUNNER_LOG_PATH" >&2
-}
-
 json_escape() {
   python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'
 }
 
-if [[ -z "${BOT_ID:-}" ]]; then
-  log_runner "BOT_ID is required"
+mkdir -p "$RUNNER_LOG_DIR"
+touch "$RUNNER_LOG_PATH" "$CONTAINER_LOG_PATH" "$RUNNER_STATE_PATH"
+RUNNER_STARTED_AT="$(timestamp)"
+RUNNER_STARTED_AT_MS="$(epoch_ms)"
+
+log_runner() {
+  printf '%s %s\n' "$(timestamp)" "$*" | tee -a "$RUNNER_LOG_PATH" >&2
+}
+
+if [[ -z "${BOT_ID:-}" && -z "${LEASE_ID:-}" ]]; then
+  log_runner "BOT_ID or LEASE_ID is required"
   exit 1
 fi
 
@@ -54,7 +55,8 @@ if ! command -v docker >/dev/null 2>&1; then
   exit 1
 fi
 
-CONTAINER_NAME="${BOT_RUNTIME_CONTAINER_NAME_PREFIX}-${BOT_ID}"
+BOT_IDENTIFIER="${BOT_ID:-lease-${LEASE_ID:-unknown}}"
+CONTAINER_NAME="${BOT_RUNTIME_CONTAINER_NAME_PREFIX}-${BOT_IDENTIFIER}"
 CONTAINER_ENV_PATH="${CONTAINER_ENV_PATH:-${RUNNER_LOG_DIR}/runtime.env}"
 log_runner "Starting runner for bot ${BOT_ID} with image ${BOT_RUNTIME_IMAGE}"
 
@@ -73,9 +75,10 @@ docker run \
   --user root \
   --security-opt seccomp=unconfined \
   --shm-size=1g \
+  -v "$ATTENDEE_REPO_DIR:$ATTENDEE_CONTAINER_WORKDIR" \
   -v "$CONTAINER_ENV_PATH:/run/attendee/runtime.env:ro" \
   "$BOT_RUNTIME_IMAGE" \
-  bash -lc "set -euo pipefail; set -a; source /run/attendee/runtime.env; set +a; cd \"$ATTENDEE_CONTAINER_WORKDIR\"; export DJANGO_SETTINGS_MODULE=\"\${DJANGO_SETTINGS_MODULE:-attendee.settings.production}\"; exec python manage.py run_bot --botid \"$BOT_ID\"" \
+    bash -lc "set -euo pipefail; set -a; source /run/attendee/runtime.env; set +a; cd \"$ATTENDEE_CONTAINER_WORKDIR\"; export DJANGO_SETTINGS_MODULE=\"\${DJANGO_SETTINGS_MODULE:-attendee.settings.bot_runtime}\"; exec python manage.py run_bot --skip-checks \${LEASE_ID:+--lease-id \"\$LEASE_ID\"} \${BOT_ID:+--botid \"\$BOT_ID\"}" \
   2>&1 | tee -a "$CONTAINER_LOG_PATH"
 EXIT_CODE=$?
 set -e

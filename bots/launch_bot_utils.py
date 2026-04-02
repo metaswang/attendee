@@ -34,7 +34,7 @@ def launch_bot(bot):
         except Exception as exc:
             logger.error(f"Bot {bot.object_id} ({bot.id}) failed to launch via {os.getenv('LAUNCH_BOT_METHOD')}: {exc}", exc_info=True)
             lease = getattr(bot, "runtime_lease", None)
-            if lease is not None:
+            if lease is not None and lease.pk is not None:
                 lease.mark_failed(str(exc))
             BotEventManager.create_event(
                 bot=bot,

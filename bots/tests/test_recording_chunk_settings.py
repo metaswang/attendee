@@ -1,9 +1,11 @@
-from unittest.mock import patch
+import json
+from unittest.mock import MagicMock, patch
 
 from django.test import TestCase
 
 from accounts.models import Organization
 from bots.models import Bot, Project, RecordingFormats
+from bots.bot_controller.recording_chunk_uploader import RecordingChunkUploader
 from bots.serializers import CreateBotSerializer
 
 
@@ -80,6 +82,21 @@ class RecordingChunkSettingsTests(TestCase):
         self.assertFalse(serializer.is_valid())
         self.assertIn("recording_settings", serializer.errors)
 
+    def test_create_bot_serializer_rejects_local_file_transport(self):
+        serializer = CreateBotSerializer(
+            data={
+                "meeting_url": "https://meet.google.com/abc-defg-hij",
+                "bot_name": "Chunk Bot",
+                "recording_settings": {
+                    "format": RecordingFormats.MP4,
+                    "transport": "local_file",
+                },
+            }
+        )
+
+        self.assertFalse(serializer.is_valid())
+        self.assertIn("recording_settings", serializer.errors)
+
     def test_runtime_policy_defaults_and_debug_recording_opt_in(self):
         audio_bot = Bot.objects.create(
             name="Audio Bot",
@@ -96,7 +113,8 @@ class RecordingChunkSettingsTests(TestCase):
 
         self.assertEqual(audio_bot.runtime_resource_class(), "audio_only")
         self.assertEqual(audio_bot.memory_request(), "4Gi")
-        self.assertEqual(audio_bot.runtime_size_slug(), "s-2vcpu-4gb")
+        with patch("bots.models.os.getenv", side_effect=lambda key, default=None: default):
+            self.assertEqual(audio_bot.runtime_size_slug(), "s-2vcpu-4gb")
         self.assertFalse(audio_bot.create_debug_recording())
 
         self.assertEqual(av_bot.runtime_resource_class(), "web_av_standard")
@@ -105,3 +123,39 @@ class RecordingChunkSettingsTests(TestCase):
 
         with patch("bots.models.os.getenv", side_effect=lambda key, default=None: "true" if key == "SAVE_DEBUG_RECORDINGS" else default):
             self.assertTrue(av_bot.create_debug_recording())
+
+    @patch("bots.bot_controller.recording_chunk_uploader.boto3.client")
+    def test_recording_chunk_uploader_writes_manifest_after_chunks(self, mock_boto_client):
+        mock_s3_client = MagicMock()
+        mock_boto_client.return_value = mock_s3_client
+
+        uploader = RecordingChunkUploader(
+            chunk_prefix="customer_audio/user-1/session-1/chunks",
+            chunk_ext="webm",
+            chunk_mime_type="audio/webm;codecs=opus",
+            raw_path="customer_audio/user-1/session-1/original.m4a",
+            chunk_interval_ms=5000,
+            worker_count=1,
+        )
+
+        uploader.enqueue_chunk(b"chunk-1")
+        uploader.enqueue_chunk(b"chunk-2")
+        result = uploader.wait_for_uploads()
+
+        self.assertEqual(result["manifest_path"], "customer_audio/user-1/session-1/manifest.json")
+        self.assertEqual(result["chunk_paths"], [
+            "customer_audio/user-1/session-1/chunks/chunk_0000.webm",
+            "customer_audio/user-1/session-1/chunks/chunk_0001.webm",
+        ])
+
+        self.assertEqual(mock_s3_client.put_object.call_count, 3)
+        manifest_call = mock_s3_client.put_object.call_args_list[-1]
+        self.assertEqual(manifest_call.kwargs["Key"], "customer_audio/user-1/session-1/manifest.json")
+        manifest = json.loads(manifest_call.kwargs["Body"].decode("utf-8"))
+        self.assertEqual(manifest["chunk_count"], 2)
+        self.assertEqual(manifest["raw_path"], "customer_audio/user-1/session-1/original.m4a")
+        self.assertEqual(manifest["chunk_paths"], result["chunk_paths"])
+
+        second_result = uploader.wait_for_uploads()
+        self.assertEqual(second_result, result)
+        self.assertEqual(mock_s3_client.put_object.call_count, 3)

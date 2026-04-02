@@ -1,0 +1,39 @@
+services:
+  postgres:
+    image: postgres:15.3-alpine
+    container_name: pg-sql
+    restart: unless-stopped
+    env_file:
+      - ${PGSQL_ENV_FILE:-/mnt/HC_Volume_105273825/voxstudio/pg_sql/.env}
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      PGDATA: /var/lib/postgresql/data
+    volumes:
+      - ${VOXSTUDIO_VOLUME_ROOT:-/mnt/HC_Volume_105273825/voxstudio}/pg_sql/postgres/data:/var/lib/postgresql/data
+    networks:
+      - pg_network
+
+  stunnel:
+    image: alpine:latest
+    container_name: pg-stunnel
+    restart: unless-stopped
+    command: >
+      sh -c "apk add --no-cache stunnel &&
+             stunnel /etc/stunnel/stunnel.conf"
+    volumes:
+      - ${VOXSTUDIO_VOLUME_ROOT:-/mnt/HC_Volume_105273825/voxstudio}/pg_sql/stunnel/stunnel.conf:/etc/stunnel/stunnel.conf:ro
+      - ${VOXSTUDIO_VOLUME_ROOT:-/mnt/HC_Volume_105273825/voxstudio}/pg_sql/stunnel/stunnel.pem:/etc/stunnel/stunnel.pem:ro
+      - ${VOXSTUDIO_VOLUME_ROOT:-/mnt/HC_Volume_105273825/voxstudio}/pg_sql/stunnel/stunnel.key:/etc/stunnel/stunnel.key:ro
+    ports:
+      - "5432:5432"
+    depends_on:
+      - postgres
+    networks:
+      - pg_network
+
+networks:
+  pg_network:
+    name: attendee_pg_network
+    external: true

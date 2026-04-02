@@ -27,6 +27,7 @@ from .models import (
     MeetingTypes,
     Project,
     Recording,
+    RecordingFormats,
     RuntimeCapacityProviders,
     RuntimeCapacitySnapshot,
     TranscriptionProviders,
@@ -216,6 +217,24 @@ def validate_external_media_storage_settings(external_media_storage_settings, pr
     return None
 
 
+def normalize_r2_chunk_recording_settings_for_gcp(bot: Bot, recording_settings: dict | None) -> dict | None:
+    if os.getenv("LAUNCH_BOT_METHOD") != "gcp-compute-engine":
+        return recording_settings
+
+    meeting_type = meeting_type_from_url(bot.meeting_url)
+    if meeting_type not in {MeetingTypes.GOOGLE_MEET, MeetingTypes.TEAMS}:
+        return recording_settings
+
+    normalized_recording_settings = dict(recording_settings or {})
+    normalized_recording_settings["transport"] = "r2_chunks"
+    normalized_recording_settings["format"] = RecordingFormats.MP3
+    normalized_recording_settings["audio_chunk_prefix"] = f"customer_audio/{bot.project.object_id}/{bot.object_id}/chunks"
+    normalized_recording_settings["audio_raw_path"] = f"customer_audio/{bot.project.object_id}/{bot.object_id}/original.m4a"
+    normalized_recording_settings["chunk_interval_ms"] = int(normalized_recording_settings.get("chunk_interval_ms", 5000))
+    normalized_recording_settings.pop("video_chunk_prefix", None)
+    return normalized_recording_settings
+
+
 class BotCreationSource(str, Enum):
     API = "api"
     DASHBOARD = "dashboard"
@@ -264,7 +283,11 @@ def create_bot(data: dict, source: BotCreationSource, project: Project) -> tuple
     external_media_storage_settings = serializer.validated_data["external_media_storage_settings"]
     voice_agent_settings = serializer.validated_data["voice_agent_settings"]
     kubernetes_settings = serializer.validated_data["kubernetes_settings"]
-    runtime_settings = validate_runtime_settings_for_create_bot(serializer.validated_data["runtime_settings"])
+    try:
+        runtime_settings = validate_runtime_settings_for_create_bot(serializer.validated_data["runtime_settings"])
+    except ValidationError as e:
+        logger.error(f"ValidationError validating runtime settings for create bot: {e}")
+        return None, {"error": e.messages[0]}
     initial_state = BotStates.SCHEDULED if join_at else BotStates.READY
 
     error = validate_external_media_storage_settings(external_media_storage_settings, project)
@@ -313,6 +336,11 @@ def create_bot(data: dict, source: BotCreationSource, project: Project) -> tuple
                 state=initial_state,
                 calendar_event=calendar_event,
             )
+
+            normalized_recording_settings = normalize_r2_chunk_recording_settings_for_gcp(bot, bot.settings.get("recording_settings"))
+            if normalized_recording_settings != bot.settings.get("recording_settings"):
+                bot.settings["recording_settings"] = normalized_recording_settings
+                bot.save(update_fields=["settings", "updated_at"])
 
             Recording.objects.create(
                 bot=bot,
@@ -460,6 +488,8 @@ def patch_bot(bot: Bot, data: dict) -> tuple[Bot | None, dict | None]:
                 if update_only_legal_for_scheduled_bots:
                     return None, {"error": f"Bot is in state {BotStates.state_to_api_code(bot.state)} but join_at, meeting_url, bot_name, bot_image and recording_settings can only be updated when in the scheduled state"}
 
+            if validated_data.get("recording_settings"):
+                bot.settings["recording_settings"] = normalize_r2_chunk_recording_settings_for_gcp(bot, validated_data["recording_settings"])
             bot.save()
 
             if validated_data.get("bot_image"):

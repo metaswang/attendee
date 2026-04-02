@@ -6,14 +6,22 @@ from celery import shared_task
 from celery.signals import worker_shutting_down
 
 from bots.bot_controller import BotController
+from bots.runtime_api_client import BotRuntimeApiClient
 
 logger = logging.getLogger(__name__)
 
 
 @shared_task(bind=True, soft_time_limit=3600)
-def run_bot(self, bot_id):
-    logger.info(f"Running bot {bot_id}")
-    bot_controller = BotController(bot_id)
+def run_bot(self, bot_id=None, lease_id=None):
+    logger.info("Running bot task bot_id=%s lease_id=%s", bot_id, lease_id)
+    runtime_api_client = BotRuntimeApiClient.from_environment()
+    if lease_id is not None and runtime_api_client is not None:
+        bootstrap = runtime_api_client.get_bootstrap()
+        bot_controller = BotController(lease_id=lease_id, runtime_bootstrap=bootstrap, runtime_api_client=runtime_api_client)
+    else:
+        if bot_id is None:
+            raise ValueError("bot_id is required when lease bootstrap is not available")
+        bot_controller = BotController(bot_id=bot_id)
     bot_controller.run()
 
 

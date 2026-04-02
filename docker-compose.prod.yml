@@ -7,7 +7,7 @@ services:
     restart: unless-stopped
     env_file:
       # Production control-plane env; DO snapshot workflow config stays separate.
-      - deploy/production/myvps.env
+      - ${ATTENDEE_PROD_ENV_FILE:-/mnt/HC_Volume_105273825/voxstudio/attendee/myvps.env}
     environment:
       DJANGO_SETTINGS_MODULE: attendee.settings.production
       DISABLE_EMAIL: "true"
@@ -16,7 +16,8 @@ services:
       PYTHONUNBUFFERED: "1"
     volumes:
       # Keep GCP ADC outside HOME so PulseAudio can still create ~/.config/pulse.
-      - /var/lib/attendee-gcloud:/var/lib/attendee-gcloud:ro
+      - ${VOXSTUDIO_VOLUME_ROOT:-/mnt/HC_Volume_105273825/voxstudio}/attendee/gcloud:/var/lib/attendee-gcloud:ro
+      - ${VOXSTUDIO_VOLUME_ROOT:-/mnt/HC_Volume_105273825/voxstudio}/attendee/staticfiles:/attendee/staticfiles
     command: >
       bash -lc "
       /opt/venv/bin/python manage.py collectstatic --noinput &&
@@ -40,7 +41,7 @@ services:
     container_name: attendee-worker
     restart: unless-stopped
     env_file:
-      - deploy/production/myvps.env
+      - ${ATTENDEE_PROD_ENV_FILE:-/mnt/HC_Volume_105273825/voxstudio/attendee/myvps.env}
     environment:
       DJANGO_SETTINGS_MODULE: attendee.settings.production
       DISABLE_EMAIL: "true"
@@ -48,7 +49,7 @@ services:
       HOME: /home/app
       PYTHONUNBUFFERED: "1"
     volumes:
-      - /var/lib/attendee-gcloud:/var/lib/attendee-gcloud:ro
+      - ${VOXSTUDIO_VOLUME_ROOT:-/mnt/HC_Volume_105273825/voxstudio}/attendee/gcloud:/var/lib/attendee-gcloud:ro
     command: /opt/venv/bin/celery -A attendee worker -l INFO
     networks:
       - default
@@ -61,14 +62,14 @@ services:
     container_name: attendee-scheduler
     restart: unless-stopped
     env_file:
-      - deploy/production/myvps.env
+      - ${ATTENDEE_PROD_ENV_FILE:-/mnt/HC_Volume_105273825/voxstudio/attendee/myvps.env}
     environment:
       DJANGO_SETTINGS_MODULE: attendee.settings.production
       DISABLE_EMAIL: "true"
       HOME: /home/app
       PYTHONUNBUFFERED: "1"
     volumes:
-      - /var/lib/attendee-gcloud:/var/lib/attendee-gcloud:ro
+      - ${VOXSTUDIO_VOLUME_ROOT:-/mnt/HC_Volume_105273825/voxstudio}/attendee/gcloud:/var/lib/attendee-gcloud:ro
     entrypoint: []
     command: /opt/venv/bin/python manage.py run_scheduler
     networks:
@@ -86,8 +87,8 @@ services:
       - "443:443"
     volumes:
       - ./deploy/nginx/meetbot.conf:/etc/nginx/conf.d/default.conf:ro
-      - ./deploy/nginx/ssl:/etc/nginx/ssl:ro
-      - /etc/letsencrypt:/etc/letsencrypt:ro
+      - ${VOXSTUDIO_VOLUME_ROOT:-/mnt/HC_Volume_105273825/voxstudio}/attendee/nginx/ssl:/etc/nginx/ssl:ro
+      - ${VOXSTUDIO_VOLUME_ROOT:-/mnt/HC_Volume_105273825/voxstudio}/attendee/letsencrypt:/etc/letsencrypt:ro
     networks:
       - default
       - pg_network
