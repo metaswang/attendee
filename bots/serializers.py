@@ -510,8 +510,8 @@ class BotValidationMixin:
 
         # Validate format if provided
         format = value.get("format")
-        if format not in [RecordingFormats.MP4, RecordingFormats.MP3, RecordingFormats.NONE, None]:
-            raise serializers.ValidationError({"format": "Format must be mp4 or mp3 or 'none'"})
+        if format not in [RecordingFormats.MP4, RecordingFormats.WEBM, RecordingFormats.MP3, RecordingFormats.NONE, None]:
+            raise serializers.ValidationError({"format": "Format must be mp4 or webm or mp3 or 'none'"})
 
         # Validate view if provided
         view = value.get("view")
@@ -646,7 +646,7 @@ BOT_RECORDING_SETTINGS_SCHEMA = {
     "properties": {
         "format": {
             "type": "string",
-            "description": "The format of the recording to save. The supported formats are 'mp4', 'mp3' and 'none'. Defaults to 'mp4'.",
+            "description": "The format of the recording to save. The supported formats are 'mp4', 'webm', 'mp3' and 'none'. Defaults to 'mp4'.",
         },
         "transport": {
             "type": "string",
@@ -684,15 +684,15 @@ BOT_RECORDING_SETTINGS_SCHEMA = {
         },
         "audio_chunk_prefix": {
             "type": "string",
-            "description": "Object storage prefix for uploaded audio chunks. Required when transport='r2_chunks'.",
+            "description": "Object storage prefix for uploaded audio chunks. Required for audio-only r2 chunk recording.",
         },
         "audio_raw_path": {
             "type": "string",
-            "description": "Canonical object path for the merged audio artifact. Required when transport='r2_chunks'.",
+            "description": "Canonical object path for the extracted or merged audio artifact. Required when transport='r2_chunks'.",
         },
         "video_chunk_prefix": {
             "type": "string",
-            "description": "Object storage prefix for uploaded video chunks. Reserved for future A/V chunk transport.",
+            "description": "Object storage prefix for uploaded meeting video artifacts. When used with transport='r2_chunks' and format='mp4', attendee uploads a single muxed screen recording and downstream audio is extracted from that video.",
         },
         "chunk_interval_ms": {
             "type": "integer",
@@ -1240,14 +1240,12 @@ class CreateBotSerializer(BotValidationMixin, serializers.Serializer):
         "properties": {
             "zoom_tokens_url": {
                 "type": "string",
-                "pattern": "^https://.*",
             },
             "recording_complete": {
                 "type": "object",
                 "properties": {
                     "url": {
                         "type": "string",
-                        "pattern": "^https://.*",
                     },
                     "signing_secret": {
                         "type": "string",
@@ -1271,15 +1269,19 @@ class CreateBotSerializer(BotValidationMixin, serializers.Serializer):
         except jsonschema.exceptions.ValidationError as e:
             raise serializers.ValidationError(e.message)
 
-        # Validate that zoom_tokens_url is a proper HTTPS URL
+        require_https = settings.REQUIRE_HTTPS_WEBHOOKS
+        allowed_schemes = ("https://",) if require_https else ("https://", "http://")
+
         zoom_tokens_url = value.get("zoom_tokens_url")
-        if zoom_tokens_url and not zoom_tokens_url.lower().startswith("https://"):
-            raise serializers.ValidationError({"zoom_tokens_url": "URL must start with https://"})
+        if zoom_tokens_url and not zoom_tokens_url.lower().startswith(allowed_schemes):
+            scheme_hint = "https://" if require_https else "http:// or https://"
+            raise serializers.ValidationError({"zoom_tokens_url": f"URL must start with {scheme_hint}"})
 
         recording_complete = value.get("recording_complete") or {}
         recording_complete_url = recording_complete.get("url")
-        if recording_complete_url and not recording_complete_url.lower().startswith("https://"):
-            raise serializers.ValidationError({"recording_complete": {"url": "URL must start with https://"}})
+        if recording_complete_url and not recording_complete_url.lower().startswith(allowed_schemes):
+            scheme_hint = "https://" if require_https else "http:// or https://"
+            raise serializers.ValidationError({"recording_complete": {"url": f"URL must start with {scheme_hint}"}})
 
         return value
 
@@ -1729,27 +1731,38 @@ class CreateBotSerializer(BotValidationMixin, serializers.Serializer):
             if not is_supported_web_adapter:
                 raise serializers.ValidationError({"recording_settings": {"transport": "transport='r2_chunks' is only supported for web meeting adapters"}})
 
-            if recording_settings.get("format") != RecordingFormats.MP3:
-                raise serializers.ValidationError({"recording_settings": {"format": "transport='r2_chunks' currently supports audio-only recording (format='mp3')"}})
-
+            recording_format = recording_settings.get("format")
             audio_chunk_prefix = recording_settings.get("audio_chunk_prefix")
             audio_raw_path = recording_settings.get("audio_raw_path")
             video_chunk_prefix = recording_settings.get("video_chunk_prefix")
 
-            if not audio_chunk_prefix:
-                raise serializers.ValidationError({"recording_settings": {"audio_chunk_prefix": "Required when transport='r2_chunks'"}})
             if not audio_raw_path:
                 raise serializers.ValidationError({"recording_settings": {"audio_raw_path": "Required when transport='r2_chunks'"}})
-            if video_chunk_prefix:
-                raise serializers.ValidationError({"recording_settings": {"video_chunk_prefix": "Must be absent for audio-only r2_chunks recording"}})
-
-            audio_prefix_parts = audio_chunk_prefix.split("/")
-            if len(audio_prefix_parts) != 4 or audio_prefix_parts[0] != "customer_audio" or audio_prefix_parts[3] != "chunks":
-                raise serializers.ValidationError({"recording_settings": {"audio_chunk_prefix": "Must follow customer_audio/{user_id}/{session_id}/chunks"}})
 
             audio_raw_parts = audio_raw_path.split("/")
             if len(audio_raw_parts) != 4 or audio_raw_parts[0] != "customer_audio" or audio_raw_parts[3] != "original.m4a":
                 raise serializers.ValidationError({"recording_settings": {"audio_raw_path": "Must follow customer_audio/{user_id}/{session_id}/original.m4a"}})
+
+            if recording_format == RecordingFormats.MP3:
+                if not audio_chunk_prefix:
+                    raise serializers.ValidationError({"recording_settings": {"audio_chunk_prefix": "Required when transport='r2_chunks' and format='mp3'"}})
+                audio_prefix_parts = audio_chunk_prefix.split("/")
+                if len(audio_prefix_parts) != 4 or audio_prefix_parts[0] != "customer_audio" or audio_prefix_parts[3] != "chunks":
+                    raise serializers.ValidationError({"recording_settings": {"audio_chunk_prefix": "Must follow customer_audio/{user_id}/{session_id}/chunks"}})
+                if video_chunk_prefix:
+                    raise serializers.ValidationError({"recording_settings": {"video_chunk_prefix": "Audio-only r2 chunk recording must not include video_chunk_prefix"}})
+            elif recording_format in (RecordingFormats.MP4, RecordingFormats.WEBM):
+                if audio_chunk_prefix:
+                    raise serializers.ValidationError({"recording_settings": {"audio_chunk_prefix": "Muxed screen recording chunk mode does not use audio_chunk_prefix"}})
+                if not video_chunk_prefix:
+                    raise serializers.ValidationError({"recording_settings": {"video_chunk_prefix": "Required when transport='r2_chunks' and format is a muxed video format"}})
+            else:
+                raise serializers.ValidationError({"recording_settings": {"format": "transport='r2_chunks' supports format='mp3' for audio-only or format='webm'/'mp4' for screen recording"}})
+
+            if video_chunk_prefix:
+                video_prefix_parts = video_chunk_prefix.split("/")
+                if len(video_prefix_parts) != 4 or video_prefix_parts[0] != "video" or video_prefix_parts[3] != "chunks":
+                    raise serializers.ValidationError({"recording_settings": {"video_chunk_prefix": "Must follow video/{user_id}/{session_id}/chunks"}})
 
             recording_complete = callback_settings.get("recording_complete") or {}
             if not recording_complete.get("url") or not recording_complete.get("signing_secret"):

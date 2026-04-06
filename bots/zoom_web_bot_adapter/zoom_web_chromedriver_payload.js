@@ -359,6 +359,7 @@ class MixedAudioStreamManager {
 class StyleManager {
     constructor() {
         this.started = false;
+        this.videoTracks = new Map();
     }
 
     async start() {
@@ -375,6 +376,30 @@ class StyleManager {
         if (!this.started)
             return null;
         return window.mixedAudioStreamManager?.getMeetingAudioStream();
+    }
+
+    addVideoTrack(trackEvent) {
+        const track = trackEvent?.track;
+        const streamId = trackEvent?.streams?.[0]?.id;
+        if (!track || !streamId) {
+            return;
+        }
+        this.videoTracks.set(track.id, {
+            track,
+            streamId,
+            firstSeenAt: Date.now(),
+        });
+        track.addEventListener('ended', () => {
+            this.videoTracks.delete(track.id);
+        }, { once: true });
+    }
+
+    getVideoTrackForRecording() {
+        const liveTracks = Array.from(this.videoTracks.values()).filter((item) => item.track?.readyState === 'live');
+        if (!liveTracks.length) {
+            return null;
+        }
+        return liveTracks.sort((a, b) => b.firstSeenAt - a.firstSeenAt)[0].track;
     }
 
     async stop() {
@@ -482,17 +507,29 @@ class WebSocketClient {
         this.mediaSendingEnabled = false;
         this.audioChunkRecorder = null;
         this.audioChunkFlushInterval = null;
+        this.videoChunkRecorder = null;
+        this.videoChunkFlushInterval = null;
+        this.videoChunkCanvas = null;
+        this.videoChunkCanvasCtx = null;
+        this.videoChunkVideoElement = null;
+        this.videoChunkAnimationFrame = null;
+        this.videoChunkSourceTrackId = null;
+        this.videoChunkSourceTrackClone = null;
     }
 
     async enableMediaSending() {
         this.mediaSendingEnabled = true;
         await window.styleManager.start();
+        if (window.initialData.sendEncodedVideoChunks) {
+            await this.startVideoChunkRecording();
+        }
         if (window.initialData.sendEncodedAudioChunks) {
             await this.startAudioChunkRecording();
         }
     }
 
     async disableMediaSending() {
+        await this.stopVideoChunkRecording();
         await this.stopAudioChunkRecording();
         window.styleManager.stop();
         // Give the media recorder a bit of time to send the final data
@@ -566,6 +603,186 @@ class WebSocketClient {
         } catch (error) {
             console.error('Error sending WebSocket audio chunk:', error);
         }
+    }
+
+    sendEncodedMP4Chunk(encodedMP4Data) {
+        if (this.ws.readyState !== WebSocket.OPEN || !this.mediaSendingEnabled) {
+            return;
+        }
+        try {
+            const headerBuffer = new ArrayBuffer(4);
+            const headerView = new DataView(headerBuffer);
+            headerView.setInt32(0, WebSocketClient.MESSAGE_TYPES.ENCODED_MP4_CHUNK, true);
+            this.ws.send(new Blob([headerBuffer, encodedMP4Data]));
+        } catch (error) {
+            console.error('Error sending WebSocket video chunk:', error);
+        }
+    }
+
+    getPreferredVideoChunkMimeType() {
+        const preferredMimeTypes = [
+            'video/webm;codecs=vp9,opus',
+            'video/webm;codecs=vp8,opus',
+            'video/webm',
+            'video/mp4;codecs=avc1.42E01E,mp4a.40.2',
+            'video/mp4',
+        ];
+        return preferredMimeTypes.find((mime) => window.MediaRecorder && MediaRecorder.isTypeSupported(mime)) || '';
+    }
+
+    ensureVideoChunkCanvas() {
+        if (!this.videoChunkCanvas) {
+            this.videoChunkCanvas = document.createElement('canvas');
+            this.videoChunkCanvas.width = window.initialData.videoFrameWidth || 1280;
+            this.videoChunkCanvas.height = window.initialData.videoFrameHeight || 720;
+            this.videoChunkCanvasCtx = this.videoChunkCanvas.getContext('2d');
+        }
+        if (!this.videoChunkVideoElement) {
+            this.videoChunkVideoElement = document.createElement('video');
+            this.videoChunkVideoElement.autoplay = true;
+            this.videoChunkVideoElement.muted = true;
+            this.videoChunkVideoElement.playsInline = true;
+        }
+    }
+
+    stopVideoChunkCanvasLoop() {
+        if (this.videoChunkAnimationFrame) {
+            cancelAnimationFrame(this.videoChunkAnimationFrame);
+            this.videoChunkAnimationFrame = null;
+        }
+    }
+
+    cleanupVideoChunkSourceTrack() {
+        if (this.videoChunkSourceTrackClone) {
+            try {
+                this.videoChunkSourceTrackClone.stop();
+            } catch (error) {
+                console.warn('Video chunk source track cleanup failed', error);
+            }
+            this.videoChunkSourceTrackClone = null;
+        }
+        this.videoChunkSourceTrackId = null;
+        if (this.videoChunkVideoElement) {
+            this.videoChunkVideoElement.srcObject = null;
+        }
+    }
+
+    syncVideoChunkSourceTrack() {
+        this.ensureVideoChunkCanvas();
+        const nextTrack = window.styleManager?.getVideoTrackForRecording?.();
+        if (!nextTrack || nextTrack.readyState !== 'live') {
+            this.cleanupVideoChunkSourceTrack();
+            return;
+        }
+        if (this.videoChunkSourceTrackId === nextTrack.id) {
+            return;
+        }
+        this.cleanupVideoChunkSourceTrack();
+        this.videoChunkSourceTrackClone = nextTrack.clone();
+        this.videoChunkSourceTrackId = nextTrack.id;
+        this.videoChunkVideoElement.srcObject = new MediaStream([this.videoChunkSourceTrackClone]);
+        this.videoChunkVideoElement.play().catch((error) => {
+            console.warn('Video chunk preview play failed', error);
+        });
+    }
+
+    drawVideoChunkFrame = () => {
+        if (!this.mediaSendingEnabled) {
+            this.stopVideoChunkCanvasLoop();
+            return;
+        }
+        this.syncVideoChunkSourceTrack();
+        const ctx = this.videoChunkCanvasCtx;
+        const canvas = this.videoChunkCanvas;
+        const video = this.videoChunkVideoElement;
+        if (!ctx || !canvas) {
+            return;
+        }
+
+        if (video && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth && video.videoHeight) {
+            if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+            }
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        } else {
+            ctx.fillStyle = 'black';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+        }
+
+        this.videoChunkAnimationFrame = requestAnimationFrame(this.drawVideoChunkFrame);
+    };
+
+    async startVideoChunkRecording() {
+        if (this.videoChunkRecorder && this.videoChunkRecorder.state !== 'inactive') {
+            return;
+        }
+        if (!window.MediaRecorder) {
+            console.warn('MediaRecorder is not available for video chunk recording');
+            return;
+        }
+
+        this.ensureVideoChunkCanvas();
+        this.syncVideoChunkSourceTrack();
+        if (!this.videoChunkSourceTrackClone) {
+            console.warn('No meeting video track available for video chunk recording');
+            return;
+        }
+
+        const recorderStream = this.videoChunkCanvas.captureStream(30);
+        const meetingAudioStream = window.styleManager?.getMeetingAudioStream?.();
+        const audioTrack = meetingAudioStream?.getAudioTracks?.()[0];
+        if (audioTrack) {
+            recorderStream.addTrack(audioTrack.clone());
+        }
+
+        const selectedMimeType = this.getPreferredVideoChunkMimeType();
+        this.videoChunkRecorder = selectedMimeType
+            ? new MediaRecorder(recorderStream, { mimeType: selectedMimeType })
+            : new MediaRecorder(recorderStream);
+        this.videoChunkRecorder.ondataavailable = (event) => {
+            if (event.data && event.data.size > 0) {
+                this.sendEncodedMP4Chunk(event.data);
+            }
+        };
+        this.stopVideoChunkCanvasLoop();
+        this.videoChunkAnimationFrame = requestAnimationFrame(this.drawVideoChunkFrame);
+        this.videoChunkRecorder.start();
+        this.videoChunkFlushInterval = setInterval(() => {
+            try {
+                if (this.videoChunkRecorder?.state === 'recording') {
+                    this.videoChunkRecorder.requestData();
+                }
+            } catch (error) {
+                console.warn('Video chunk recorder requestData failed', error);
+            }
+        }, window.initialData.recordingChunkIntervalMs || 5000);
+    }
+
+    async stopVideoChunkRecording() {
+        if (this.videoChunkFlushInterval) {
+            clearInterval(this.videoChunkFlushInterval);
+            this.videoChunkFlushInterval = null;
+        }
+        if (!this.videoChunkRecorder || this.videoChunkRecorder.state === 'inactive') {
+            this.stopVideoChunkCanvasLoop();
+            this.cleanupVideoChunkSourceTrack();
+            return;
+        }
+
+        await new Promise((resolve) => {
+            const recorder = this.videoChunkRecorder;
+            recorder.addEventListener('stop', () => resolve(), { once: true });
+            try {
+                recorder.requestData();
+            } catch (error) {
+                console.warn('Final video chunk requestData failed', error);
+            }
+            recorder.stop();
+        });
+        this.videoChunkRecorder = null;
+        this.stopVideoChunkCanvasLoop();
+        this.cleanupVideoChunkSourceTrack();
     }
 
     async startAudioChunkRecording() {

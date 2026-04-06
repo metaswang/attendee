@@ -1025,6 +1025,13 @@ class Bot(models.Model):
         recording_settings = self.settings.get("recording_settings", {}) or {}
         return int(recording_settings.get("chunk_interval_ms", 5000))
 
+    def recording_transport(self):
+        recording_settings = self.settings.get("recording_settings", {}) or {}
+        return recording_settings.get("transport")
+
+    def uses_r2_chunk_recording(self):
+        return self.recording_transport() == "r2_chunks"
+
     def audio_chunk_prefix(self):
         recording_settings = self.settings.get("recording_settings", {}) or {}
         return recording_settings.get("audio_chunk_prefix")
@@ -1036,6 +1043,16 @@ class Bot(models.Model):
     def video_chunk_prefix(self):
         recording_settings = self.settings.get("recording_settings", {}) or {}
         return recording_settings.get("video_chunk_prefix")
+
+    def should_record_sidecar_video(self):
+        return bool(self.video_chunk_prefix())
+
+    def uses_muxed_screen_recording_chunks(self):
+        return (
+            self.uses_r2_chunk_recording()
+            and self.recording_format() in (RecordingFormats.MP4, RecordingFormats.WEBM)
+            and bool(self.video_chunk_prefix())
+        )
 
     def record_chat_messages_when_paused(self):
         recording_settings = self.settings.get("recording_settings", {})
@@ -1078,6 +1095,8 @@ class Bot(models.Model):
     def runtime_resource_class(self):
         if self.recording_type() == RecordingTypes.NO_RECORDING:
             return "web_av_heavy" if self._uses_heavy_runtime_features() else "transcription_only"
+        if self.should_record_sidecar_video():
+            return "web_av_heavy" if self._uses_heavy_runtime_features() else "web_av_standard"
         if self.recording_type() == RecordingTypes.AUDIO_ONLY:
             return "web_av_heavy" if self._uses_heavy_runtime_features() else "audio_only"
         return "web_av_heavy" if self._uses_heavy_runtime_features() else "web_av_standard"

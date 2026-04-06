@@ -621,6 +621,7 @@ class WebBotAdapter(BotAdapter):
             f"recordingView: '{self.recording_view}', "
             f"sendMixedAudio: {'true' if self.add_mixed_audio_chunk_callback else 'false'}, "
             f"sendPerParticipantAudio: {'true' if self.add_audio_chunk_callback else 'false'}, "
+            f"sendEncodedVideoChunks: {'true' if self.add_encoded_mp4_chunk_callback else 'false'}, "
             f"sendEncodedAudioChunks: {'true' if self.add_encoded_audio_chunk_callback else 'false'}, "
             f"recordingChunkIntervalMs: {self.recording_chunk_interval_ms}, "
             f"collectCaptions: {'true' if self.upsert_caption_callback else 'false'}, "

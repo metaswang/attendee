@@ -227,11 +227,26 @@ def normalize_r2_chunk_recording_settings_for_gcp(bot: Bot, recording_settings: 
 
     normalized_recording_settings = dict(recording_settings or {})
     normalized_recording_settings["transport"] = "r2_chunks"
-    normalized_recording_settings["format"] = RecordingFormats.MP3
-    normalized_recording_settings["audio_chunk_prefix"] = f"customer_audio/{bot.project.object_id}/{bot.object_id}/chunks"
-    normalized_recording_settings["audio_raw_path"] = f"customer_audio/{bot.project.object_id}/{bot.object_id}/original.m4a"
+    recording_format = normalized_recording_settings.get("format") or RecordingFormats.MP3
+    normalized_recording_settings["format"] = recording_format
+    session_id = str((bot.metadata or {}).get("session_id") or "").strip() or bot.object_id
+    normalized_recording_settings.setdefault(
+        "audio_raw_path",
+        f"customer_audio/{bot.project.object_id}/{session_id}/original.m4a",
+    )
+    if recording_format == RecordingFormats.MP3:
+        normalized_recording_settings.setdefault(
+            "audio_chunk_prefix",
+            f"customer_audio/{bot.project.object_id}/{session_id}/chunks",
+        )
+        normalized_recording_settings.pop("video_chunk_prefix", None)
+    elif recording_format in (RecordingFormats.MP4, RecordingFormats.WEBM):
+        normalized_recording_settings.setdefault(
+            "video_chunk_prefix",
+            f"video/{bot.project.object_id}/{session_id}/chunks",
+        )
+        normalized_recording_settings.pop("audio_chunk_prefix", None)
     normalized_recording_settings["chunk_interval_ms"] = int(normalized_recording_settings.get("chunk_interval_ms", 5000))
-    normalized_recording_settings.pop("video_chunk_prefix", None)
     return normalized_recording_settings
 
 

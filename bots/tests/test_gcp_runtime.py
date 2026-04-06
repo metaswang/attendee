@@ -323,7 +323,47 @@ class TestGCPRuntime(TestCase):
         self.assertIn("BOT_RUNTIME_SOURCE_ARCHIVE_URL", runtime_env)
         self.assertIn("DJANGO_SETTINGS_MODULE", runtime_env)
 
+    @patch.dict(
+        "os.environ",
+        {
+            "GCP_PROJECT_ID": "test-project",
+            "GCP_BOT_SOURCE_IMAGE_FAMILY": "attendee-bot-golden",
+            "BOT_RUNTIME_REDIS_URL": "rediss://:token@ad.voxstudio.me:6363",
+            "REDIS_URL": "redis://redis:6379/5",
+        },
+        clear=False,
+    )
+    @patch("bots.runtime_providers.gcp_compute_engine.compute_v1")
+    def test_serialized_runtime_env_prefers_bot_runtime_redis_url(self, mock_compute_v1):
+        mock_compute_v1.InstancesClient.return_value = MagicMock()
+        mock_compute_v1.ZoneOperationsClient.return_value = MagicMock()
+
+        provider = GCPComputeInstanceProvider()
+        lease = BotRuntimeLease.objects.create(
+            bot=self.bot,
+            provider=BotRuntimeProviderTypes.GCP_COMPUTE_INSTANCE,
+            status=BotRuntimeLeaseStatuses.PROVISIONING,
+        )
+
+        runtime_env = provider._serialized_runtime_env(self.bot, lease)
+
+        self.assertIn("export REDIS_URL=rediss://:token@ad.voxstudio.me:6363", runtime_env)
+        self.assertNotIn("export REDIS_URL=redis://redis:6379/5", runtime_env)
+
     def test_bootstrap_view_returns_runtime_snapshot(self):
+        session_id = "019d61ee-39d9-700b-80d8-1d554c5b5b70"
+        self.bot.settings = {
+            "runtime_settings": {"region": "asia-southeast1"},
+            "callback_settings": {
+                "recording_complete": {
+                    "url": "http://api:8000/v2/meeting/app/bot/recording/complete",
+                    "signing_secret": "api-secret",
+                }
+            },
+        }
+        self.bot.metadata = {"session_id": session_id}
+        self.bot.save(update_fields=["settings", "metadata", "updated_at"])
+
         lease = BotRuntimeLease.objects.create(
             bot=self.bot,
             provider=BotRuntimeProviderTypes.GCP_COMPUTE_INSTANCE,
@@ -343,8 +383,8 @@ class TestGCPRuntime(TestCase):
         self.assertEqual(payload["project"]["object_id"], self.project.object_id)
         self.assertEqual(payload["bot"]["settings"]["recording_settings"]["transport"], "r2_chunks")
         self.assertEqual(payload["bot"]["settings"]["recording_settings"]["format"], RecordingFormats.MP3)
-        self.assertEqual(payload["bot"]["settings"]["recording_settings"]["audio_chunk_prefix"], f"customer_audio/{self.project.object_id}/{self.bot.object_id}/chunks")
-        self.assertEqual(payload["bot"]["settings"]["recording_settings"]["audio_raw_path"], f"customer_audio/{self.project.object_id}/{self.bot.object_id}/original.m4a")
+        self.assertEqual(payload["bot"]["settings"]["recording_settings"]["audio_chunk_prefix"], f"customer_audio/{self.project.object_id}/{session_id}/chunks")
+        self.assertEqual(payload["bot"]["settings"]["recording_settings"]["audio_raw_path"], f"customer_audio/{self.project.object_id}/{session_id}/original.m4a")
         self.assertTrue(
             payload["bot"]["settings"]["callback_settings"]["recording_complete"]["url"].endswith(
                 f"/internal/bot-runtime-leases/{lease.id}/recording-complete"
@@ -355,7 +395,20 @@ class TestGCPRuntime(TestCase):
         self.assertEqual(runtime_bot.id, self.bot.id)
         self.assertEqual(runtime_bot.project.object_id, self.project.object_id)
 
-    def test_recording_complete_view_accepts_signed_callback(self):
+    @patch("bots.internal_views.requests.post")
+    def test_recording_complete_view_forwards_signed_callback_to_upstream(self, mock_post):
+        mock_post.return_value = SimpleNamespace(status_code=202, text="accepted")
+        self.bot.settings = {
+            "runtime_settings": {"region": "asia-southeast1"},
+            "callback_settings": {
+                "recording_complete": {
+                    "url": "http://api:8000/v2/meeting/app/bot/recording/complete",
+                    "signing_secret": "api-secret",
+                }
+            },
+        }
+        self.bot.save(update_fields=["settings", "updated_at"])
+
         lease = BotRuntimeLease.objects.create(
             bot=self.bot,
             provider=BotRuntimeProviderTypes.GCP_COMPUTE_INSTANCE,
@@ -391,6 +444,17 @@ class TestGCPRuntime(TestCase):
         )
 
         self.assertEqual(response.status_code, 200)
+        expected_upstream_signature = sign_payload(payload, "api-secret")
+        mock_post.assert_called_once_with(
+            "http://api:8000/v2/meeting/app/bot/recording/complete",
+            json=payload,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "Attendee-Runtime/1.0",
+                "X-Webhook-Signature": expected_upstream_signature,
+            },
+            timeout=20,
+        )
 
     def test_control_view_returns_control_snapshot(self):
         lease = BotRuntimeLease.objects.create(
@@ -429,6 +493,29 @@ class TestGCPRuntime(TestCase):
         self.assertGreater(len(archive_bytes), 0)
         with tarfile.open(fileobj=BytesIO(archive_bytes), mode="r:gz") as archive:
             self.assertIn("bots/runtime_providers/gcp_compute_engine.py", archive.getnames())
+
+    @patch("bots.internal_views.subprocess.run")
+    def test_source_archive_includes_git_untracked_files(self, mock_run):
+        tracked_result = SimpleNamespace(stdout=b"bots/runtime_providers/gcp_compute_engine.py\x00")
+        untracked_result = SimpleNamespace(stdout=b"bots/tasks/launch_joining_bot_task.py\x00")
+        mock_run.side_effect = [tracked_result, untracked_result]
+
+        lease = BotRuntimeLease.objects.create(
+            bot=self.bot,
+            provider=BotRuntimeProviderTypes.GCP_COMPUTE_INSTANCE,
+            status=BotRuntimeLeaseStatuses.PROVISIONING,
+        )
+
+        response = self.client.get(
+            f"/internal/bot-runtime-leases/{lease.id}/source-archive",
+            HTTP_AUTHORIZATION=f"Bearer {lease.shutdown_token}",
+            secure=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        archive_bytes = b"".join(response.streaming_content)
+        with tarfile.open(fileobj=BytesIO(archive_bytes), mode="r:gz") as archive:
+            self.assertIn("bots/tasks/launch_joining_bot_task.py", archive.getnames())
 
     def test_bot_events_view_applies_state_transition(self):
         self.bot.state = BotStates.READY
@@ -712,11 +799,27 @@ class TestRuntimeSettingsAndCapacity(TestCase):
         clear=False,
     )
     def test_create_bot_persists_gcp_chunk_recording_settings(self):
+        session_id = "019d61ee-39d9-700b-80d8-1d554c5b5b70"
         bot, error = create_bot(
             data={
                 "meeting_url": "https://meet.google.com/abc-defg-hij",
                 "bot_name": "GCP Chunk Bot",
                 "runtime_settings": {"region": "us-central1"},
+                "recording_settings": {
+                    "transport": "r2_chunks",
+                    "format": RecordingFormats.MP3,
+                    "audio_chunk_prefix": f"customer_audio/{self.project.object_id}/{session_id}/chunks",
+                    "audio_raw_path": f"customer_audio/{self.project.object_id}/{session_id}/original.m4a",
+                },
+                "callback_settings": {
+                    "recording_complete": {
+                        "url": "http://api:8000/v2/meeting/app/bot/recording/complete",
+                        "signing_secret": "api-secret",
+                    }
+                },
+                "metadata": {
+                    "session_id": session_id,
+                },
             },
             source=BotCreationSource.API,
             project=self.project,
@@ -724,8 +827,50 @@ class TestRuntimeSettingsAndCapacity(TestCase):
         self.assertIsNone(error)
         self.assertEqual(bot.settings["recording_settings"]["transport"], "r2_chunks")
         self.assertEqual(bot.settings["recording_settings"]["format"], RecordingFormats.MP3)
-        self.assertEqual(bot.settings["recording_settings"]["audio_chunk_prefix"], f"customer_audio/{self.project.object_id}/{bot.object_id}/chunks")
-        self.assertEqual(bot.settings["recording_settings"]["audio_raw_path"], f"customer_audio/{self.project.object_id}/{bot.object_id}/original.m4a")
+        self.assertEqual(bot.settings["recording_settings"]["audio_chunk_prefix"], f"customer_audio/{self.project.object_id}/{session_id}/chunks")
+        self.assertEqual(bot.settings["recording_settings"]["audio_raw_path"], f"customer_audio/{self.project.object_id}/{session_id}/original.m4a")
+
+    @patch.dict(
+        "os.environ",
+        {
+            "LAUNCH_BOT_METHOD": "gcp-compute-engine",
+            "GCP_BOT_REGIONS": "asia-southeast1,us-central1",
+            "GCP_BOT_DEFAULT_REGION": "asia-southeast1",
+        },
+        clear=False,
+    )
+    def test_create_bot_persists_gcp_muxed_screen_recording_settings(self):
+        session_id = "019d61ee-39d9-700b-80d8-1d554c5b5b70"
+        bot, error = create_bot(
+            data={
+                "meeting_url": "https://meet.google.com/abc-defg-hij",
+                "bot_name": "GCP Screen Chunk Bot",
+                "runtime_settings": {"region": "us-central1"},
+                "recording_settings": {
+                    "transport": "r2_chunks",
+                    "format": RecordingFormats.WEBM,
+                    "audio_raw_path": f"customer_audio/{self.project.object_id}/{session_id}/original.m4a",
+                    "video_chunk_prefix": f"video/{self.project.object_id}/{session_id}/chunks",
+                },
+                "callback_settings": {
+                    "recording_complete": {
+                        "url": "http://api:8000/v2/meeting/app/bot/recording/complete",
+                        "signing_secret": "api-secret",
+                    }
+                },
+                "metadata": {
+                    "session_id": session_id,
+                },
+            },
+            source=BotCreationSource.API,
+            project=self.project,
+        )
+        self.assertIsNone(error)
+        self.assertEqual(bot.settings["recording_settings"]["transport"], "r2_chunks")
+        self.assertEqual(bot.settings["recording_settings"]["format"], RecordingFormats.WEBM)
+        self.assertEqual(bot.settings["recording_settings"]["video_chunk_prefix"], f"video/{self.project.object_id}/{session_id}/chunks")
+        self.assertEqual(bot.settings["recording_settings"]["audio_raw_path"], f"customer_audio/{self.project.object_id}/{session_id}/original.m4a")
+        self.assertNotIn("audio_chunk_prefix", bot.settings["recording_settings"])
 
     @patch.dict(
         "os.environ",

@@ -8,6 +8,7 @@ from io import BytesIO
 from pathlib import Path
 from textwrap import shorten
 
+import requests
 from django.http import FileResponse, HttpResponseNotAllowed, JsonResponse
 from django.utils.decorators import method_decorator
 from django.views import View
@@ -51,7 +52,7 @@ from bots.runtime_providers import get_runtime_provider
 from bots.meeting_url_utils import meeting_type_from_url
 from bots.webhook_payloads import chat_message_webhook_payload, participant_event_webhook_payload, utterance_webhook_payload
 from bots.webhook_utils import trigger_webhook
-from bots.webhook_utils import verify_signature
+from bots.webhook_utils import sign_payload, verify_signature
 
 logger = logging.getLogger(__name__)
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -84,13 +85,20 @@ def _repo_source_archive_paths() -> list[Path]:
                 check=True,
                 capture_output=True,
             ).stdout.split(b"\x00")
+            untracked_files = subprocess.run(
+                ["git", "-C", str(REPO_ROOT), "ls-files", "--others", "--exclude-standard", "-z"],
+                check=True,
+                capture_output=True,
+            ).stdout.split(b"\x00")
             paths = []
-            for raw_relative_path in tracked_files:
+            seen_paths: set[Path] = set()
+            for raw_relative_path in [*tracked_files, *untracked_files]:
                 if not raw_relative_path:
                     continue
                 absolute_path = REPO_ROOT / raw_relative_path.decode("utf-8")
-                if absolute_path.exists():
+                if absolute_path.exists() and absolute_path not in seen_paths:
                     paths.append(absolute_path)
+                    seen_paths.add(absolute_path)
             return paths
         except subprocess.CalledProcessError:
             logger.warning("Falling back to filesystem walk for runtime source archive because git ls-files failed", exc_info=True)
@@ -128,14 +136,21 @@ def _serialize_bot_runtime_snapshot(bot: Bot, lease: BotRuntimeLease) -> dict:
     callback_settings = bot_settings.get("callback_settings") or {}
 
     if lease.provider == BotRuntimeProviderTypes.GCP_COMPUTE_INSTANCE and meeting_type_from_url(bot.meeting_url) in {MeetingTypes.GOOGLE_MEET, MeetingTypes.TEAMS}:
+        session_id = str((bot.metadata or {}).get("session_id") or "").strip() or bot.object_id
+        recording_format = recording_settings.get("format") or RecordingFormats.MP3
         recording_settings["transport"] = "r2_chunks"
-        recording_settings["format"] = RecordingFormats.MP3
-        recording_settings.setdefault("audio_chunk_prefix", f"customer_audio/{bot.project.object_id}/{bot.object_id}/chunks")
-        recording_settings.setdefault("audio_raw_path", f"customer_audio/{bot.project.object_id}/{bot.object_id}/original.m4a")
+        recording_settings["format"] = recording_format
+        recording_settings.setdefault("audio_raw_path", f"customer_audio/{bot.project.object_id}/{session_id}/original.m4a")
+        if recording_format == RecordingFormats.MP3:
+            recording_settings.setdefault("audio_chunk_prefix", f"customer_audio/{bot.project.object_id}/{session_id}/chunks")
+            recording_settings.pop("video_chunk_prefix", None)
+        elif recording_format in (RecordingFormats.MP4, RecordingFormats.WEBM):
+            recording_settings.setdefault("video_chunk_prefix", f"video/{bot.project.object_id}/{session_id}/chunks")
+            recording_settings.pop("audio_chunk_prefix", None)
         recording_settings.setdefault("chunk_interval_ms", 5000)
         recording_complete = copy.deepcopy(callback_settings.get("recording_complete") or {})
-        recording_complete.setdefault("url", build_site_url(f"/internal/bot-runtime-leases/{lease.id}/recording-complete"))
-        recording_complete.setdefault("signing_secret", lease.shutdown_token)
+        recording_complete["url"] = build_site_url(f"/internal/bot-runtime-leases/{lease.id}/recording-complete")
+        recording_complete["signing_secret"] = lease.shutdown_token
         callback_settings["recording_complete"] = recording_complete
 
     bot_settings["recording_settings"] = recording_settings
@@ -436,6 +451,69 @@ class BotRuntimeLeaseRecordingCompleteView(View):
             lease.bot.object_id,
             (((payload.get("data") or {}).get("audio") or {}).get("chunk_count")),
             (((payload.get("data") or {}).get("audio") or {}).get("raw_path")),
+        )
+
+        callback_url = lease.bot.recording_complete_callback_url()
+        callback_signing_secret = lease.bot.recording_complete_signing_secret()
+        if not callback_url or not callback_signing_secret:
+            logger.error(
+                "Missing upstream recording complete callback settings for lease=%s bot=%s",
+                lease.id,
+                lease.bot.object_id,
+            )
+            return JsonResponse({"error": "Upstream recording complete callback is not configured"}, status=502)
+
+        upstream_signature = sign_payload(payload, callback_signing_secret)
+        try:
+            response = requests.post(
+                callback_url,
+                json=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": "Attendee-Runtime/1.0",
+                    "X-Webhook-Signature": upstream_signature,
+                },
+                timeout=20,
+            )
+        except requests.RequestException as exc:
+            logger.exception(
+                "Failed to forward runtime recording complete callback for lease=%s bot=%s url=%s",
+                lease.id,
+                lease.bot.object_id,
+                callback_url,
+            )
+            return JsonResponse(
+                {
+                    "error": "Failed to forward recording complete callback",
+                    "details": str(exc),
+                },
+                status=502,
+            )
+
+        if not 200 <= response.status_code < 300:
+            logger.error(
+                "Upstream recording complete callback rejected for lease=%s bot=%s url=%s status=%s body=%s",
+                lease.id,
+                lease.bot.object_id,
+                callback_url,
+                response.status_code,
+                response.text[:1000],
+            )
+            return JsonResponse(
+                {
+                    "error": "Recording complete callback rejected",
+                    "status_code": response.status_code,
+                    "details": response.text[:1000],
+                },
+                status=502,
+            )
+
+        logger.info(
+            "Forwarded runtime recording complete callback for lease=%s bot=%s url=%s status=%s",
+            lease.id,
+            lease.bot.object_id,
+            callback_url,
+            response.status_code,
         )
         return JsonResponse({"status": "ok"}, status=200)
 

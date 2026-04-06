@@ -68,6 +68,7 @@ from bots.runtime_snapshot import RuntimeBotControlSnapshot, RuntimeBotSnapshot
 
 from .audio_chunk_uploader import AudioChunkUploader
 from .audio_output_manager import AudioOutputManager
+from .azure_file_uploader import AzureFileUploader
 from .bot_resource_snapshot_taker import BotResourceSnapshotTaker
 from .closed_caption_manager import ClosedCaptionManager
 from .grouped_closed_caption_manager import GroupedClosedCaptionManager
@@ -78,6 +79,7 @@ from .pipeline_configuration import PipelineConfiguration
 from .realtime_audio_output_manager import RealtimeAudioOutputManager
 from .recording_chunk_uploader import RecordingChunkUploader
 from .rtmp_client import RTMPClient
+from .s3_file_uploader import S3FileUploader
 from .screen_and_audio_recorder import ScreenAndAudioRecorder
 from .video_output_manager import VideoOutputManager
 from .webpage_streamer_manager import WebpageStreamerManager
@@ -281,10 +283,10 @@ class BotController:
         return self.save_utterances_for_individual_audio_chunks() or self.bot_in_db.record_async_transcription_audio_chunks()
 
     def disable_incoming_video_for_web_bots(self):
-        return not (self.pipeline_configuration.record_video or self.pipeline_configuration.rtmp_stream_video)
+        return not (self.pipeline_configuration.record_video or self.pipeline_configuration.rtmp_stream_video or self.bot_in_db.should_record_sidecar_video())
 
     def should_modify_dom_for_video_recording_for_web_bots(self):
-        return self.pipeline_configuration.record_video or self.pipeline_configuration.rtmp_stream_video
+        return self.pipeline_configuration.record_video or self.pipeline_configuration.rtmp_stream_video or self.bot_in_db.should_record_sidecar_video()
 
     # Constructs the callback we'll use to receive per-participant audio chunks
     # For most cases, we'll feed them to the per-participant audio input manager which will transcribe them and store the audio chunks for post-meeting transcription
@@ -365,8 +367,8 @@ class BotController:
             upsert_chat_message_callback=self.on_new_chat_message,
             add_participant_event_callback=self.on_new_participant_event,
             automatic_leave_configuration=self.automatic_leave_configuration,
-            add_encoded_mp4_chunk_callback=None,
-            add_encoded_audio_chunk_callback=self.on_recording_audio_chunk_from_adapter if self.recording_chunk_uploader else None,
+            add_encoded_mp4_chunk_callback=self.on_recording_video_chunk_from_adapter if self.bot_in_db.uses_muxed_screen_recording_chunks() else None,
+            add_encoded_audio_chunk_callback=self.on_recording_audio_chunk_from_adapter if self.recording_chunk_uploader and not self.bot_in_db.uses_muxed_screen_recording_chunks() else None,
             recording_view=self.bot_in_db.recording_view(),
             google_meet_closed_captions_language=self.bot_in_db.transcription_settings.google_meet_closed_captions_language(),
             should_create_debug_recording=self.bot_in_db.create_debug_recording(),
@@ -400,8 +402,8 @@ class BotController:
             upsert_chat_message_callback=self.on_new_chat_message,
             add_participant_event_callback=self.on_new_participant_event,
             automatic_leave_configuration=self.automatic_leave_configuration,
-            add_encoded_mp4_chunk_callback=None,
-            add_encoded_audio_chunk_callback=self.on_recording_audio_chunk_from_adapter if self.recording_chunk_uploader else None,
+            add_encoded_mp4_chunk_callback=self.on_recording_video_chunk_from_adapter if self.bot_in_db.uses_muxed_screen_recording_chunks() else None,
+            add_encoded_audio_chunk_callback=self.on_recording_audio_chunk_from_adapter if self.recording_chunk_uploader and not self.bot_in_db.uses_muxed_screen_recording_chunks() else None,
             recording_view=self.bot_in_db.recording_view(),
             teams_closed_captions_language=self.bot_in_db.transcription_settings.teams_closed_captions_language(),
             should_create_debug_recording=self.bot_in_db.create_debug_recording(),
@@ -472,8 +474,8 @@ class BotController:
             upsert_chat_message_callback=self.on_new_chat_message,
             add_participant_event_callback=self.on_new_participant_event,
             automatic_leave_configuration=self.automatic_leave_configuration,
-            add_encoded_mp4_chunk_callback=None,
-            add_encoded_audio_chunk_callback=self.on_recording_audio_chunk_from_adapter if self.recording_chunk_uploader else None,
+            add_encoded_mp4_chunk_callback=self.on_recording_video_chunk_from_adapter if self.bot_in_db.uses_muxed_screen_recording_chunks() else None,
+            add_encoded_audio_chunk_callback=self.on_recording_audio_chunk_from_adapter if self.recording_chunk_uploader and not self.bot_in_db.uses_muxed_screen_recording_chunks() else None,
             recording_view=self.bot_in_db.recording_view(),
             should_create_debug_recording=self.bot_in_db.create_debug_recording(),
             start_recording_screen_callback=self.screen_and_audio_recorder.start_recording if self.screen_and_audio_recorder else None,
@@ -683,6 +685,12 @@ class BotController:
         return max(1, int(time.time() - self.recording_chunks_started_at))
 
     def recording_session_id(self):
+        metadata_session_id = str((self.bot_in_db.metadata or {}).get("session_id") or "").strip()
+        if metadata_session_id:
+            return metadata_session_id
+
+        # GCP runtime recording paths are keyed by bot.object_id, so use the API session UUID from metadata
+        # when it exists and keep the legacy raw_path fallback for older/local flows.
         raw_path = self.bot_in_db.audio_raw_path() or ""
         parts = raw_path.split("/")
         if len(parts) >= 4:
@@ -695,14 +703,63 @@ class BotController:
             return
         self.recording_chunk_uploader.enqueue_chunk(chunk_bytes)
 
-    def deliver_recording_complete_callback(self):
+    def on_recording_video_chunk_from_adapter(self, chunk_bytes):
         if not self.recording_chunk_uploader:
+            logger.warning("Received recording video chunk but no recording chunk uploader is configured")
             return
+        self.recording_chunk_uploader.enqueue_chunk(chunk_bytes)
 
-        upload_result = self.recording_chunk_uploader.wait_for_uploads()
-        uploaded_chunk_paths = upload_result["chunk_paths"]
-        manifest_path = upload_result["manifest_path"]
-        self.recording_file_saved(manifest_path)
+    def has_recording_complete_handoff(self):
+        return self.recording_chunk_uploader is not None
+
+    def get_sidecar_video_file_location(self):
+        video_chunk_prefix = self.bot_in_db.video_chunk_prefix()
+        if not video_chunk_prefix:
+            return None
+        session_id = self.recording_session_id() or self.bot_in_db.object_id
+        return os.path.join(self.get_recording_storage_directory(), f"{session_id}.meeting-recording.mp4")
+
+    def upload_sidecar_video_recording(self):
+        video_chunk_prefix = self.bot_in_db.video_chunk_prefix()
+        file_path = self.get_sidecar_video_file_location()
+        if not video_chunk_prefix or not file_path:
+            return None
+        if not os.path.exists(file_path) or os.path.getsize(file_path) <= 0:
+            logger.warning("Screen recording was requested but no sidecar video file was produced at %s", file_path)
+            return None
+
+        chunk_path = f"{video_chunk_prefix.rstrip('/')}/chunk_0000.mp4"
+        storage_options = settings.RECORDING_STORAGE_BACKEND.get("OPTIONS", {})
+        if settings.STORAGE_PROTOCOL == "azure":
+            uploader = AzureFileUploader(
+                container=storage_options.get("azure_container"),
+                filename=chunk_path,
+                connection_string=storage_options.get("connection_string"),
+                account_key=storage_options.get("account_key"),
+                account_name=storage_options.get("account_name"),
+            )
+        else:
+            uploader = S3FileUploader(
+                settings.AWS_RECORDING_STORAGE_BUCKET_NAME,
+                chunk_path,
+                endpoint_url=storage_options.get("endpoint_url"),
+                access_key_id=storage_options.get("access_key"),
+                access_key_secret=storage_options.get("secret_key"),
+            )
+        uploader.upload_file(file_path)
+        uploader.wait_for_upload()
+        return {
+            "chunk_paths": [chunk_path],
+            "chunk_count": 1,
+            "chunk_ext": "mp4",
+            "chunk_mime_type": "video/mp4",
+            "chunk_interval_ms": None,
+            "duration_sec": self.recording_chunk_duration_sec(),
+        }
+
+    def deliver_recording_complete_callback(self):
+        if not self.has_recording_complete_handoff():
+            return
 
         session_id = self.recording_session_id()
         if not session_id:
@@ -713,6 +770,38 @@ class BotController:
         if not callback_url or not callback_secret:
             raise RuntimeError("Recording completion callback settings are missing")
 
+        upload_result = self.recording_chunk_uploader.wait_for_uploads()
+        uploaded_chunk_paths = upload_result["chunk_paths"]
+        manifest_path = upload_result["manifest_path"]
+        self.recording_file_saved(manifest_path)
+
+        video_upload_result = None
+        audio_upload_result = None
+
+        if self.bot_in_db.uses_muxed_screen_recording_chunks():
+            video_upload_result = {
+                "chunk_paths": uploaded_chunk_paths,
+                "chunk_count": len(uploaded_chunk_paths),
+                "chunk_ext": "webm",
+                "chunk_mime_type": "video/webm",
+                "chunk_interval_ms": self.bot_in_db.recording_chunk_interval_ms(),
+                "duration_sec": self.recording_chunk_duration_sec(),
+            }
+            audio_upload_result = {
+                **video_upload_result,
+                "raw_path": self.bot_in_db.audio_raw_path(),
+            }
+        else:
+            audio_upload_result = {
+                "chunk_paths": uploaded_chunk_paths,
+                "chunk_count": len(uploaded_chunk_paths),
+                "chunk_ext": "webm",
+                "chunk_mime_type": "audio/webm;codecs=opus",
+                "chunk_interval_ms": self.bot_in_db.recording_chunk_interval_ms(),
+                "duration_sec": self.recording_chunk_duration_sec(),
+                "raw_path": self.bot_in_db.audio_raw_path(),
+            }
+
         payload = {
             "idempotency_key": str(uuid.uuid4()),
             "trigger": "recording.complete",
@@ -720,17 +809,11 @@ class BotController:
             "provider": self.recording_complete_provider(),
             "data": {
                 "session_id": session_id,
-                "audio": {
-                    "chunk_paths": uploaded_chunk_paths,
-                    "chunk_count": len(uploaded_chunk_paths),
-                    "chunk_ext": "webm",
-                    "chunk_mime_type": "audio/webm;codecs=opus",
-                    "chunk_interval_ms": self.bot_in_db.recording_chunk_interval_ms(),
-                    "duration_sec": self.recording_chunk_duration_sec(),
-                    "raw_path": self.bot_in_db.audio_raw_path(),
-                },
+                "audio": audio_upload_result,
             },
         }
+        if video_upload_result is not None:
+            payload["data"]["video"] = video_upload_result
         make_signed_callback_request(
             url=callback_url,
             payload=payload,
@@ -834,7 +917,7 @@ class BotController:
             logger.info("Telling websocket client manager to cleanup...")
             self.websocket_client_manager.cleanup()
 
-        if self.recording_chunk_uploader:
+        if self.has_recording_complete_handoff():
             logger.info("Flushing browser recording chunks and delivering completion callback...")
             self.deliver_recording_complete_callback()
 
@@ -1055,8 +1138,14 @@ class BotController:
         return self.pipeline_configuration.websocket_stream_audio or self.pipeline_configuration.websocket_stream_per_participant_audio
 
     def should_create_screen_and_audio_recorder(self):
+        if self.bot_in_db.uses_muxed_screen_recording_chunks():
+            return False
+
         if self.recording_chunk_uploader:
             return False
+
+        if self.bot_in_db.should_record_sidecar_video():
+            return True
 
         # if we're not recording audio or video and not doing rtmp streaming, then we don't need to create a screen and audio recorder
         if not self.pipeline_configuration.record_audio and not self.pipeline_configuration.record_video and not self.pipeline_configuration.rtmp_stream_audio and not self.pipeline_configuration.rtmp_stream_video:
@@ -1149,16 +1238,28 @@ class BotController:
         self.screen_and_audio_recorder = None
         if self.should_create_screen_and_audio_recorder():
             self.screen_and_audio_recorder = ScreenAndAudioRecorder(
-                file_location=self.get_recording_file_location(),
+                file_location=self.get_sidecar_video_file_location() or self.get_recording_file_location(),
                 recording_dimensions=self.bot_in_db.recording_dimensions(),
-                audio_only=not (self.pipeline_configuration.record_video or self.pipeline_configuration.rtmp_stream_video),
+                audio_only=not (
+                    self.pipeline_configuration.record_video
+                    or self.pipeline_configuration.rtmp_stream_video
+                    or self.bot_in_db.should_record_sidecar_video()
+                ),
             )
 
-        if self.bot_in_db.audio_chunk_prefix() and self.bot_in_db.audio_raw_path():
+        if self.bot_in_db.audio_chunk_prefix() and self.bot_in_db.audio_raw_path() and not self.bot_in_db.uses_muxed_screen_recording_chunks():
             self.recording_chunk_uploader = RecordingChunkUploader(
                 chunk_prefix=self.bot_in_db.audio_chunk_prefix(),
                 chunk_ext="webm",
                 chunk_mime_type="audio/webm;codecs=opus",
+                raw_path=self.bot_in_db.audio_raw_path(),
+                chunk_interval_ms=self.bot_in_db.recording_chunk_interval_ms(),
+            )
+        elif self.bot_in_db.uses_muxed_screen_recording_chunks():
+            self.recording_chunk_uploader = RecordingChunkUploader(
+                chunk_prefix=self.bot_in_db.video_chunk_prefix(),
+                chunk_ext="webm",
+                chunk_mime_type="video/webm",
                 raw_path=self.bot_in_db.audio_raw_path(),
                 chunk_interval_ms=self.bot_in_db.recording_chunk_interval_ms(),
             )
@@ -2419,7 +2520,7 @@ class BotController:
 
             # The internal pipeline needs to start or resume recording.
             self.start_or_resume_recording_for_pipeline_objects_raise_on_failure()
-            if self.recording_chunk_uploader and self.recording_chunks_started_at is None:
+            if self.has_recording_complete_handoff() and self.recording_chunks_started_at is None:
                 self.recording_chunks_started_at = time.time()
 
             BotEventManager.create_event(
