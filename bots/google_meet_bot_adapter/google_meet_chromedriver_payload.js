@@ -1301,6 +1301,7 @@ class WebSocketClient {
     this.cleanupVideoChunkSourceTrack();
     this.videoChunkSourceTrackClone = nextTrack.clone();
     this.videoChunkSourceTrackId = nextTrack.id;
+    console.log('Video chunk recording attached live video track', this.videoChunkSourceTrackId);
     this.videoChunkVideoElement.srcObject = new MediaStream([this.videoChunkSourceTrackClone]);
     this.videoChunkVideoElement.play().catch((error) => {
       console.warn('Video chunk preview play failed', error);
@@ -1347,8 +1348,7 @@ class WebSocketClient {
     this.ensureVideoChunkCanvas();
     this.syncVideoChunkSourceTrack();
     if (!this.videoChunkSourceTrackClone) {
-      console.warn('No meeting video track available for video chunk recording');
-      return;
+      console.warn('No meeting video track available for video chunk recording yet; starting canvas recorder with black frames');
     }
 
     const recorderStream = this.videoChunkCanvas.captureStream(30);
@@ -1359,11 +1359,13 @@ class WebSocketClient {
     }
 
     const selectedMimeType = this.getPreferredVideoChunkMimeType();
+    console.log('Starting video chunk recording with mime type', selectedMimeType || 'browser-default');
     this.videoChunkRecorder = selectedMimeType
       ? new MediaRecorder(recorderStream, { mimeType: selectedMimeType })
       : new MediaRecorder(recorderStream);
     this.videoChunkRecorder.ondataavailable = (event) => {
       if (event.data && event.data.size > 0) {
+        console.log('Video chunk recorder produced chunk', event.data.type || selectedMimeType || 'unknown', event.data.size);
         this.sendEncodedMP4Chunk(event.data);
       }
     };
@@ -2236,6 +2238,17 @@ new RTCInterceptor({
             }
             if (event.track.kind === 'video') {
                 window.styleManager.addVideoTrack(event);
+                // Register in videoTrackManager for canvas-based muxed chunk recording
+                const firstStreamId = event.streams[0]?.id;
+                if (firstStreamId) {
+                    const isScreenShare = userManager
+                        .getCurrentUsersInMeetingWhoAreScreenSharing()
+                        .some(user => userManager.getDeviceOutput(user.deviceId, DEVICE_OUTPUT_TYPE.VIDEO).streamId === firstStreamId);
+                    videoTrackManager.upsertVideoTrack(event.track, firstStreamId, isScreenShare);
+                    event.track.addEventListener('ended', () => {
+                        videoTrackManager.deleteVideoTrack(event.track);
+                    });
+                }
             }
         });
 
