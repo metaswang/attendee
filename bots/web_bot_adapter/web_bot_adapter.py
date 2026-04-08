@@ -375,9 +375,16 @@ class WebBotAdapter(BotAdapter):
                     "recording_ms": recording_ms,
                     "display_width": display_width,
                     "display_height": display_height,
+                    "is_track_switch": bool(resize_event.get("is_track_switch", False)),
                 }
             )
 
+        logger.info(
+            "Received RecordingResizeEvents payload event_count=%s first_event=%s last_event=%s",
+            len(normalized_events),
+            (normalized_events[0] if normalized_events else None),
+            (normalized_events[-1] if normalized_events else None),
+        )
         self.update_recording_resize_events_callback(normalized_events)
 
     def mask_transcript_if_required(self, json_data):

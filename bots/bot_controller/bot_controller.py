@@ -841,6 +841,25 @@ class BotController:
             }
         if video_upload_result is not None and self.recording_resize_events:
             video_upload_result["resize_events"] = self.recording_resize_events
+            if self.bot_in_db.uses_muxed_screen_recording_chunks():
+                video_upload_result["screen_resize_events"] = copy.deepcopy(self.recording_resize_events)
+            logger.info(
+                "Attaching video resize metadata to recording callback for bot=%s session=%s resize_event_count=%s "
+                "screen_resize_event_count=%s first_event=%s last_event=%s",
+                self.bot_in_db.object_id,
+                session_id,
+                len(self.recording_resize_events),
+                len(video_upload_result.get("screen_resize_events") or []),
+                (self.recording_resize_events[0] if self.recording_resize_events else None),
+                (self.recording_resize_events[-1] if self.recording_resize_events else None),
+            )
+        elif video_upload_result is not None:
+            logger.warning(
+                "No recording resize metadata available for video callback bot=%s session=%s chunk_count=%s",
+                self.bot_in_db.object_id,
+                session_id,
+                video_upload_result.get("chunk_count"),
+            )
 
         payload = {
             "idempotency_key": str(uuid.uuid4()),

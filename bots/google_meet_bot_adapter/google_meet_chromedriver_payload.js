@@ -1068,6 +1068,8 @@ class WebSocketClient {
       this.videoChunkResizeStartTime = null;
       this.videoChunkResizeLastWidth = null;
       this.videoChunkResizeLastHeight = null;
+      this.videoChunkLastLoggedTrackInfo = null;
+      this._pendingTrackSwitch = false;
       
       /*
       We no longer need this because we're not using MediaStreamTrackProcessor's
@@ -1266,6 +1268,13 @@ class WebSocketClient {
       this.videoChunkVideoElement.autoplay = true;
       this.videoChunkVideoElement.muted = true;
       this.videoChunkVideoElement.playsInline = true;
+      // Event-driven aspect-ratio detection: fires whenever videoWidth/videoHeight changes,
+      // covering both track-level resolution shifts and initial load of a new track.
+      this.videoChunkVideoElement.addEventListener('resize', () => {
+        const isTrackSwitch = this._pendingTrackSwitch;
+        this._pendingTrackSwitch = false;
+        this.recordVideoChunkResizeEvent(isTrackSwitch);
+      });
     }
   }
 
@@ -1291,15 +1300,19 @@ class WebSocketClient {
     }
   }
 
-  recordVideoChunkResizeEvent() {
+  recordVideoChunkResizeEvent(isTrackSwitch = false) {
     const video = this.videoChunkVideoElement;
-    if (!video || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || !video.videoWidth || !video.videoHeight) {
+    // When called from the resize event listener the video is already decoded;
+    // only require non-zero dimensions.
+    if (!video || !video.videoWidth || !video.videoHeight) {
       return false;
     }
 
     const width = video.videoWidth;
     const height = video.videoHeight;
-    if (this.videoChunkResizeLastWidth === width && this.videoChunkResizeLastHeight === height) {
+    // Skip duplicate dimensions unless a track switch just happened (same resolution,
+    // different source track is still semantically distinct).
+    if (!isTrackSwitch && this.videoChunkResizeLastWidth === width && this.videoChunkResizeLastHeight === height) {
       return false;
     }
 
@@ -1310,9 +1323,21 @@ class WebSocketClient {
       recording_ms: recordingMs,
       display_width: width,
       display_height: height,
+      is_track_switch: isTrackSwitch,
     });
     this.videoChunkResizeLastWidth = width;
     this.videoChunkResizeLastHeight = height;
+    console.log(
+      'Video chunk resize event recorded',
+      JSON.stringify({
+        recording_ms: recordingMs,
+        display_width: width,
+        display_height: height,
+        is_track_switch: isTrackSwitch,
+        total_events: this.videoChunkResizeEvents.length,
+        source_track_id: this.videoChunkSourceTrackId,
+      }),
+    );
     return true;
   }
 
@@ -1320,6 +1345,10 @@ class WebSocketClient {
     this.ensureVideoChunkCanvas();
     const nextTrack = this.getVideoTrackForChunkRecording();
     if (!nextTrack || nextTrack.readyState !== 'live') {
+      if (this.videoChunkLastLoggedTrackInfo !== 'missing') {
+        console.warn('Video chunk recording has no live source track');
+        this.videoChunkLastLoggedTrackInfo = 'missing';
+      }
       this.cleanupVideoChunkSourceTrack();
       return;
     }
@@ -1330,7 +1359,20 @@ class WebSocketClient {
     this.cleanupVideoChunkSourceTrack();
     this.videoChunkSourceTrackClone = nextTrack.clone();
     this.videoChunkSourceTrackId = nextTrack.id;
-    console.log('Video chunk recording attached live video track', this.videoChunkSourceTrackId);
+    this.videoChunkLastLoggedTrackInfo = nextTrack.id;
+    // Signal that the next resize event on the video element is caused by a track switch,
+    // not a mid-stream resolution change.  The flag is cleared by the resize handler.
+    this._pendingTrackSwitch = true;
+    const trackSettings = typeof nextTrack.getSettings === 'function' ? nextTrack.getSettings() : null;
+    console.log(
+      'Video chunk recording attached live video track',
+      JSON.stringify({
+        track_id: this.videoChunkSourceTrackId,
+        kind: nextTrack.kind,
+        ready_state: nextTrack.readyState,
+        settings: trackSettings,
+      }),
+    );
     this.videoChunkVideoElement.srcObject = new MediaStream([this.videoChunkSourceTrackClone]);
     this.videoChunkVideoElement.play().catch((error) => {
       console.warn('Video chunk preview play failed', error);
@@ -1352,7 +1394,6 @@ class WebSocketClient {
     }
 
     if (video && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth && video.videoHeight) {
-      this.recordVideoChunkResizeEvent();
       if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
         canvas.width = video.videoWidth;
         canvas.height = video.videoHeight;
@@ -1385,6 +1426,21 @@ class WebSocketClient {
     this.videoChunkResizeLastWidth = null;
     this.videoChunkResizeLastHeight = null;
     this.recordVideoChunkResizeEvent();
+    console.log(
+      'Starting video chunk recording',
+      JSON.stringify({
+        track_id: this.videoChunkSourceTrackId,
+        initial_canvas: {
+          width: this.videoChunkCanvas?.width || null,
+          height: this.videoChunkCanvas?.height || null,
+        },
+        initial_video: {
+          width: this.videoChunkVideoElement?.videoWidth || null,
+          height: this.videoChunkVideoElement?.videoHeight || null,
+          ready_state: this.videoChunkVideoElement?.readyState ?? null,
+        },
+      }),
+    );
 
     const recorderStream = this.videoChunkCanvas.captureStream(30);
     const meetingAudioStream = window.styleManager?.getMeetingAudioStream?.();
@@ -1446,17 +1502,36 @@ class WebSocketClient {
     this.videoChunkRecorder = null;
     this.stopVideoChunkCanvasLoop();
     const resizeEvents = this.videoChunkResizeEvents.slice();
+    console.log(
+      'Stopping video chunk recording',
+      JSON.stringify({
+        resize_event_count: resizeEvents.length,
+        first_event: resizeEvents[0] || null,
+        last_event: resizeEvents[resizeEvents.length - 1] || null,
+        source_track_id: this.videoChunkSourceTrackId,
+      }),
+    );
     if (resizeEvents.length > 1) {
       this.sendJson({
         type: 'RecordingResizeEvents',
         resize_events: resizeEvents,
       });
+    } else {
+      console.warn(
+        'Video chunk recording completed without enough resize events to send',
+        JSON.stringify({
+          resize_event_count: resizeEvents.length,
+          source_track_id: this.videoChunkSourceTrackId,
+        }),
+      );
     }
     this.cleanupVideoChunkSourceTrack();
     this.videoChunkResizeEvents = [];
     this.videoChunkResizeStartTime = null;
     this.videoChunkResizeLastWidth = null;
     this.videoChunkResizeLastHeight = null;
+    this.videoChunkLastLoggedTrackInfo = null;
+    this._pendingTrackSwitch = false;
   }
 
   sendEncodedAudioChunk(encodedAudioData) {
