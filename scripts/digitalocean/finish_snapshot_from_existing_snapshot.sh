@@ -13,11 +13,21 @@ if [[ ! -f "$ENV_FILE" ]]; then
   exit 1
 fi
 
+set -a
+# shellcheck disable=SC1090
 source "$ENV_FILE"
+set +a
 export DIGITALOCEAN_ACCESS_TOKEN="$DROPLET_API_KEY"
 
-TMP_NAME="attendee-bot-template-v4"
+: "${DO_TEMPLATE_DROPLET_NAME:?DO_TEMPLATE_DROPLET_NAME is required}"
+TMP_NAME="$DO_TEMPLATE_DROPLET_NAME"
 SNAPSHOT_NAME="attendee-bot-snapshot-$(date +%Y%m%d%H%M%S)"
+
+# Remove stale droplets with the same name so create does not collide.
+while read -r did dname; do
+  [[ "$dname" == "$TMP_NAME" ]] || continue
+  doctl compute droplet delete "$did" --force
+done < <(doctl compute droplet list --format ID,Name --no-header)
 
 cleanup() {
   env DIGITALOCEAN_ACCESS_TOKEN="$DIGITALOCEAN_ACCESS_TOKEN" \

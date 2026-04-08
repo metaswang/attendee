@@ -1,9 +1,13 @@
 import copy
+import base64
+import hashlib
+import hmac
 import json
 import logging
 import os
 import subprocess
 import tarfile
+import time
 from io import BytesIO
 from pathlib import Path
 from textwrap import shorten
@@ -76,6 +80,25 @@ SOURCE_ARCHIVE_EXCLUDED_FILE_NAMES = {
 }
 
 
+def _sign_raw_body_with_timestamp(raw_body: bytes, timestamp: str, secret: str) -> str:
+    message = timestamp.encode("utf-8") + b"." + raw_body
+    digest = hmac.new(secret.encode("utf-8"), message, hashlib.sha256).digest()
+    return base64.b64encode(digest).decode("utf-8")
+
+
+def _verify_raw_body_signature_with_timestamp(raw_body: bytes, timestamp: str, signature: str, secret: str, max_age_seconds: int = 300) -> bool:
+    if not signature or not timestamp:
+        return False
+    try:
+        ts = int(timestamp)
+    except (TypeError, ValueError):
+        return False
+    if abs(int(time.time()) - ts) > max_age_seconds:
+        return False
+    expected_signature = _sign_raw_body_with_timestamp(raw_body, timestamp, secret)
+    return hmac.compare_digest(signature, expected_signature)
+
+
 def _repo_source_archive_paths() -> list[Path]:
     git_dir = REPO_ROOT / ".git"
     if git_dir.exists():
@@ -134,6 +157,7 @@ def _serialize_bot_runtime_snapshot(bot: Bot, lease: BotRuntimeLease) -> dict:
     bot_settings = copy.deepcopy(bot.settings or {})
     recording_settings = bot_settings.get("recording_settings") or {}
     callback_settings = bot_settings.get("callback_settings") or {}
+    callback_settings_changed = False
 
     if lease.provider == BotRuntimeProviderTypes.GCP_COMPUTE_INSTANCE and meeting_type_from_url(bot.meeting_url) in {MeetingTypes.GOOGLE_MEET, MeetingTypes.TEAMS}:
         session_id = str((bot.metadata or {}).get("session_id") or "").strip() or bot.object_id
@@ -150,12 +174,28 @@ def _serialize_bot_runtime_snapshot(bot: Bot, lease: BotRuntimeLease) -> dict:
         recording_settings.setdefault("chunk_interval_ms", 5000)
         recording_complete = copy.deepcopy(callback_settings.get("recording_complete") or {})
         recording_complete["url"] = build_site_url(f"/internal/bot-runtime-leases/{lease.id}/recording-complete")
+        upstream_signing_secret = recording_complete.get("signing_secret")
+        if upstream_signing_secret:
+            if recording_complete.get("upstream_signing_secret") != upstream_signing_secret:
+                callback_settings_changed = True
+            recording_complete["upstream_signing_secret"] = upstream_signing_secret
         recording_complete["signing_secret"] = lease.shutdown_token
         callback_settings["recording_complete"] = recording_complete
 
     bot_settings["recording_settings"] = recording_settings
     if callback_settings:
         bot_settings["callback_settings"] = callback_settings
+    if callback_settings_changed:
+        persisted_settings = copy.deepcopy(bot.settings or {})
+        persisted_callback_settings = persisted_settings.get("callback_settings") or {}
+        persisted_recording_complete = copy.deepcopy(persisted_callback_settings.get("recording_complete") or {})
+        persisted_signing_secret = persisted_recording_complete.get("signing_secret")
+        if persisted_signing_secret:
+            persisted_recording_complete["upstream_signing_secret"] = persisted_signing_secret
+            persisted_callback_settings["recording_complete"] = persisted_recording_complete
+            persisted_settings["callback_settings"] = persisted_callback_settings
+            bot.settings = persisted_settings
+            bot.save(update_fields=["settings", "updated_at"])
 
     recordings = [
         {
@@ -434,12 +474,21 @@ class BotRuntimeLeaseRecordingCompleteView(View):
         except BotRuntimeLease.DoesNotExist:
             return JsonResponse({"error": "Lease not found"}, status=404)
 
+        raw_body = request.body or b""
         payload, error_response = _require_json_body(request)
         if error_response is not None:
             return error_response
 
         signature = request.headers.get("X-Webhook-Signature", "")
-        if not signature or not verify_signature(payload, signature, lease.shutdown_token):
+        timestamp = request.headers.get("X-Webhook-Timestamp", "")
+        legacy_signature = request.headers.get("X-Webhook-Signature-Legacy", "")
+        is_valid = False
+        if timestamp:
+            is_valid = _verify_raw_body_signature_with_timestamp(raw_body, timestamp, signature, lease.shutdown_token)
+        if not is_valid:
+            signature_for_legacy = legacy_signature or signature
+            is_valid = bool(signature_for_legacy) and verify_signature(payload, signature_for_legacy, lease.shutdown_token)
+        if not is_valid:
             return JsonResponse({"error": "Invalid signature"}, status=401)
 
         if payload.get("trigger") != "recording.complete":
@@ -454,7 +503,7 @@ class BotRuntimeLeaseRecordingCompleteView(View):
         )
 
         callback_url = lease.bot.recording_complete_callback_url()
-        callback_signing_secret = lease.bot.recording_complete_signing_secret()
+        callback_signing_secret = lease.bot.recording_complete_upstream_signing_secret()
         if not callback_url or not callback_signing_secret:
             logger.error(
                 "Missing upstream recording complete callback settings for lease=%s bot=%s",
@@ -463,14 +512,18 @@ class BotRuntimeLeaseRecordingCompleteView(View):
             )
             return JsonResponse({"error": "Upstream recording complete callback is not configured"}, status=502)
 
-        upstream_signature = sign_payload(payload, callback_signing_secret)
+        # Prefer timestamped raw-body signature to avoid JSON re-serialization mismatch across services.
+        raw_payload = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        upstream_timestamp = str(int(time.time()))
+        upstream_signature = _sign_raw_body_with_timestamp(raw_payload, upstream_timestamp, callback_signing_secret)
         try:
             response = requests.post(
                 callback_url,
-                json=payload,
+                data=raw_payload,
                 headers={
                     "Content-Type": "application/json",
                     "User-Agent": "Attendee-Runtime/1.0",
+                    "X-Webhook-Timestamp": upstream_timestamp,
                     "X-Webhook-Signature": upstream_signature,
                 },
                 timeout=20,

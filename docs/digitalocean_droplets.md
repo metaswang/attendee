@@ -45,8 +45,8 @@ On the template Droplet:
 1. Install Docker.
 2. Clone this repo to `/opt/attendee`.
 3. Build the runtime image with `docker build -t "$BOT_RUNTIME_IMAGE" .`.
-4. Copy [attendee-bot-runner.sh](/Users/adamwang/Project/attendee/scripts/digitalocean/attendee-bot-runner.sh) to `/usr/local/bin/attendee-bot-runner` and mark it executable.
-5. Copy [attendee-bot-runner.service](/Users/adamwang/Project/attendee/scripts/digitalocean/attendee-bot-runner.service) to `/etc/systemd/system/attendee-bot-runner.service`.
+4. Copy [attendee-bot-runner.sh](../scripts/digitalocean/attendee-bot-runner.sh) to `/usr/local/bin/attendee-bot-runner` and mark it executable.
+5. Copy [attendee-bot-runner.service](../scripts/digitalocean/attendee-bot-runner.service) to `/etc/systemd/system/attendee-bot-runner.service`.
 6. Ensure the template Droplet can reach your managed Postgres, Redis, and object storage endpoints.
 7. Run `cloud-init clean --logs` before taking the snapshot.
 8. Create a snapshot and set its image ID as `DO_BOT_SNAPSHOT_ID` on `myvps`.
@@ -63,4 +63,4 @@ On the template Droplet:
 - The project now includes the control-plane logic, lease model, cleanup integration, and operator scripts.
 - You still need to build the initial template Droplet and snapshot manually.
 - End-to-end validation should be run in a Python 3.11 environment with Django dependencies installed.
-- A command-by-command first-run procedure is documented in [digitalocean_first_snapshot_runbook.md](/Users/adamwang/Project/attendee/docs/digitalocean_first_snapshot_runbook.md).
+- A command-by-command first-run procedure is documented in [digitalocean_first_snapshot_runbook.md](./digitalocean_first_snapshot_runbook.md).

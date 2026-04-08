@@ -1064,6 +1064,10 @@ class WebSocketClient {
       this.videoChunkAnimationFrame = null;
       this.videoChunkSourceTrackId = null;
       this.videoChunkSourceTrackClone = null;
+      this.videoChunkResizeEvents = [];
+      this.videoChunkResizeStartTime = null;
+      this.videoChunkResizeLastWidth = null;
+      this.videoChunkResizeLastHeight = null;
       
       /*
       We no longer need this because we're not using MediaStreamTrackProcessor's
@@ -1287,6 +1291,31 @@ class WebSocketClient {
     }
   }
 
+  recordVideoChunkResizeEvent() {
+    const video = this.videoChunkVideoElement;
+    if (!video || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || !video.videoWidth || !video.videoHeight) {
+      return false;
+    }
+
+    const width = video.videoWidth;
+    const height = video.videoHeight;
+    if (this.videoChunkResizeLastWidth === width && this.videoChunkResizeLastHeight === height) {
+      return false;
+    }
+
+    const recordingMs = this.videoChunkResizeEvents.length === 0 || !this.videoChunkResizeStartTime
+      ? 0
+      : Math.max(0, Date.now() - this.videoChunkResizeStartTime);
+    this.videoChunkResizeEvents.push({
+      recording_ms: recordingMs,
+      display_width: width,
+      display_height: height,
+    });
+    this.videoChunkResizeLastWidth = width;
+    this.videoChunkResizeLastHeight = height;
+    return true;
+  }
+
   syncVideoChunkSourceTrack() {
     this.ensureVideoChunkCanvas();
     const nextTrack = this.getVideoTrackForChunkRecording();
@@ -1323,6 +1352,7 @@ class WebSocketClient {
     }
 
     if (video && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth && video.videoHeight) {
+      this.recordVideoChunkResizeEvent();
       if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
         canvas.width = video.videoWidth;
         canvas.height = video.videoHeight;
@@ -1350,6 +1380,11 @@ class WebSocketClient {
     if (!this.videoChunkSourceTrackClone) {
       console.warn('No meeting video track available for video chunk recording yet; starting canvas recorder with black frames');
     }
+    this.videoChunkResizeStartTime = Date.now();
+    this.videoChunkResizeEvents = [];
+    this.videoChunkResizeLastWidth = null;
+    this.videoChunkResizeLastHeight = null;
+    this.recordVideoChunkResizeEvent();
 
     const recorderStream = this.videoChunkCanvas.captureStream(30);
     const meetingAudioStream = window.styleManager?.getMeetingAudioStream?.();
@@ -1391,6 +1426,10 @@ class WebSocketClient {
     if (!this.videoChunkRecorder || this.videoChunkRecorder.state === 'inactive') {
       this.stopVideoChunkCanvasLoop();
       this.cleanupVideoChunkSourceTrack();
+      this.videoChunkResizeEvents = [];
+      this.videoChunkResizeStartTime = null;
+      this.videoChunkResizeLastWidth = null;
+      this.videoChunkResizeLastHeight = null;
       return;
     }
 
@@ -1406,7 +1445,18 @@ class WebSocketClient {
     });
     this.videoChunkRecorder = null;
     this.stopVideoChunkCanvasLoop();
+    const resizeEvents = this.videoChunkResizeEvents.slice();
+    if (resizeEvents.length > 1) {
+      this.sendJson({
+        type: 'RecordingResizeEvents',
+        resize_events: resizeEvents,
+      });
+    }
     this.cleanupVideoChunkSourceTrack();
+    this.videoChunkResizeEvents = [];
+    this.videoChunkResizeStartTime = null;
+    this.videoChunkResizeLastWidth = null;
+    this.videoChunkResizeLastHeight = null;
   }
 
   sendEncodedAudioChunk(encodedAudioData) {
@@ -1437,6 +1487,13 @@ class WebSocketClient {
     const preferredMimeTypes = ['audio/webm;codecs=opus', 'audio/webm'];
     const selectedMimeType = preferredMimeTypes.find((mime) => window.MediaRecorder && MediaRecorder.isTypeSupported(mime));
     this.audioChunkRecorder = selectedMimeType ? new MediaRecorder(audioStream, { mimeType: selectedMimeType }) : new MediaRecorder(audioStream);
+    const audioChunkMimeType = this.audioChunkRecorder.mimeType || selectedMimeType || 'audio/webm';
+    window.ws.sendJson({
+      type: 'RecordingChunkFormat',
+      kind: 'audio',
+      mimeType: audioChunkMimeType,
+      extension: audioChunkMimeType.includes('mp4') ? 'm4a' : 'webm',
+    });
     this.audioChunkRecorder.ondataavailable = (event) => {
       if (event.data && event.data.size > 0) {
         this.sendEncodedAudioChunk(event.data);

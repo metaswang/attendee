@@ -10,6 +10,7 @@ from bots.bot_controller.bot_controller import BotController
 from bots.bots_api_utils import BotCreationSource, create_bot
 from bots.models import Bot, Project, RecordingFormats
 from bots.bot_controller.recording_chunk_uploader import RecordingChunkUploader
+from bots.bot_controller.bot_controller import R2_AUDIO_CHUNK_EXT, R2_AUDIO_CHUNK_MIME_TYPE
 from bots.serializers import CreateBotSerializer
 
 
@@ -232,6 +233,7 @@ class RecordingChunkSettingsTests(TestCase):
             self.assertTrue(av_bot.create_debug_recording())
 
     @patch("bots.bot_controller.recording_chunk_uploader.boto3.client")
+    @override_settings(AWS_RECORDING_STORAGE_BUCKET_NAME="voxella-video", AWS_AUDIO_CHUNK_STORAGE_BUCKET_NAME="vox")
     def test_recording_chunk_uploader_writes_manifest_after_chunks(self, mock_boto_client):
         mock_s3_client = MagicMock()
         mock_boto_client.return_value = mock_s3_client
@@ -239,11 +241,13 @@ class RecordingChunkSettingsTests(TestCase):
         uploader = RecordingChunkUploader(
             chunk_prefix="customer_audio/user-1/session-1/chunks",
             chunk_ext="webm",
-            chunk_mime_type="audio/webm;codecs=opus",
+            chunk_mime_type=R2_AUDIO_CHUNK_MIME_TYPE,
             raw_path="customer_audio/user-1/session-1/original.m4a",
             chunk_interval_ms=5000,
             worker_count=1,
         )
+
+        self.assertEqual(uploader._s3_bucket, "vox")
 
         uploader.enqueue_chunk(b"chunk-1")
         uploader.enqueue_chunk(b"chunk-2")
@@ -266,6 +270,92 @@ class RecordingChunkSettingsTests(TestCase):
         second_result = uploader.wait_for_uploads()
         self.assertEqual(second_result, result)
         self.assertEqual(mock_s3_client.put_object.call_count, 3)
+
+    @patch("bots.bot_controller.recording_chunk_uploader.boto3.client")
+    @override_settings(AWS_RECORDING_STORAGE_BUCKET_NAME="voxella-video", AWS_AUDIO_CHUNK_STORAGE_BUCKET_NAME="vox")
+    def test_video_chunk_prefix_routes_to_video_bucket(self, mock_boto_client):
+        mock_s3_client = MagicMock()
+        mock_boto_client.return_value = mock_s3_client
+
+        uploader = RecordingChunkUploader(
+            chunk_prefix="video/user-1/session-1/chunks",
+            chunk_ext="webm",
+            chunk_mime_type="video/webm",
+            raw_path="customer_audio/user-1/session-1/original.m4a",
+            chunk_interval_ms=5000,
+            worker_count=1,
+        )
+
+        self.assertEqual(uploader._s3_bucket, "voxella-video")
+
+        uploader.enqueue_chunk(b"chunk-1")
+        result = uploader.wait_for_uploads()
+
+        chunk_call = mock_s3_client.put_object.call_args_list[0]
+        self.assertEqual(chunk_call.kwargs["Bucket"], "voxella-video")
+        self.assertEqual(result["manifest_path"], "video/user-1/session-1/manifest.json")
+
+    @patch("bots.bot_controller.bot_controller.make_signed_callback_request")
+    def test_audio_only_recording_callback_uses_generic_audio_webm_mime_type(self, mock_callback):
+        bot = Bot.objects.create(
+            project=self.project,
+            name="Audio Chunk Bot",
+            meeting_url="https://meet.google.com/abc-defg-hij",
+            settings={
+                "recording_settings": {
+                    "format": RecordingFormats.MP3,
+                    "transport": "r2_chunks",
+                    "audio_chunk_prefix": "customer_audio/user-1/session-1/chunks",
+                    "audio_raw_path": "customer_audio/user-1/session-1/original.m4a",
+                },
+                "callback_settings": {
+                    "recording_complete": {
+                        "url": "https://api.example.com/v2/meeting/app/bot/recording/complete",
+                        "signing_secret": "top-secret",
+                    }
+                },
+            },
+            metadata={"session_id": "session-1"},
+        )
+
+        controller = BotController.__new__(BotController)
+        controller.bot_in_db = bot
+        controller.recording_chunk_uploader = MagicMock()
+        controller.recording_chunk_uploader.wait_for_uploads.return_value = {
+            "chunk_paths": [
+                "customer_audio/user-1/session-1/chunks/chunk_0000.webm",
+            ],
+            "manifest_path": "customer_audio/user-1/session-1/manifest.json",
+        }
+        controller.recording_chunks_started_at = 100.0
+        controller.recording_file_saved = MagicMock()
+        controller.recording_complete_provider = MagicMock(return_value="google")
+
+        with patch("bots.bot_controller.bot_controller.time.time", return_value=107.0):
+            controller.deliver_recording_complete_callback()
+
+        payload = mock_callback.call_args.kwargs["payload"]
+        self.assertEqual(payload["data"]["audio"]["chunk_mime_type"], R2_AUDIO_CHUNK_MIME_TYPE)
+
+    def test_audio_only_recording_chunk_metadata_update_uses_browser_selected_format(self):
+        controller = BotController.__new__(BotController)
+        controller.bot_in_db = MagicMock()
+        controller.bot_in_db.uses_muxed_screen_recording_chunks.return_value = False
+        controller.recording_audio_chunk_mime_type = R2_AUDIO_CHUNK_MIME_TYPE
+        controller.recording_audio_chunk_ext = R2_AUDIO_CHUNK_EXT
+        controller.recording_chunk_uploader = RecordingChunkUploader(
+            chunk_prefix="customer_audio/user-1/session-1/chunks",
+            chunk_ext=R2_AUDIO_CHUNK_EXT,
+            chunk_mime_type=R2_AUDIO_CHUNK_MIME_TYPE,
+            raw_path="customer_audio/user-1/session-1/original.m4a",
+            worker_count=1,
+        )
+
+        controller.update_recording_chunk_metadata_from_adapter("audio", "audio/webm;codecs=opus", "webm")
+
+        self.assertEqual(controller.recording_audio_chunk_mime_type, "audio/webm;codecs=opus")
+        self.assertEqual(controller.recording_audio_chunk_ext, "webm")
+        self.assertEqual(controller.recording_chunk_uploader.chunk_mime_type, "audio/webm;codecs=opus")
 
     @patch("bots.bot_controller.bot_controller.make_signed_callback_request")
     def test_muxed_screen_recording_callback_uses_video_as_single_source(self, mock_callback):
@@ -319,3 +409,4 @@ class RecordingChunkSettingsTests(TestCase):
             "video/user-1/session-1/chunks/chunk_0000.webm",
             "video/user-1/session-1/chunks/chunk_0001.webm",
         ])
+        self.assertEqual(payload["data"]["video"]["raw_path"], "customer_audio/user-1/session-1/original.m4a")

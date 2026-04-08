@@ -24,7 +24,6 @@ from bots.bot_adapter import BotAdapter
 from bots.models import ParticipantEventTypes, RecordingViews
 from bots.utils import half_ceil, scale_i420
 
-from .debug_screen_recorder import DebugScreenRecorder
 from .ui_methods import UiAuthorizedUserNotInMeetingTimeoutExceededException, UiBlockedByCaptchaException, UiCouldNotJoinMeetingWaitingForHostException, UiCouldNotJoinMeetingWaitingRoomTimeoutException, UiIncorrectPasswordException, UiInfinitelyRetryableException, UiLoginAttemptFailedException, UiLoginRequiredException, UiMeetingNotFoundException, UiRequestToJoinDeniedException, UiRetryableException, UiRetryableExpectedException
 
 logger = logging.getLogger(__name__)
@@ -43,6 +42,7 @@ class WebBotAdapter(BotAdapter):
         add_mixed_audio_chunk_callback,
         add_encoded_mp4_chunk_callback,
         add_encoded_audio_chunk_callback,
+        update_recording_chunk_metadata_callback,
         upsert_caption_callback,
         upsert_chat_message_callback,
         add_participant_event_callback,
@@ -56,6 +56,7 @@ class WebBotAdapter(BotAdapter):
         disable_incoming_video: bool,
         record_participant_speech_start_stop_events: bool,
         recording_chunk_interval_ms: int,
+        update_recording_resize_events_callback=None,
     ):
         self.display_name = display_name
         self.send_message_callback = send_message_callback
@@ -65,6 +66,8 @@ class WebBotAdapter(BotAdapter):
         self.wants_any_video_frames_callback = wants_any_video_frames_callback
         self.add_encoded_mp4_chunk_callback = add_encoded_mp4_chunk_callback
         self.add_encoded_audio_chunk_callback = add_encoded_audio_chunk_callback
+        self.update_recording_chunk_metadata_callback = update_recording_chunk_metadata_callback
+        self.update_recording_resize_events_callback = update_recording_resize_events_callback
         self.upsert_caption_callback = upsert_caption_callback
         self.upsert_chat_message_callback = upsert_chat_message_callback
         self.add_participant_event_callback = add_participant_event_callback
@@ -107,7 +110,6 @@ class WebBotAdapter(BotAdapter):
         self.automatic_leave_configuration = automatic_leave_configuration
 
         self.should_create_debug_recording = should_create_debug_recording
-        self.debug_screen_recorder = None
 
         self.silence_detection_activated = False
         self.joined_at = None
@@ -328,6 +330,56 @@ class WebBotAdapter(BotAdapter):
 
         self.upsert_chat_message_callback(json_data)
 
+    def handle_recording_chunk_format(self, json_data):
+        if not self.update_recording_chunk_metadata_callback:
+            return
+
+        kind = (json_data.get("kind") or "").strip().lower()
+        mime_type = (json_data.get("mimeType") or "").strip()
+        extension = (json_data.get("extension") or "").strip().lstrip(".")
+        if kind not in {"audio", "video"} or not mime_type or not extension:
+            logger.warning("Received invalid RecordingChunkFormat payload: %s", json_data)
+            return
+
+        self.update_recording_chunk_metadata_callback(kind, mime_type, extension)
+
+    def handle_recording_resize_events(self, json_data):
+        if not self.update_recording_resize_events_callback:
+            return
+
+        resize_events = json_data.get("resize_events")
+        if not isinstance(resize_events, list) or not resize_events:
+            logger.warning("Received invalid RecordingResizeEvents payload: %s", json_data)
+            return
+
+        normalized_events = []
+        for resize_event in resize_events:
+            if not isinstance(resize_event, dict):
+                logger.warning("Received invalid RecordingResizeEvents event: %s", resize_event)
+                return
+
+            try:
+                recording_ms = int(resize_event.get("recording_ms"))
+                display_width = int(resize_event.get("display_width"))
+                display_height = int(resize_event.get("display_height"))
+            except (TypeError, ValueError):
+                logger.warning("Received invalid RecordingResizeEvents event: %s", resize_event)
+                return
+
+            if recording_ms < 0 or display_width <= 0 or display_height <= 0:
+                logger.warning("Received invalid RecordingResizeEvents event: %s", resize_event)
+                return
+
+            normalized_events.append(
+                {
+                    "recording_ms": recording_ms,
+                    "display_width": display_width,
+                    "display_height": display_height,
+                }
+            )
+
+        self.update_recording_resize_events_callback(normalized_events)
+
     def mask_transcript_if_required(self, json_data):
         if not settings.MASK_TRANSCRIPT_IN_LOGS:
             return json_data
@@ -367,6 +419,12 @@ class WebBotAdapter(BotAdapter):
 
                         elif json_data.get("type") == "ChatMessage":
                             self.handle_chat_message(json_data)
+
+                        elif json_data.get("type") == "RecordingChunkFormat":
+                            self.handle_recording_chunk_format(json_data)
+
+                        elif json_data.get("type") == "RecordingResizeEvents":
+                            self.handle_recording_resize_events(json_data)
 
                         elif json_data.get("type") == "ParticipantSpeechStartStopEvent":
                             self.handle_participant_speech_start_stop_event(json_data)
@@ -578,6 +636,11 @@ class WebBotAdapter(BotAdapter):
         options.add_argument("--disable-application-cache")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--disable-blink-features=AutomationControlled")
+        # Prevent renderer process crash in Docker/headless environments (Chrome 114+)
+        # VizDisplayCompositor runs out-of-process and crashes without GPU
+        options.add_argument("--disable-features=VizDisplayCompositor")
+        options.add_argument("--disable-features=site-per-process")
+        options.add_argument("--disable-software-rasterizer")
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
 
         if os.getenv("ENABLE_CHROME_SANDBOX", "false").lower() != "true":
@@ -670,10 +733,6 @@ class WebBotAdapter(BotAdapter):
             self.display = Display(visible=0, size=(1930, 1090))
             self.display.start()
             self.display_var_for_debug_recording = self.display.new_display_var
-
-        if self.should_create_debug_recording:
-            self.debug_screen_recorder = DebugScreenRecorder(self.display_var_for_debug_recording, self.video_frame_size, BotAdapter.DEBUG_RECORDING_FILE_PATH)
-            self.debug_screen_recorder.start()
 
         # Start websocket server in a separate thread
         websocket_thread = threading.Thread(target=self.run_websocket_server, daemon=True)
@@ -830,8 +889,7 @@ class WebBotAdapter(BotAdapter):
         self.media_sending_enable_timestamp_ms = time.time() * 1000
 
     def stop_debug_screen_recording(self):
-        if self.debug_screen_recorder:
-            self.debug_screen_recorder.stop()
+        return None
 
     def leave(self):
         if self.left_meeting:
@@ -903,9 +961,6 @@ class WebBotAdapter(BotAdapter):
                     logger.warning(f"Error quitting driver: {e}")
         except Exception as e:
             logger.warning(f"Error during cleanup: {e}")
-
-        if self.debug_screen_recorder:
-            self.debug_screen_recorder.stop()
 
         # Properly shutdown the websocket server
         if self.websocket_server:

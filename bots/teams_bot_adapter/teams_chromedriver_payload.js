@@ -1449,6 +1449,7 @@ class WebSocketClient {
         this.cleanupVideoChunkSourceTrack();
         this.videoChunkSourceTrackClone = nextTrack.clone();
         this.videoChunkSourceTrackId = nextTrack.id;
+        console.log('Video chunk recording attached live video track', this.videoChunkSourceTrackId);
         this.videoChunkVideoElement.srcObject = new MediaStream([this.videoChunkSourceTrackClone]);
         this.videoChunkVideoElement.play().catch((error) => {
             console.warn('Video chunk preview play failed', error);
@@ -1495,8 +1496,7 @@ class WebSocketClient {
         this.ensureVideoChunkCanvas();
         this.syncVideoChunkSourceTrack();
         if (!this.videoChunkSourceTrackClone) {
-            console.warn('No meeting video track available for video chunk recording');
-            return;
+            console.warn('No meeting video track available for video chunk recording yet; starting canvas recorder with black frames');
         }
 
         const recorderStream = this.videoChunkCanvas.captureStream(30);
@@ -1507,11 +1507,13 @@ class WebSocketClient {
         }
 
         const selectedMimeType = this.getPreferredVideoChunkMimeType();
+        console.log('Starting video chunk recording with mime type', selectedMimeType || 'browser-default');
         this.videoChunkRecorder = selectedMimeType
             ? new MediaRecorder(recorderStream, { mimeType: selectedMimeType })
             : new MediaRecorder(recorderStream);
         this.videoChunkRecorder.ondataavailable = (event) => {
             if (event.data && event.data.size > 0) {
+                console.log('Video chunk recorder produced chunk', event.data.type || selectedMimeType || 'unknown', event.data.size);
                 this.sendEncodedMP4Chunk(event.data);
             }
         };
@@ -1567,6 +1569,13 @@ class WebSocketClient {
         const preferredMimeTypes = ['audio/webm;codecs=opus', 'audio/webm'];
         const selectedMimeType = preferredMimeTypes.find((mime) => window.MediaRecorder && MediaRecorder.isTypeSupported(mime));
         this.audioChunkRecorder = selectedMimeType ? new MediaRecorder(audioStream, { mimeType: selectedMimeType }) : new MediaRecorder(audioStream);
+        const audioChunkMimeType = this.audioChunkRecorder.mimeType || selectedMimeType || 'audio/webm';
+        this.ws.sendJson({
+            type: 'RecordingChunkFormat',
+            kind: 'audio',
+            mimeType: audioChunkMimeType,
+            extension: audioChunkMimeType.includes('mp4') ? 'm4a' : 'webm',
+        });
         this.audioChunkRecorder.ondataavailable = (event) => {
             if (event.data && event.data.size > 0) {
                 this.sendEncodedAudioChunk(event.data);

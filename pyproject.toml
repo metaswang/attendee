@@ -62,12 +62,12 @@ dependencies = [
     "prompt-toolkit==3.0.48",
     "proto-plus==1.26.0",
     "protobuf==5.29.6",
-    "psycopg2==2.9.10",
+    "psycopg2==2.9.10; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "pyasn1==0.6.2",
     "pyasn1-modules==0.4.1",
     "pycparser==2.22",
     "pydub==0.25.1",
-    "pygobject==3.50.0",
+    "pygobject==3.50.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "pyjwt==2.9.0",
     "pysaml2==7.5.4",
     "pysocks==1.7.1",
@@ -108,7 +108,7 @@ dependencies = [
     "websockets==14.1",
     "whitenoise==6.8.2",
     "wsproto==1.2.0",
-    "zoom-meeting-sdk==0.0.27",
+    "zoom-meeting-sdk==0.0.27; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
 [tool.ruff]

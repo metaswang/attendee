@@ -797,6 +797,13 @@ class WebSocketClient {
         const preferredMimeTypes = ['audio/webm;codecs=opus', 'audio/webm'];
         const selectedMimeType = preferredMimeTypes.find((mime) => window.MediaRecorder && MediaRecorder.isTypeSupported(mime));
         this.audioChunkRecorder = selectedMimeType ? new MediaRecorder(audioStream, { mimeType: selectedMimeType }) : new MediaRecorder(audioStream);
+        const audioChunkMimeType = this.audioChunkRecorder.mimeType || selectedMimeType || 'audio/webm';
+        this.ws.sendJson({
+            type: 'RecordingChunkFormat',
+            kind: 'audio',
+            mimeType: audioChunkMimeType,
+            extension: audioChunkMimeType.includes('mp4') ? 'm4a' : 'webm',
+        });
         this.audioChunkRecorder.ondataavailable = (event) => {
             if (event.data && event.data.size > 0) {
                 this.sendEncodedAudioChunk(event.data);

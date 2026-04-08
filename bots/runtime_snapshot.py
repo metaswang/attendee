@@ -456,6 +456,11 @@ class RuntimeBotSnapshot:
         recording_complete = callback_settings.get("recording_complete") or {}
         return recording_complete.get("signing_secret")
 
+    def recording_complete_upstream_signing_secret(self):
+        callback_settings = self.settings.get("callback_settings", {}) or {}
+        recording_complete = callback_settings.get("recording_complete") or {}
+        return recording_complete.get("upstream_signing_secret")
+
     def recording_format(self):
         recording_settings = self.settings.get("recording_settings", {}) or {}
         return recording_settings.get("format", RecordingFormats.MP4)
@@ -586,3 +591,8 @@ class RuntimeBotSnapshot:
         callback_settings = self.settings.get("callback_settings", {}) or {}
         recording_complete = callback_settings.get("recording_complete") or {}
         return recording_complete.get("signing_secret")
+
+    def recording_complete_upstream_signing_secret(self):
+        callback_settings = self.settings.get("callback_settings", {}) or {}
+        recording_complete = callback_settings.get("recording_complete") or {}
+        return recording_complete.get("upstream_signing_secret")

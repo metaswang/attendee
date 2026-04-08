@@ -127,6 +127,9 @@ class GCPComputeInstanceProvider:
                 "LEASE_SHUTDOWN_TOKEN": lease.shutdown_token,
             }
         )
+        runtime_redis_url = os.getenv("BOT_RUNTIME_REDIS_URL", "").strip()
+        if runtime_redis_url:
+            env_vars["REDIS_URL"] = runtime_redis_url
         return "\n".join(f"export {key}={shlex.quote(str(value))}" for key, value in sorted(env_vars.items()))
 
     def _startup_script(self, bot, lease: BotRuntimeLease) -> str:

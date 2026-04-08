@@ -391,9 +391,19 @@ class TestGCPRuntime(TestCase):
             )
         )
         self.assertTrue(payload["bot"]["settings"]["callback_settings"]["recording_complete"]["url"].startswith("https://"))
+        self.assertEqual(
+            payload["bot"]["settings"]["callback_settings"]["recording_complete"]["signing_secret"],
+            lease.shutdown_token,
+        )
+        self.assertEqual(
+            payload["bot"]["settings"]["callback_settings"]["recording_complete"]["upstream_signing_secret"],
+            "api-secret",
+        )
         runtime_bot = RuntimeBotSnapshot(payload)
         self.assertEqual(runtime_bot.id, self.bot.id)
         self.assertEqual(runtime_bot.project.object_id, self.project.object_id)
+        self.assertEqual(runtime_bot.recording_complete_signing_secret(), lease.shutdown_token)
+        self.assertEqual(runtime_bot.recording_complete_upstream_signing_secret(), "api-secret")
 
     @patch("bots.internal_views.requests.post")
     def test_recording_complete_view_forwards_signed_callback_to_upstream(self, mock_post):
@@ -426,7 +436,7 @@ class TestGCPRuntime(TestCase):
                     "chunk_paths": ["customer_audio/test/chunks/chunk_0000.webm"],
                     "chunk_count": 1,
                     "chunk_ext": "webm",
-                    "chunk_mime_type": "audio/webm;codecs=opus",
+                    "chunk_mime_type": "audio/webm",
                     "chunk_interval_ms": 5000,
                     "duration_sec": 7,
                     "raw_path": "customer_audio/test/original.m4a",

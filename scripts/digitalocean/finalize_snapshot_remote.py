@@ -35,13 +35,17 @@ def main() -> int:
         return 1
 
     env = load_env(sys.argv[1])
+    template_name = (env.get("DO_TEMPLATE_DROPLET_NAME") or "").strip()
+    if not template_name:
+        print("DO_TEMPLATE_DROPLET_NAME is required in env file", file=sys.stderr)
+        return 1
     do_env = os.environ.copy()
     do_env["DIGITALOCEAN_ACCESS_TOKEN"] = env["DROPLET_API_KEY"]
 
     droplets = doctl_json(["compute", "droplet", "list"], do_env)
-    candidates = [d for d in droplets if d["name"] == "attendee-bot-template-v4"]
+    candidates = [d for d in droplets if d["name"] == template_name]
     if not candidates:
-        print("no attendee-bot-template-v4 droplets found", file=sys.stderr)
+        print(f"no droplets named {template_name!r} found", file=sys.stderr)
         return 1
 
     target = max(candidates, key=lambda d: d["id"])
@@ -63,12 +67,18 @@ def main() -> int:
         print("ssh to target droplet failed", file=sys.stderr)
         return 1
 
+    repo_root = Path(__file__).resolve().parents[2]
+    runner_src = repo_root / "scripts/digitalocean/attendee-bot-runner.sh"
+    service_src = repo_root / "scripts/digitalocean/attendee-bot-runner.service"
+    if not runner_src.is_file() or not service_src.is_file():
+        print(f"runner assets not found under {repo_root}", file=sys.stderr)
+        return 1
     run(
         [
             "scp",
             "-o",
             "StrictHostKeyChecking=no",
-            "/voxstudio/attendee/scripts/digitalocean/attendee-bot-runner.sh",
+            str(runner_src),
             f"root@{target_ip}:/usr/local/bin/attendee-bot-runner",
         ]
     )
@@ -77,7 +87,7 @@ def main() -> int:
             "scp",
             "-o",
             "StrictHostKeyChecking=no",
-            "/voxstudio/attendee/scripts/digitalocean/attendee-bot-runner.service",
+            str(service_src),
             f"root@{target_ip}:/etc/systemd/system/attendee-bot-runner.service",
         ]
     )

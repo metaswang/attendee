@@ -1,5 +1,6 @@
 from .autopay_charge_task import autopay_charge
 from .deliver_webhook_task import deliver_webhook
+from .launch_joining_bot_task import launch_joining_bot
 from .launch_scheduled_bot_task import launch_scheduled_bot
 from .process_async_transcription_task import process_async_transcription
 from .process_utterance_task import process_utterance
@@ -17,6 +18,7 @@ __all__ = [
     "process_utterance",
     "run_bot",
     "deliver_webhook",
+    "launch_joining_bot",
     "restart_bot_pod",
     "launch_scheduled_bot",
     "sync_calendar",

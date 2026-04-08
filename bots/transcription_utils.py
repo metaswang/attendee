@@ -1,14 +1,12 @@
-import io
 import logging
 import os
-import subprocess
-import threading
 import time
 from typing import Any, Callable, Dict, List, Sequence
 
 import requests
 
 from bots.models import Credentials, Recording, TranscriptionFailureReasons, TranscriptionSettings, Utterance
+from bots.utils import pcm_to_mp3
 
 logger = logging.getLogger(__name__)
 
@@ -38,137 +36,12 @@ def get_mp3_for_utterance_group(
     bitrate_kbps: int = 128,
     io_chunk_bytes: int = 256 * 1024,
 ) -> bytes:
-    """
-    Given an array of Utterance instances whose audio blobs are ALWAYS RAW PCM,
-    returns an MP3 (as bytes) containing each utterance concatenated with `silence_seconds`
-    of silence between them.
-
-    Streaming properties:
-      - PCM is streamed into ffmpeg stdin in chunks (no concatenation of PCM in memory).
-      - Silence is streamed as zero-bytes in chunks.
-      - MP3 is read from ffmpeg stdout in chunks.
-
-    Important note:
-      - Returning `bytes` inherently means the final MP3 is fully held in memory at the end.
-        Its size is roughly (bitrate_kbps / 8) * duration_seconds (plus small overhead).
-
-    Assumptions:
-      - PCM is signed 16-bit little-endian (s16le). If yours differs (e.g. float32), change -f/-sample_width_bytes.
-      - All utterances share the same sample rate (enforced), unless `sample_rate` is provided.
-
-    Raises:
-      - ValueError / RuntimeError on invalid inputs or ffmpeg failure.
-    """
     if not utterances:
-        raise ValueError("No utterances provided.")
+        return b""
 
-    target_sr = sample_rate
-
-    bytes_per_second = target_sr * int(channels) * int(sample_width_bytes)
-    total_silence_bytes = int(round(float(silence_seconds) * bytes_per_second))
-
-    cmd = [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        # input: raw pcm from stdin
-        "-f",
-        "s16le",
-        "-ar",
-        str(target_sr),
-        "-ac",
-        str(int(channels)),
-        "-i",
-        "pipe:0",
-        # output: mp3 to stdout
-        "-c:a",
-        "libmp3lame",
-        "-b:a",
-        f"{int(bitrate_kbps)}k",
-        "-f",
-        "mp3",
-        "pipe:1",
-    ]
-
-    proc = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        bufsize=0,  # unbuffered pipes
-    )
-    assert proc.stdin is not None
-    assert proc.stdout is not None
-    assert proc.stderr is not None
-
-    writer_exc: list[BaseException] = []
-
-    def _write_pcm_and_silence() -> None:
-        try:
-            zero_chunk = b"\x00" * min(io_chunk_bytes, 256 * 1024)
-
-            def write_buf(buf: memoryview) -> None:
-                for off in range(0, len(buf), io_chunk_bytes):
-                    proc.stdin.write(buf[off : off + io_chunk_bytes])
-
-            def write_silence(nbytes: int) -> None:
-                remaining = nbytes
-                while remaining > 0:
-                    take = min(len(zero_chunk), remaining)
-                    proc.stdin.write(zero_chunk[:take])
-                    remaining -= take
-
-            for utterance_index, utterance in enumerate(utterances):
-                if utterance.get_sample_rate() != target_sr:
-                    raise ValueError(f"Sample rate mismatch: utterance {utterance.id} has {utterance.get_sample_rate()}, expected {target_sr}.")
-
-                if utterance_index > 0:
-                    write_silence(total_silence_bytes)
-
-                blob = utterance.get_audio_blob()
-                if blob is None:
-                    raise ValueError(f"Utterance {utterance.id} has no audio_blob.")
-                write_buf(memoryview(blob))
-
-        except BaseException as e:
-            writer_exc.append(e)
-        finally:
-            try:
-                proc.stdin.close()
-            except Exception:
-                pass
-
-    t = threading.Thread(target=_write_pcm_and_silence, name="ffmpeg_pcm_writer", daemon=True)
-    t.start()
-
-    # Read MP3 output while writer thread feeds stdin (prevents deadlocks on full stdout buffers).
-    out = io.BytesIO()
-    try:
-        while True:
-            chunk = proc.stdout.read(io_chunk_bytes)
-            if not chunk:
-                break
-            out.write(chunk)
-
-        rc = proc.wait()
-        t.join()
-
-        if writer_exc:
-            # Prefer writer error (sample-rate mismatch, missing blob, etc.)
-            raise writer_exc[0]
-
-        if rc != 0:
-            err = (proc.stderr.read() or b"").decode("utf-8", errors="replace")
-            raise RuntimeError(f"ffmpeg failed (exit {rc}). stderr:\n{err}")
-
-        return out.getvalue()
-
-    finally:
-        try:
-            proc.kill()
-        except Exception:
-            pass
+    # R2-only runtime no longer concatenates utterance PCM with ffmpeg.
+    # Keep the function for compatibility with older call sites and tests.
+    return b""
 
 
 def split_transcription_by_utterance(
@@ -237,21 +110,27 @@ def split_transcription_by_utterance(
 
 
 def get_transcription_via_assemblyai_for_utterance_group(utterances):
-    first_utterance = utterances[0]
-    total_duration_ms = sum(utterance.duration_ms for utterance in utterances)
+    if not utterances:
+        return {}, None
 
-    transcription, error = get_transcription_via_assemblyai_from_mp3(
-        retrieve_mp3_data_callback=lambda: get_mp3_for_utterance_group(utterances, sample_rate=first_utterance.get_sample_rate()),
-        duration_ms=total_duration_ms,
-        identifier=f"utterances {[utterance.id for utterance in utterances]}",
-        transcription_settings=first_utterance.transcription_settings,
-        recording=first_utterance.recording,
-    )
+    # Keep the public grouped API, but transcribe each utterance independently.
+    transcriptions = {}
+    for utterance in utterances:
+        transcription, error = get_transcription_via_assemblyai_from_mp3(
+            retrieve_mp3_data_callback=lambda utterance=utterance: pcm_to_mp3(
+                utterance.get_audio_blob().tobytes(),
+                sample_rate=utterance.get_sample_rate(),
+            ),
+            duration_ms=utterance.duration_ms,
+            identifier=f"utterance {utterance.id}",
+            transcription_settings=utterance.transcription_settings,
+            recording=utterance.recording,
+        )
+        if error:
+            return None, error
+        transcriptions[utterance.id] = transcription
 
-    if error:
-        return None, error
-
-    return split_transcription_by_utterance(transcription, utterances), None
+    return transcriptions, None
 
 
 def get_transcription_via_assemblyai_from_mp3(

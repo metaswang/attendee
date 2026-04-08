@@ -19,7 +19,6 @@ from django.views.generic import ListView
 from accounts.models import User, UserRole
 
 from .bots_api_utils import BotCreationSource, create_bot, create_webhook_subscription
-from .launch_bot_utils import launch_bot
 from .models import (
     ApiKey,
     Bot,
@@ -53,6 +52,7 @@ from .models import (
     WebhookTriggerTypes,
     ZoomOAuthApp,
 )
+from .tasks import launch_joining_bot
 from .stripe_utils import credit_amount_for_purchase_amount_dollars, process_checkout_session_completed
 from .tasks.deliver_webhook_task import deliver_webhook
 from .utils import generate_recordings_json_for_bot_detail_view
@@ -1258,7 +1258,7 @@ class CreateBotView(LoginRequiredMixin, ProjectUrlContextMixin, View):
 
             # If this is a scheduled bot, we don't want to launch it yet.
             if bot.state == BotStates.JOINING:
-                launch_bot(bot)
+                launch_joining_bot.delay(bot.id)
 
             return HttpResponse("ok", status=200)
         except Exception as e:

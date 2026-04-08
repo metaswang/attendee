@@ -62,11 +62,15 @@ def main() -> int:
 
     env_file, runner_file, service_file = sys.argv[1:]
     env = load_env(env_file)
+    template_name = (env.get("DO_TEMPLATE_DROPLET_NAME") or "").strip()
+    if not template_name:
+        print("DO_TEMPLATE_DROPLET_NAME is required in env file", file=sys.stderr)
+        return 1
     do_env = os.environ.copy()
     do_env["DIGITALOCEAN_ACCESS_TOKEN"] = env["DROPLET_API_KEY"]
 
     for droplet in doctl_json(["compute", "droplet", "list"], do_env):
-        if droplet["name"] == "attendee-bot-template-v4":
+        if droplet["name"] == template_name:
             run(["doctl", "compute", "droplet", "delete", str(droplet["id"]), "--force"], env=do_env)
 
     user_data = render_userdata(Path(runner_file), Path(service_file))
@@ -81,7 +85,7 @@ def main() -> int:
                 "compute",
                 "droplet",
                 "create",
-                "attendee-bot-template-v4",
+                template_name,
                 "--size",
                 env["DO_TEMPLATE_SIZE_SLUG"],
                 "--image",
@@ -100,7 +104,7 @@ def main() -> int:
         )
 
         droplets = doctl_json(["compute", "droplet", "list"], do_env)
-        target = max((d for d in droplets if d["name"] == "attendee-bot-template-v4"), key=lambda d: d["id"])
+        target = max((d for d in droplets if d["name"] == template_name), key=lambda d: d["id"])
         target_id = str(target["id"])
         print(f"TARGET_ID={target_id}")
 

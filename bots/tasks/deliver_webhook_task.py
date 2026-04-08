@@ -1,6 +1,10 @@
 import logging
 import os
 import time
+import base64
+import hashlib
+import hmac
+import json
 
 import redis
 import requests
@@ -38,6 +42,12 @@ def is_global_webhook_rate_limit_reached():
 
 # This is how many times we will try to deliver the webhook before giving up.
 MAX_WEBHOOK_DELIVERY_ATTEMPTS = int(os.getenv("MAX_WEBHOOK_DELIVERY_ATTEMPTS", 3))
+
+
+def _sign_raw_body_with_timestamp(raw_body: bytes, timestamp: str, secret: str) -> str:
+    message = timestamp.encode("utf-8") + b"." + raw_body
+    digest = hmac.new(secret.encode("utf-8"), message, hashlib.sha256).digest()
+    return base64.b64encode(digest).decode("utf-8")
 # This is how many times the task can be retried before giving up.
 # This is distinct from MAX_WEBHOOK_DELIVERY_ATTEMPTS because the task can also be retried for
 # reasons other than delivery failures (e.g., rate limiting enforced by Attendee via GLOBAL_WEBHOOK_DELIVERIES_PER_SECOND_RATE_LIMIT or unexpected exceptions).
@@ -104,7 +114,10 @@ def deliver_webhook(self, delivery_id):
 
     # Sign the payload
     active_secret = subscription.project.webhook_secrets.filter().order_by("-created_at").first()
-    signature = sign_payload(webhook_data, active_secret.get_secret())
+    raw_payload = json.dumps(webhook_data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    webhook_timestamp = str(int(time.time()))
+    signature = _sign_raw_body_with_timestamp(raw_payload, webhook_timestamp, active_secret.get_secret())
+    legacy_signature = sign_payload(webhook_data, active_secret.get_secret())
 
     # Check if the global webhook rate limit has been reached before delivering.
     if is_global_webhook_rate_limit_reached():
@@ -128,11 +141,13 @@ def deliver_webhook(self, delivery_id):
     try:
         response = requests.post(
             subscription.url,
-            json=webhook_data,
+            data=raw_payload,
             headers={
                 "Content-Type": "application/json",
                 "User-Agent": "Attendee-Webhook/1.0",
                 "X-Webhook-Signature": signature,
+                "X-Webhook-Timestamp": webhook_timestamp,
+                "X-Webhook-Signature-Legacy": legacy_signature,
             },
             timeout=10,  # 10-second timeout
         )

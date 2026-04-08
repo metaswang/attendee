@@ -35,6 +35,10 @@ class RecordingChunkUploader:
         self._next_chunk_index = 0
         self._workers = []
 
+        # video/ prefix → recording bucket (voxella-video)
+        # customer_audio/ prefix → audio chunk bucket (vox)
+        is_video_prefix = chunk_prefix.startswith("video/")
+
         if settings.STORAGE_PROTOCOL == "azure":
             from azure.storage.blob import BlobServiceClient, ContentSettings
 
@@ -45,7 +49,9 @@ class RecordingChunkUploader:
             else:
                 account_url = f"https://{options.get('account_name')}.blob.core.windows.net"
                 service_client = BlobServiceClient(account_url=account_url, credential=options.get("account_key"))
-            self._azure_container = options.get("azure_container")
+            self._azure_container = (
+                settings.AZURE_RECORDING_STORAGE_CONTAINER_NAME if is_video_prefix else settings.AZURE_AUDIO_CHUNK_STORAGE_CONTAINER_NAME
+            )
             self._azure_service_client = service_client
             self._s3_client = None
             self._s3_bucket = None
@@ -57,7 +63,7 @@ class RecordingChunkUploader:
                 aws_access_key_id=options.get("access_key"),
                 aws_secret_access_key=options.get("secret_key"),
             )
-            self._s3_bucket = settings.AWS_RECORDING_STORAGE_BUCKET_NAME
+            self._s3_bucket = settings.AWS_RECORDING_STORAGE_BUCKET_NAME if is_video_prefix else settings.AWS_AUDIO_CHUNK_STORAGE_BUCKET_NAME
             self._azure_service_client = None
             self._azure_container = None
             self._azure_content_settings_class = None
@@ -66,6 +72,16 @@ class RecordingChunkUploader:
             worker = threading.Thread(target=self._upload_worker, daemon=True)
             worker.start()
             self._workers.append(worker)
+
+    def update_chunk_metadata(self, *, chunk_ext: str | None = None, chunk_mime_type: str | None = None):
+        with self._lock:
+            if self._next_chunk_index > 0:
+                logger.warning("Ignoring late recording chunk metadata update after uploads started")
+                return
+            if chunk_ext:
+                self.chunk_ext = chunk_ext.lstrip(".")
+            if chunk_mime_type:
+                self.chunk_mime_type = chunk_mime_type
 
     def _next_chunk_path(self):
         with self._lock:

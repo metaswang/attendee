@@ -1,4 +1,9 @@
 import logging
+import base64
+import hashlib
+import hmac
+import json
+import time
 from typing import Dict, Optional
 
 import requests
@@ -30,17 +35,31 @@ class CallbackHTTPError(CallbackError):
         self.response_body = response_body
 
 
+def _sign_raw_body_with_timestamp(raw_body: bytes, timestamp: str, secret: bytes | str) -> str:
+    if isinstance(secret, str):
+        secret = secret.encode("utf-8")
+    message = timestamp.encode("utf-8") + b"." + raw_body
+    digest = hmac.new(secret, message, hashlib.sha256).digest()
+    return base64.b64encode(digest).decode("utf-8")
+
+
 def make_signed_callback_request(url: str, payload: Dict, signing_secret: bytes | str, timeout_seconds: int = 30) -> Dict:
     secret_bytes = signing_secret.encode("utf-8") if isinstance(signing_secret, str) else signing_secret
-    signature = sign_payload(payload, secret_bytes)
+    raw_payload = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    timestamp = str(int(time.time()))
+    signature = _sign_raw_body_with_timestamp(raw_payload, timestamp, secret_bytes)
+    # Keep legacy header for backward compatibility.
+    legacy_signature = sign_payload(payload, secret_bytes)
     try:
         response = requests.post(
             url,
-            json=payload,
+            data=raw_payload,
             headers={
                 "Content-Type": "application/json",
                 "User-Agent": "Attendee-Callback/1.0",
                 "X-Webhook-Signature": signature,
+                "X-Webhook-Timestamp": timestamp,
+                "X-Webhook-Signature-Legacy": legacy_signature,
             },
             timeout=timeout_seconds,
         )

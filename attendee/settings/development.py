@@ -4,14 +4,16 @@ from .base import *
 
 DEBUG = True
 SITE_DOMAIN = os.getenv("SITE_DOMAIN", "localhost:8100")
-ALLOWED_HOSTS = ["tendee-stripe-hooks.ngrok.io", "localhost"]
+_allowed_hosts = ["tendee-stripe-hooks.ngrok.io", "localhost", "127.0.0.1"]
+_extra_allowed_hosts = [host.strip() for host in os.getenv("ALLOWED_HOSTS", "").split(",") if host.strip()]
+ALLOWED_HOSTS = list(dict.fromkeys(_allowed_hosts + _extra_allowed_hosts))
 
 DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.postgresql",
-        "NAME": "attendee_development",
-        "USER": "attendee_development_user",
-        "PASSWORD": "attendee_development_user",
+        "NAME": os.getenv("POSTGRES_DB", "attendee_development"),
+        "USER": os.getenv("POSTGRES_USER", "attendee_development_user"),
+        "PASSWORD": os.getenv("POSTGRES_PASSWORD", "attendee_development_user"),
         "HOST": os.getenv("POSTGRES_HOST", "localhost"),
         "PORT": "5432",
     }
