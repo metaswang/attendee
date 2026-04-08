@@ -24,7 +24,6 @@ from bots.bot_adapter import BotAdapter
 from bots.models import ParticipantEventTypes, RecordingViews
 from bots.utils import half_ceil, scale_i420
 
-from .debug_screen_recorder import DebugScreenRecorder
 from .ui_methods import UiAuthorizedUserNotInMeetingTimeoutExceededException, UiBlockedByCaptchaException, UiCouldNotJoinMeetingWaitingForHostException, UiCouldNotJoinMeetingWaitingRoomTimeoutException, UiIncorrectPasswordException, UiInfinitelyRetryableException, UiLoginAttemptFailedException, UiLoginRequiredException, UiMeetingNotFoundException, UiRequestToJoinDeniedException, UiRetryableException, UiRetryableExpectedException
 
 logger = logging.getLogger(__name__)
@@ -42,6 +41,8 @@ class WebBotAdapter(BotAdapter):
         add_audio_chunk_callback,
         add_mixed_audio_chunk_callback,
         add_encoded_mp4_chunk_callback,
+        add_encoded_audio_chunk_callback,
+        update_recording_chunk_metadata_callback,
         upsert_caption_callback,
         upsert_chat_message_callback,
         add_participant_event_callback,
@@ -54,6 +55,8 @@ class WebBotAdapter(BotAdapter):
         record_chat_messages_when_paused: bool,
         disable_incoming_video: bool,
         record_participant_speech_start_stop_events: bool,
+        recording_chunk_interval_ms: int,
+        update_recording_resize_events_callback=None,
     ):
         self.display_name = display_name
         self.send_message_callback = send_message_callback
@@ -62,6 +65,9 @@ class WebBotAdapter(BotAdapter):
         self.add_video_frame_callback = add_video_frame_callback
         self.wants_any_video_frames_callback = wants_any_video_frames_callback
         self.add_encoded_mp4_chunk_callback = add_encoded_mp4_chunk_callback
+        self.add_encoded_audio_chunk_callback = add_encoded_audio_chunk_callback
+        self.update_recording_chunk_metadata_callback = update_recording_chunk_metadata_callback
+        self.update_recording_resize_events_callback = update_recording_resize_events_callback
         self.upsert_caption_callback = upsert_caption_callback
         self.upsert_chat_message_callback = upsert_chat_message_callback
         self.add_participant_event_callback = add_participant_event_callback
@@ -71,6 +77,7 @@ class WebBotAdapter(BotAdapter):
         self.record_chat_messages_when_paused = record_chat_messages_when_paused
         self.disable_incoming_video = disable_incoming_video
         self.record_participant_speech_start_stop_events = record_participant_speech_start_stop_events
+        self.recording_chunk_interval_ms = recording_chunk_interval_ms
         self.meeting_url = meeting_url
 
         # This is an internal ID that comes from the platform. It is currently only used for MS Teams.
@@ -103,7 +110,6 @@ class WebBotAdapter(BotAdapter):
         self.automatic_leave_configuration = automatic_leave_configuration
 
         self.should_create_debug_recording = should_create_debug_recording
-        self.debug_screen_recorder = None
 
         self.silence_detection_activated = False
         self.joined_at = None
@@ -128,6 +134,17 @@ class WebBotAdapter(BotAdapter):
             encoded_mp4_data = message[4:]
             logger.info(f"encoded mp4 data length {len(encoded_mp4_data)}")
             self.add_encoded_mp4_chunk_callback(encoded_mp4_data)
+
+    def process_encoded_audio_chunk(self, message):
+        if self.recording_paused:
+            return
+        if not self.add_encoded_audio_chunk_callback:
+            return
+
+        self.last_media_message_processed_time = time.time()
+        if len(message) > 4:
+            encoded_audio_data = message[4:]
+            self.add_encoded_audio_chunk_callback(encoded_audio_data)
 
     def get_participant(self, participant_id):
         if participant_id in self.participants_info:
@@ -313,6 +330,63 @@ class WebBotAdapter(BotAdapter):
 
         self.upsert_chat_message_callback(json_data)
 
+    def handle_recording_chunk_format(self, json_data):
+        if not self.update_recording_chunk_metadata_callback:
+            return
+
+        kind = (json_data.get("kind") or "").strip().lower()
+        mime_type = (json_data.get("mimeType") or "").strip()
+        extension = (json_data.get("extension") or "").strip().lstrip(".")
+        if kind not in {"audio", "video"} or not mime_type or not extension:
+            logger.warning("Received invalid RecordingChunkFormat payload: %s", json_data)
+            return
+
+        self.update_recording_chunk_metadata_callback(kind, mime_type, extension)
+
+    def handle_recording_resize_events(self, json_data):
+        if not self.update_recording_resize_events_callback:
+            return
+
+        resize_events = json_data.get("resize_events")
+        if not isinstance(resize_events, list) or not resize_events:
+            logger.warning("Received invalid RecordingResizeEvents payload: %s", json_data)
+            return
+
+        normalized_events = []
+        for resize_event in resize_events:
+            if not isinstance(resize_event, dict):
+                logger.warning("Received invalid RecordingResizeEvents event: %s", resize_event)
+                return
+
+            try:
+                recording_ms = int(resize_event.get("recording_ms"))
+                display_width = int(resize_event.get("display_width"))
+                display_height = int(resize_event.get("display_height"))
+            except (TypeError, ValueError):
+                logger.warning("Received invalid RecordingResizeEvents event: %s", resize_event)
+                return
+
+            if recording_ms < 0 or display_width <= 0 or display_height <= 0:
+                logger.warning("Received invalid RecordingResizeEvents event: %s", resize_event)
+                return
+
+            normalized_events.append(
+                {
+                    "recording_ms": recording_ms,
+                    "display_width": display_width,
+                    "display_height": display_height,
+                    "is_track_switch": bool(resize_event.get("is_track_switch", False)),
+                }
+            )
+
+        logger.info(
+            "Received RecordingResizeEvents payload event_count=%s first_event=%s last_event=%s",
+            len(normalized_events),
+            (normalized_events[0] if normalized_events else None),
+            (normalized_events[-1] if normalized_events else None),
+        )
+        self.update_recording_resize_events_callback(normalized_events)
+
     def mask_transcript_if_required(self, json_data):
         if not settings.MASK_TRANSCRIPT_IN_LOGS:
             return json_data
@@ -352,6 +426,12 @@ class WebBotAdapter(BotAdapter):
 
                         elif json_data.get("type") == "ChatMessage":
                             self.handle_chat_message(json_data)
+
+                        elif json_data.get("type") == "RecordingChunkFormat":
+                            self.handle_recording_chunk_format(json_data)
+
+                        elif json_data.get("type") == "RecordingResizeEvents":
+                            self.handle_recording_resize_events(json_data)
 
                         elif json_data.get("type") == "ParticipantSpeechStartStopEvent":
                             self.handle_participant_speech_start_stop_event(json_data)
@@ -407,6 +487,8 @@ class WebBotAdapter(BotAdapter):
                     self.process_encoded_mp4_chunk(message)
                 elif message_type == 5:  # PER_PARTICIPANT_AUDIO
                     self.process_per_participant_audio_frame(message)
+                elif message_type == 6:  # ENCODED_AUDIO_CHUNK
+                    self.process_encoded_audio_chunk(message)
 
                 self.last_websocket_message_processed_time = time.time()
         except Exception as e:
@@ -561,6 +643,11 @@ class WebBotAdapter(BotAdapter):
         options.add_argument("--disable-application-cache")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--disable-blink-features=AutomationControlled")
+        # Prevent renderer process crash in Docker/headless environments (Chrome 114+)
+        # VizDisplayCompositor runs out-of-process and crashes without GPU
+        options.add_argument("--disable-features=VizDisplayCompositor")
+        options.add_argument("--disable-features=site-per-process")
+        options.add_argument("--disable-software-rasterizer")
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
 
         if os.getenv("ENABLE_CHROME_SANDBOX", "false").lower() != "true":
@@ -594,7 +681,23 @@ class WebBotAdapter(BotAdapter):
         self.driver = webdriver.Chrome(options=options, service=Service(executable_path="/usr/local/bin/chromedriver"))
         logger.info(f"web driver server initialized at port {self.driver.service.port}")
 
-        initial_data_code = f"window.initialData = {{websocketPort: {self.websocket_port}, videoFrameWidth: {self.video_frame_size[0]}, videoFrameHeight: {self.video_frame_size[1]}, botName: {json.dumps(self.display_name)}, addClickRipple: {'true' if self.should_create_debug_recording else 'false'}, recordingView: '{self.recording_view}', sendMixedAudio: {'true' if self.add_mixed_audio_chunk_callback else 'false'}, sendPerParticipantAudio: {'true' if self.add_audio_chunk_callback else 'false'}, collectCaptions: {'true' if self.upsert_caption_callback else 'false'}, recordParticipantSpeechStartStopEvents: {'true' if self.record_participant_speech_start_stop_events else 'false'}}}"
+        initial_data_code = (
+            "window.initialData = {"
+            f"websocketPort: {self.websocket_port}, "
+            f"videoFrameWidth: {self.video_frame_size[0]}, "
+            f"videoFrameHeight: {self.video_frame_size[1]}, "
+            f"botName: {json.dumps(self.display_name)}, "
+            f"addClickRipple: {'true' if self.should_create_debug_recording else 'false'}, "
+            f"recordingView: '{self.recording_view}', "
+            f"sendMixedAudio: {'true' if self.add_mixed_audio_chunk_callback else 'false'}, "
+            f"sendPerParticipantAudio: {'true' if self.add_audio_chunk_callback else 'false'}, "
+            f"sendEncodedVideoChunks: {'true' if self.add_encoded_mp4_chunk_callback else 'false'}, "
+            f"sendEncodedAudioChunks: {'true' if self.add_encoded_audio_chunk_callback else 'false'}, "
+            f"recordingChunkIntervalMs: {self.recording_chunk_interval_ms}, "
+            f"collectCaptions: {'true' if self.upsert_caption_callback else 'false'}, "
+            f"recordParticipantSpeechStartStopEvents: {'true' if self.record_participant_speech_start_stop_events else 'false'}"
+            "}"
+        )
 
         # Define the CDN libraries needed
         CDN_LIBRARIES = ["https://cdnjs.cloudflare.com/ajax/libs/protobufjs/7.4.0/protobuf.min.js", "https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js"]
@@ -637,10 +740,6 @@ class WebBotAdapter(BotAdapter):
             self.display = Display(visible=0, size=(1930, 1090))
             self.display.start()
             self.display_var_for_debug_recording = self.display.new_display_var
-
-        if self.should_create_debug_recording:
-            self.debug_screen_recorder = DebugScreenRecorder(self.display_var_for_debug_recording, self.video_frame_size, BotAdapter.DEBUG_RECORDING_FILE_PATH)
-            self.debug_screen_recorder.start()
 
         # Start websocket server in a separate thread
         websocket_thread = threading.Thread(target=self.run_websocket_server, daemon=True)
@@ -797,8 +896,7 @@ class WebBotAdapter(BotAdapter):
         self.media_sending_enable_timestamp_ms = time.time() * 1000
 
     def stop_debug_screen_recording(self):
-        if self.debug_screen_recorder:
-            self.debug_screen_recorder.stop()
+        return None
 
     def leave(self):
         if self.left_meeting:
@@ -870,9 +968,6 @@ class WebBotAdapter(BotAdapter):
                     logger.warning(f"Error quitting driver: {e}")
         except Exception as e:
             logger.warning(f"Error during cleanup: {e}")
-
-        if self.debug_screen_recorder:
-            self.debug_screen_recorder.stop()
 
         # Properly shutdown the websocket server
         if self.websocket_server:

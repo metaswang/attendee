@@ -1027,7 +1027,8 @@ class WebSocketClient {
       VIDEO: 2,
       AUDIO: 3,
       ENCODED_MP4_CHUNK: 4,
-      PER_PARTICIPANT_AUDIO: 5
+      PER_PARTICIPANT_AUDIO: 5,
+      ENCODED_AUDIO_CHUNK: 6
   };
 
   constructor() {
@@ -1053,6 +1054,22 @@ class WebSocketClient {
       };
 
       this.mediaSendingEnabled = false;
+      this.audioChunkRecorder = null;
+      this.audioChunkFlushInterval = null;
+      this.videoChunkRecorder = null;
+      this.videoChunkFlushInterval = null;
+      this.videoChunkCanvas = null;
+      this.videoChunkCanvasCtx = null;
+      this.videoChunkVideoElement = null;
+      this.videoChunkAnimationFrame = null;
+      this.videoChunkSourceTrackId = null;
+      this.videoChunkSourceTrackClone = null;
+      this.videoChunkResizeEvents = [];
+      this.videoChunkResizeStartTime = null;
+      this.videoChunkResizeLastWidth = null;
+      this.videoChunkResizeLastHeight = null;
+      this.videoChunkLastLoggedTrackInfo = null;
+      this._pendingTrackSwitch = false;
       
       /*
       We no longer need this because we're not using MediaStreamTrackProcessor's
@@ -1121,12 +1138,20 @@ class WebSocketClient {
   async enableMediaSending() {
     this.mediaSendingEnabled = true;
     await window.styleManager.start();
+    if (window.initialData.sendEncodedVideoChunks) {
+      await this.startVideoChunkRecording();
+    }
+    if (window.initialData.sendEncodedAudioChunks) {
+      await this.startAudioChunkRecording();
+    }
 
     // No longer need this because we're not using MediaStreamTrackProcessor's
     //this.startFillerFrameTimer();
   }
 
   async disableMediaSending() {
+    await this.stopVideoChunkRecording();
+    await this.stopAudioChunkRecording();
     window.styleManager.stop();
     // Give the media recorder a bit of time to send the final data
     await new Promise(resolve => setTimeout(resolve, 2000));
@@ -1214,6 +1239,373 @@ class WebSocketClient {
     } catch (error) {
       console.error('Error sending WebSocket video chunk:', error);
     }
+  }
+
+  getPreferredVideoChunkMimeType() {
+    const preferredMimeTypes = [
+      'video/webm;codecs=vp9,opus',
+      'video/webm;codecs=vp8,opus',
+      'video/webm',
+      'video/mp4;codecs=avc1.42E01E,mp4a.40.2',
+      'video/mp4',
+    ];
+    return preferredMimeTypes.find((mime) => window.MediaRecorder && MediaRecorder.isTypeSupported(mime)) || '';
+  }
+
+  getVideoTrackForChunkRecording() {
+    return window.videoTrackManager?.getTrackToSendCached?.()?.originalTrack || null;
+  }
+
+  ensureVideoChunkCanvas() {
+    if (!this.videoChunkCanvas) {
+      this.videoChunkCanvas = document.createElement('canvas');
+      this.videoChunkCanvas.width = window.initialData.videoFrameWidth || 1280;
+      this.videoChunkCanvas.height = window.initialData.videoFrameHeight || 720;
+      this.videoChunkCanvasCtx = this.videoChunkCanvas.getContext('2d');
+    }
+    if (!this.videoChunkVideoElement) {
+      this.videoChunkVideoElement = document.createElement('video');
+      this.videoChunkVideoElement.autoplay = true;
+      this.videoChunkVideoElement.muted = true;
+      this.videoChunkVideoElement.playsInline = true;
+      // Event-driven aspect-ratio detection: fires whenever videoWidth/videoHeight changes,
+      // covering both track-level resolution shifts and initial load of a new track.
+      this.videoChunkVideoElement.addEventListener('resize', () => {
+        const isTrackSwitch = this._pendingTrackSwitch;
+        this._pendingTrackSwitch = false;
+        this.recordVideoChunkResizeEvent(isTrackSwitch);
+      });
+    }
+  }
+
+  stopVideoChunkCanvasLoop() {
+    if (this.videoChunkAnimationFrame) {
+      cancelAnimationFrame(this.videoChunkAnimationFrame);
+      this.videoChunkAnimationFrame = null;
+    }
+  }
+
+  cleanupVideoChunkSourceTrack() {
+    if (this.videoChunkSourceTrackClone) {
+      try {
+        this.videoChunkSourceTrackClone.stop();
+      } catch (error) {
+        console.warn('Video chunk source track cleanup failed', error);
+      }
+      this.videoChunkSourceTrackClone = null;
+    }
+    this.videoChunkSourceTrackId = null;
+    if (this.videoChunkVideoElement) {
+      this.videoChunkVideoElement.srcObject = null;
+    }
+  }
+
+  recordVideoChunkResizeEvent(isTrackSwitch = false) {
+    const video = this.videoChunkVideoElement;
+    // When called from the resize event listener the video is already decoded;
+    // only require non-zero dimensions.
+    if (!video || !video.videoWidth || !video.videoHeight) {
+      return false;
+    }
+
+    const width = video.videoWidth;
+    const height = video.videoHeight;
+    // Skip duplicate dimensions unless a track switch just happened (same resolution,
+    // different source track is still semantically distinct).
+    if (!isTrackSwitch && this.videoChunkResizeLastWidth === width && this.videoChunkResizeLastHeight === height) {
+      return false;
+    }
+
+    const recordingMs = this.videoChunkResizeEvents.length === 0 || !this.videoChunkResizeStartTime
+      ? 0
+      : Math.max(0, Date.now() - this.videoChunkResizeStartTime);
+    this.videoChunkResizeEvents.push({
+      recording_ms: recordingMs,
+      display_width: width,
+      display_height: height,
+      is_track_switch: isTrackSwitch,
+    });
+    this.videoChunkResizeLastWidth = width;
+    this.videoChunkResizeLastHeight = height;
+    console.log(
+      'Video chunk resize event recorded',
+      JSON.stringify({
+        recording_ms: recordingMs,
+        display_width: width,
+        display_height: height,
+        is_track_switch: isTrackSwitch,
+        total_events: this.videoChunkResizeEvents.length,
+        source_track_id: this.videoChunkSourceTrackId,
+      }),
+    );
+    return true;
+  }
+
+  syncVideoChunkSourceTrack() {
+    this.ensureVideoChunkCanvas();
+    const nextTrack = this.getVideoTrackForChunkRecording();
+    if (!nextTrack || nextTrack.readyState !== 'live') {
+      if (this.videoChunkLastLoggedTrackInfo !== 'missing') {
+        console.warn('Video chunk recording has no live source track');
+        this.videoChunkLastLoggedTrackInfo = 'missing';
+      }
+      this.cleanupVideoChunkSourceTrack();
+      return;
+    }
+    if (this.videoChunkSourceTrackId === nextTrack.id) {
+      return;
+    }
+
+    this.cleanupVideoChunkSourceTrack();
+    this.videoChunkSourceTrackClone = nextTrack.clone();
+    this.videoChunkSourceTrackId = nextTrack.id;
+    this.videoChunkLastLoggedTrackInfo = nextTrack.id;
+    // Signal that the next resize event on the video element is caused by a track switch,
+    // not a mid-stream resolution change.  The flag is cleared by the resize handler.
+    this._pendingTrackSwitch = true;
+    const trackSettings = typeof nextTrack.getSettings === 'function' ? nextTrack.getSettings() : null;
+    console.log(
+      'Video chunk recording attached live video track',
+      JSON.stringify({
+        track_id: this.videoChunkSourceTrackId,
+        kind: nextTrack.kind,
+        ready_state: nextTrack.readyState,
+        settings: trackSettings,
+      }),
+    );
+    this.videoChunkVideoElement.srcObject = new MediaStream([this.videoChunkSourceTrackClone]);
+    this.videoChunkVideoElement.play().catch((error) => {
+      console.warn('Video chunk preview play failed', error);
+    });
+  }
+
+  drawVideoChunkFrame = () => {
+    if (!this.mediaSendingEnabled) {
+      this.stopVideoChunkCanvasLoop();
+      return;
+    }
+
+    this.syncVideoChunkSourceTrack();
+    const ctx = this.videoChunkCanvasCtx;
+    const canvas = this.videoChunkCanvas;
+    const video = this.videoChunkVideoElement;
+    if (!ctx || !canvas) {
+      return;
+    }
+
+    if (video && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth && video.videoHeight) {
+      if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+      }
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    } else {
+      ctx.fillStyle = 'black';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+    }
+
+    this.videoChunkAnimationFrame = requestAnimationFrame(this.drawVideoChunkFrame);
+  };
+
+  async startVideoChunkRecording() {
+    if (this.videoChunkRecorder && this.videoChunkRecorder.state !== 'inactive') {
+      return;
+    }
+    if (!window.MediaRecorder) {
+      console.warn('MediaRecorder is not available for video chunk recording');
+      return;
+    }
+
+    this.ensureVideoChunkCanvas();
+    this.syncVideoChunkSourceTrack();
+    if (!this.videoChunkSourceTrackClone) {
+      console.warn('No meeting video track available for video chunk recording yet; starting canvas recorder with black frames');
+    }
+    this.videoChunkResizeStartTime = Date.now();
+    this.videoChunkResizeEvents = [];
+    this.videoChunkResizeLastWidth = null;
+    this.videoChunkResizeLastHeight = null;
+    this.recordVideoChunkResizeEvent();
+    console.log(
+      'Starting video chunk recording',
+      JSON.stringify({
+        track_id: this.videoChunkSourceTrackId,
+        initial_canvas: {
+          width: this.videoChunkCanvas?.width || null,
+          height: this.videoChunkCanvas?.height || null,
+        },
+        initial_video: {
+          width: this.videoChunkVideoElement?.videoWidth || null,
+          height: this.videoChunkVideoElement?.videoHeight || null,
+          ready_state: this.videoChunkVideoElement?.readyState ?? null,
+        },
+      }),
+    );
+
+    const recorderStream = this.videoChunkCanvas.captureStream(30);
+    const meetingAudioStream = window.styleManager?.getMeetingAudioStream?.();
+    const audioTrack = meetingAudioStream?.getAudioTracks?.()[0];
+    if (audioTrack) {
+      recorderStream.addTrack(audioTrack.clone());
+    }
+
+    const selectedMimeType = this.getPreferredVideoChunkMimeType();
+    console.log('Starting video chunk recording with mime type', selectedMimeType || 'browser-default');
+    this.videoChunkRecorder = selectedMimeType
+      ? new MediaRecorder(recorderStream, { mimeType: selectedMimeType })
+      : new MediaRecorder(recorderStream);
+    this.videoChunkRecorder.ondataavailable = (event) => {
+      if (event.data && event.data.size > 0) {
+        console.log('Video chunk recorder produced chunk', event.data.type || selectedMimeType || 'unknown', event.data.size);
+        this.sendEncodedMP4Chunk(event.data);
+      }
+    };
+    this.stopVideoChunkCanvasLoop();
+    this.videoChunkAnimationFrame = requestAnimationFrame(this.drawVideoChunkFrame);
+    this.videoChunkRecorder.start();
+    this.videoChunkFlushInterval = setInterval(() => {
+      try {
+        if (this.videoChunkRecorder?.state === 'recording') {
+          this.videoChunkRecorder.requestData();
+        }
+      } catch (error) {
+        console.warn('Video chunk recorder requestData failed', error);
+      }
+    }, window.initialData.recordingChunkIntervalMs || 5000);
+  }
+
+  async stopVideoChunkRecording() {
+    if (this.videoChunkFlushInterval) {
+      clearInterval(this.videoChunkFlushInterval);
+      this.videoChunkFlushInterval = null;
+    }
+    if (!this.videoChunkRecorder || this.videoChunkRecorder.state === 'inactive') {
+      this.stopVideoChunkCanvasLoop();
+      this.cleanupVideoChunkSourceTrack();
+      this.videoChunkResizeEvents = [];
+      this.videoChunkResizeStartTime = null;
+      this.videoChunkResizeLastWidth = null;
+      this.videoChunkResizeLastHeight = null;
+      return;
+    }
+
+    await new Promise((resolve) => {
+      const recorder = this.videoChunkRecorder;
+      recorder.addEventListener('stop', () => resolve(), { once: true });
+      try {
+        recorder.requestData();
+      } catch (error) {
+        console.warn('Final video chunk requestData failed', error);
+      }
+      recorder.stop();
+    });
+    this.videoChunkRecorder = null;
+    this.stopVideoChunkCanvasLoop();
+    const resizeEvents = this.videoChunkResizeEvents.slice();
+    console.log(
+      'Stopping video chunk recording',
+      JSON.stringify({
+        resize_event_count: resizeEvents.length,
+        first_event: resizeEvents[0] || null,
+        last_event: resizeEvents[resizeEvents.length - 1] || null,
+        source_track_id: this.videoChunkSourceTrackId,
+      }),
+    );
+    if (resizeEvents.length > 1) {
+      this.sendJson({
+        type: 'RecordingResizeEvents',
+        resize_events: resizeEvents,
+      });
+    } else {
+      console.warn(
+        'Video chunk recording completed without enough resize events to send',
+        JSON.stringify({
+          resize_event_count: resizeEvents.length,
+          source_track_id: this.videoChunkSourceTrackId,
+        }),
+      );
+    }
+    this.cleanupVideoChunkSourceTrack();
+    this.videoChunkResizeEvents = [];
+    this.videoChunkResizeStartTime = null;
+    this.videoChunkResizeLastWidth = null;
+    this.videoChunkResizeLastHeight = null;
+    this.videoChunkLastLoggedTrackInfo = null;
+    this._pendingTrackSwitch = false;
+  }
+
+  sendEncodedAudioChunk(encodedAudioData) {
+    if (this.ws.readyState !== WebSocket.OPEN || !this.mediaSendingEnabled) {
+      return;
+    }
+
+    try {
+      const headerBuffer = new ArrayBuffer(4);
+      const headerView = new DataView(headerBuffer);
+      headerView.setInt32(0, WebSocketClient.MESSAGE_TYPES.ENCODED_AUDIO_CHUNK, true);
+      this.ws.send(new Blob([headerBuffer, encodedAudioData]));
+    } catch (error) {
+      console.error('Error sending WebSocket audio chunk:', error);
+    }
+  }
+
+  async startAudioChunkRecording() {
+    if (this.audioChunkRecorder && this.audioChunkRecorder.state !== 'inactive') {
+      return;
+    }
+    const audioStream = window.styleManager?.getMeetingAudioStream?.();
+    if (!audioStream || audioStream.getAudioTracks().length === 0) {
+      console.warn('No meeting audio stream available for audio chunk recording');
+      return;
+    }
+
+    const preferredMimeTypes = ['audio/webm;codecs=opus', 'audio/webm'];
+    const selectedMimeType = preferredMimeTypes.find((mime) => window.MediaRecorder && MediaRecorder.isTypeSupported(mime));
+    this.audioChunkRecorder = selectedMimeType ? new MediaRecorder(audioStream, { mimeType: selectedMimeType }) : new MediaRecorder(audioStream);
+    const audioChunkMimeType = this.audioChunkRecorder.mimeType || selectedMimeType || 'audio/webm';
+    window.ws.sendJson({
+      type: 'RecordingChunkFormat',
+      kind: 'audio',
+      mimeType: audioChunkMimeType,
+      extension: audioChunkMimeType.includes('mp4') ? 'm4a' : 'webm',
+    });
+    this.audioChunkRecorder.ondataavailable = (event) => {
+      if (event.data && event.data.size > 0) {
+        this.sendEncodedAudioChunk(event.data);
+      }
+    };
+    this.audioChunkRecorder.start();
+    this.audioChunkFlushInterval = setInterval(() => {
+      try {
+        if (this.audioChunkRecorder?.state === 'recording') {
+          this.audioChunkRecorder.requestData();
+        }
+      } catch (error) {
+        console.warn('Audio chunk recorder requestData failed', error);
+      }
+    }, window.initialData.recordingChunkIntervalMs || 5000);
+  }
+
+  async stopAudioChunkRecording() {
+    if (this.audioChunkFlushInterval) {
+      clearInterval(this.audioChunkFlushInterval);
+      this.audioChunkFlushInterval = null;
+    }
+    if (!this.audioChunkRecorder || this.audioChunkRecorder.state === 'inactive') {
+      return;
+    }
+
+    await new Promise((resolve) => {
+      const recorder = this.audioChunkRecorder;
+      recorder.addEventListener('stop', () => resolve(), { once: true });
+      try {
+        recorder.requestData();
+      } catch (error) {
+        console.warn('Final audio chunk requestData failed', error);
+      }
+      recorder.stop();
+    });
+    this.audioChunkRecorder = null;
   }
 
   sendPerParticipantAudio(participantId, audioData) {
@@ -1978,6 +2370,17 @@ new RTCInterceptor({
             }
             if (event.track.kind === 'video') {
                 window.styleManager.addVideoTrack(event);
+                // Register in videoTrackManager for canvas-based muxed chunk recording
+                const firstStreamId = event.streams[0]?.id;
+                if (firstStreamId) {
+                    const isScreenShare = userManager
+                        .getCurrentUsersInMeetingWhoAreScreenSharing()
+                        .some(user => userManager.getDeviceOutput(user.deviceId, DEVICE_OUTPUT_TYPE.VIDEO).streamId === firstStreamId);
+                    videoTrackManager.upsertVideoTrack(event.track, firstStreamId, isScreenShare);
+                    event.track.addEventListener('ended', () => {
+                        videoTrackManager.deleteVideoTrack(event.track);
+                    });
+                }
             }
         });
 
