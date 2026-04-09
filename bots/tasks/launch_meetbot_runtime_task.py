@@ -37,7 +37,7 @@ def launch_meetbot_runtime(self, bot_id: int):
             existing_lease = getattr(bot, "runtime_lease", None)
             if existing_lease and existing_lease.status in {BotRuntimeLeaseStatuses.PROVISIONING, BotRuntimeLeaseStatuses.ACTIVE}:
                 logger.info("Bot %s (%s) already has active/provisioning lease %s", bot_id, bot.object_id, existing_lease.id)
-                return existing_lease.id.id
+                return existing_lease.id
 
             acquired_lock = acquire_lease_lock(bot.id)
             if not acquired_lock:
