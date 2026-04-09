@@ -63,6 +63,8 @@ def fetch_bot_pod_spec(bot_pod_spec_type: str) -> str:
 
 class BotPodCreator:
     def __init__(self):
+        if client is None or config is None:
+            raise RuntimeError("kubernetes package is not installed")
         try:
             config.load_incluster_config()
         except config.ConfigException:

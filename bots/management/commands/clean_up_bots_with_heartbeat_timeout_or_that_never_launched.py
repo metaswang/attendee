@@ -6,7 +6,6 @@ from django.conf import settings
 from django.core.management.base import BaseCommand
 from django.db import models
 from django.utils import timezone
-from kubernetes import client, config
 
 from bots.models import Bot, BotEventManager, BotEventSubTypes, BotEventTypes
 from bots.runtime_providers import get_runtime_provider
@@ -33,13 +32,20 @@ class Command(BaseCommand):
 
         # There isn't really a safe way to terminate the bot if it's running as a celery task
         if os.getenv("LAUNCH_BOT_METHOD") == "kubernetes":
-            self._terminate_kubernetes_pod(bot)
+            try:
+                self._terminate_kubernetes_pod(bot)
+            except RuntimeError as e:
+                logger.warning("Skip kubernetes bot termination for bot %s: %s", bot.id, e)
         elif getattr(bot, "runtime_lease", None) is not None:
             self._terminate_runtime_lease(bot)
         elif os.getenv("LAUNCH_BOT_METHOD") == "docker-compose-multi-host":
             self._terminate_ephemeral_docker_container(bot)
 
     def _terminate_kubernetes_pod(self, bot):
+        try:
+            from kubernetes import client, config
+        except ImportError as exc:
+            raise RuntimeError("kubernetes package is not installed") from exc
         # Initialize kubernetes client
         try:
             config.load_incluster_config()
@@ -119,7 +125,7 @@ class Command(BaseCommand):
 
             logger.info("Finished terminating bots with heartbeat timeout")
 
-        except client.ApiException as e:
+        except Exception as e:
             logger.error(f"Failed to terminate bots with heartbeat timeout: {str(e)}")
 
     def terminate_bots_that_never_launched(self):
