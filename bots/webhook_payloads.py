@@ -1,7 +1,6 @@
-from bots.serializers import CalendarSerializer, ChatMessageSerializer, ParticipantEventSerializer, ZoomOAuthConnectionSerializer
-
-
 def chat_message_webhook_payload(chat_message):
+    from bots.serializers import ChatMessageSerializer
+
     return ChatMessageSerializer(chat_message).data
 
 
@@ -18,10 +17,14 @@ def utterance_webhook_payload(utterance):
 
 
 def participant_event_webhook_payload(participant_event):
+    from bots.serializers import ParticipantEventSerializer
+
     return ParticipantEventSerializer(participant_event).data
 
 
 def calendar_webhook_payload(calendar):
+    from bots.serializers import CalendarSerializer
+
     serialized_calendar = CalendarSerializer(calendar).data
     return {
         "state": serialized_calendar["state"],
@@ -32,6 +35,8 @@ def calendar_webhook_payload(calendar):
 
 
 def zoom_oauth_connection_webhook_payload(zoom_oauth_connection):
+    from bots.serializers import ZoomOAuthConnectionSerializer
+
     serialized_zoom_oauth_connection = ZoomOAuthConnectionSerializer(zoom_oauth_connection).data
     return {
         "state": serialized_zoom_oauth_connection["state"],

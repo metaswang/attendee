@@ -188,11 +188,23 @@ STATIC_URL = "static/"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # Redis/Celery Configuration
+def _normalize_redis_ssl_requirements(value: str | None) -> str | None:
+    if not value:
+        return None
+    normalized = value.strip().lower()
+    alias_map = {
+        "cert_none": "none",
+        "cert_optional": "optional",
+        "cert_required": "required",
+    }
+    return alias_map.get(normalized, normalized)
+
+
 redis_params = {}
 if os.getenv("DISABLE_REDIS_SSL"):  # backward compatibility
     redis_params["ssl_cert_reqs"] = "none"
 elif os.getenv("REDIS_SSL_REQUIREMENTS"):
-    redis_params["ssl_cert_reqs"] = os.getenv("REDIS_SSL_REQUIREMENTS")
+    redis_params["ssl_cert_reqs"] = _normalize_redis_ssl_requirements(os.getenv("REDIS_SSL_REQUIREMENTS"))
 redis_params_query_string = "&".join([f"{key}={value}" for key, value in redis_params.items()])
 
 raw_redis_url = os.getenv("REDIS__URL") or os.getenv("REDIS_URL")

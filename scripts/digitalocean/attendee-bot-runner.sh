@@ -199,7 +199,7 @@ if [[ -n "${LEASE_CALLBACK_URL:-}" && -n "${LEASE_SHUTDOWN_TOKEN:-}" ]]; then
     "bootstrap_fetched_at": __import__("os").environ.get("BOT_RUNTIME_BOOTSTRAP_FETCHED_AT"),
     "run_bot_entered_at": __import__("os").environ.get("BOT_RUNTIME_RUN_BOT_ENTERED_AT"),
     "first_heartbeat_at": __import__("os").environ.get("BOT_RUNTIME_FIRST_HEARTBEAT_AT"),
-  }.items() if v}); print(json.dumps(payload, separators=(\",\", \":\")))')"
+  }.items() if v}); print(json.dumps(payload, separators=(",", ":")))')"
   curl -fsS \
     -X POST \
     -H "Authorization: Bearer ${LEASE_SHUTDOWN_TOKEN}" \

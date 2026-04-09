@@ -11,11 +11,22 @@ logger = logging.getLogger(__name__)
 import jsonschema
 from dateutil.relativedelta import relativedelta
 from django.utils import timezone
-from drf_spectacular.utils import (
-    OpenApiExample,
-    extend_schema_field,
-    extend_schema_serializer,
-)
+try:
+    from drf_spectacular.utils import (
+        OpenApiExample,
+        extend_schema_field,
+        extend_schema_serializer,
+    )
+except ImportError:  # bot runtime environment does not ship drf-spectacular
+    def extend_schema_field(*_a, **_kw):  # type: ignore[misc]
+        return lambda fn: fn
+
+    def extend_schema_serializer(*_a, **_kw):  # type: ignore[misc]
+        return lambda cls: cls
+
+    class OpenApiExample:  # type: ignore[no-redef]
+        def __init__(self, *_a, **_kw):
+            pass
 from rest_framework import serializers
 
 from .automatic_leave_configuration import AutomaticLeaveConfiguration
