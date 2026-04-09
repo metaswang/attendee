@@ -29,6 +29,11 @@ RUN apt-get update \
     gstreamer1.0-tools \
     libasound2 \
     libasound2-plugins \
+    libavcodec-dev \
+    libavdevice-dev \
+    libavfilter-dev \
+    libavformat-dev \
+    libavutil-dev \
     libcairo2-dev \
     libdbus-1-3 \
     libgbm1 \
@@ -42,6 +47,8 @@ RUN apt-get update \
     libopencv-dev \
     libpq-dev \
     libssl-dev \
+    libswresample-dev \
+    libswscale-dev \
     libvulkan1 \
     libx11-dev \
     libx11-xcb1 \
