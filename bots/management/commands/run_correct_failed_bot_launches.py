@@ -7,7 +7,6 @@ from django.conf import settings
 from django.core.management.base import BaseCommand
 from django.db import connection, models
 from django.utils import timezone
-from kubernetes import client, config
 
 from bots.launch_methods import uses_hybrid_runtime_scheduler
 from bots.launch_bot_utils import launch_bot
@@ -41,6 +40,11 @@ class Command(BaseCommand):
     def handle(self, *args, **opts):
         self.launch_method = os.getenv("LAUNCH_BOT_METHOD")
         if self.launch_method == "kubernetes":
+            try:
+                from kubernetes import client, config
+            except ImportError as exc:
+                raise RuntimeError("kubernetes package is not installed") from exc
+            self._k8s_client = client
             try:
                 config.load_incluster_config()
             except config.ConfigException:
@@ -95,7 +99,7 @@ class Command(BaseCommand):
             self.v1.delete_namespaced_pod(name=pod_name, namespace=self.namespace, grace_period_seconds=5)
             logger.info(f"Deleted pod so that it can be re-launched: {pod_name}")
             return False
-        except client.ApiException as e:
+        except self._k8s_client.ApiException as e:
             if e.status == 404:
                 return False
             raise

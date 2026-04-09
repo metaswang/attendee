@@ -3,7 +3,6 @@ from typing import List
 
 from django.conf import settings
 from django.core.management.base import BaseCommand
-from kubernetes import client, config
 
 logger = logging.getLogger(__name__)
 
@@ -13,6 +12,11 @@ class Command(BaseCommand):
 
     def __init__(self):
         super().__init__()
+        try:
+            from kubernetes import client, config
+        except ImportError as exc:
+            raise RuntimeError("kubernetes package is not installed") from exc
+        self._k8s_client = client
         # Initialize kubernetes client
         try:
             config.load_incluster_config()
@@ -41,10 +45,10 @@ class Command(BaseCommand):
                 try:
                     self.v1.delete_namespaced_pod(name=pod_name, namespace=namespace, grace_period_seconds=60)
                     logger.info(f"Deleted pod: {pod_name}")
-                except client.ApiException as e:
+                except self._k8s_client.ApiException as e:
                     logger.warning(f"Error deleting pod {pod_name}: {str(e)}")
 
             logger.info(f"Bot pod cleanup completed. Deleted {len(completed_pods)} pods")
 
-        except client.ApiException as e:
+        except self._k8s_client.ApiException as e:
             logger.info(f"Failed to cleanup bot pods: {str(e)}")

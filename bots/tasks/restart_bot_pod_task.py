@@ -2,7 +2,6 @@ import logging
 import time
 
 from celery import shared_task
-from kubernetes import client, config
 
 from bots.models import Bot, BotEventTypes
 
@@ -27,6 +26,11 @@ def restart_bot_pod(self, bot_id):
     if last_bot_event.event_type != BotEventTypes.JOIN_REQUESTED:
         logger.info(f"Bot {bot_id} is not in JOINING state, so not restarting pod")
         return
+
+    try:
+        from kubernetes import client, config
+    except ImportError as exc:
+        raise RuntimeError("kubernetes package is not installed") from exc
 
     # Initialize kubernetes client
     try:
