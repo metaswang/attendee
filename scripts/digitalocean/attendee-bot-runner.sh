@@ -131,6 +131,12 @@ set +e
 docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 CONTAINER_START_AT="$(timestamp)"
 CONTAINER_START_AT_MS="$(epoch_ms)"
+
+REPO_VOLUME_ARGS=()
+if [[ -d "$ATTENDEE_REPO_DIR" ]] && [[ -n "$(ls -A "$ATTENDEE_REPO_DIR" 2>/dev/null)" ]]; then
+  REPO_VOLUME_ARGS=("-v" "$ATTENDEE_REPO_DIR:$ATTENDEE_CONTAINER_WORKDIR")
+fi
+
 docker run \
   --rm \
   --name "$CONTAINER_NAME" \
@@ -140,7 +146,7 @@ docker run \
   --memory="$BOT_MEMORY_LIMIT" \
   --memory-reservation="$BOT_MEMORY_RESERVATION" \
   --shm-size="$BOT_SHM_SIZE" \
-  -v "$ATTENDEE_REPO_DIR:$ATTENDEE_CONTAINER_WORKDIR" \
+  "${REPO_VOLUME_ARGS[@]}" \
   -v "$CONTAINER_ENV_PATH:/run/attendee/runtime.env:ro" \
   "$BOT_RUNTIME_IMAGE" \
     bash -lc "set -euo pipefail; set -a; source /run/attendee/runtime.env; set +a; cd \"$ATTENDEE_CONTAINER_WORKDIR\"; export DJANGO_SETTINGS_MODULE=\"\${DJANGO_SETTINGS_MODULE:-attendee.settings.bot_runtime}\"; exec python manage.py run_bot --skip-checks \${LEASE_ID:+--lease-id \"\$LEASE_ID\"} \${BOT_ID:+--botid \"\$BOT_ID\"}" \

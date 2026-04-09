@@ -218,6 +218,7 @@ class GCPComputeInstanceProvider:
             return self._bootstrap_startup_script(host_name, lease, zone=zone, region=region)
 
         runtime_agent_script_contents = (Path(__file__).resolve().parents[2] / "scripts/runtime_agent.py").read_text()
+        runner_script_contents = (Path(__file__).resolve().parents[2] / "scripts/digitalocean/attendee-bot-runner.sh").read_text()
         return "\n".join(
             [
                 "#!/bin/bash",
@@ -231,6 +232,10 @@ class GCPComputeInstanceProvider:
                 runtime_agent_script_contents,
                 "EOF_AGENT",
                 "chmod 0755 /usr/local/bin/attendee-runtime-agent",
+                "cat >/usr/local/bin/attendee-bot-runner <<'EOF_RUNNER'",
+                runner_script_contents,
+                "EOF_RUNNER",
+                "chmod 0755 /usr/local/bin/attendee-bot-runner",
                 "systemctl daemon-reload",
                 "systemctl enable --now attendee-runtime-agent.service",
                 "systemctl restart attendee-runtime-agent.service",
