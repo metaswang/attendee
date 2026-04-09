@@ -16,7 +16,7 @@ PYTHON_BIN="${PYTHON_BIN:-python3.11}"
 export DEBIAN_FRONTEND=noninteractive
 
 apt-get update
-apt-get install -y ca-certificates cloud-init curl git jq
+apt-get install -y ca-certificates cloud-init curl git jq redis-tools
 
 if ! command -v docker >/dev/null 2>&1; then
   curl -fsSL https://get.docker.com | sh
@@ -54,10 +54,13 @@ command -v "$PYTHON_BIN" >/dev/null 2>&1 || {
 
 install -D -m 0755 "$RUNNER_SCRIPT_SOURCE" /usr/local/bin/attendee-bot-runner
 install -D -m 0644 "$RUNNER_SERVICE_SOURCE" /etc/systemd/system/attendee-bot-runner.service
+install -D -m 0755 scripts/runtime_agent.py /usr/local/bin/attendee-runtime-agent
+install -D -m 0644 scripts/digitalocean/attendee-runtime-agent.service /etc/systemd/system/attendee-runtime-agent.service
 mkdir -p /etc/attendee /var/log/attendee
 
 systemctl daemon-reload
 systemctl disable attendee-bot-runner.service >/dev/null 2>&1 || true
+systemctl enable attendee-runtime-agent.service >/dev/null 2>&1 || true
 
 cloud-init clean --logs
 truncate -s 0 /etc/machine-id || true

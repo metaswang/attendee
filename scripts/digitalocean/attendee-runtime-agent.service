@@ -1,0 +1,14 @@
+[Unit]
+Description=Attendee runtime agent
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/attendee/runtime-agent.env
+ExecStart=/usr/local/bin/attendee-runtime-agent
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

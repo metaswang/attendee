@@ -11,6 +11,7 @@ from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
 from django.urls import reverse
 
+from .launch_methods import current_launch_method, uses_hybrid_runtime_scheduler
 from .meeting_url_utils import meeting_type_from_url
 from .models import (
     Bot,
@@ -28,8 +29,6 @@ from .models import (
     Project,
     Recording,
     RecordingFormats,
-    RuntimeCapacityProviders,
-    RuntimeCapacitySnapshot,
     TranscriptionProviders,
     TranscriptionSettings,
     TranscriptionTypes,
@@ -58,29 +57,18 @@ def _default_gcp_region() -> str | None:
 
 
 def validate_runtime_settings_for_create_bot(runtime_settings: dict | None) -> dict | None:
-    if os.getenv("LAUNCH_BOT_METHOD") != "gcp-compute-engine":
+    if not uses_hybrid_runtime_scheduler():
         return runtime_settings
 
     runtime_settings = runtime_settings or {}
     region = (runtime_settings.get("region") or _default_gcp_region() or "").strip()
-    if not region:
-        raise ValidationError("runtime_settings.region is required when LAUNCH_BOT_METHOD=gcp-compute-engine")
-
     supported_regions = _supported_gcp_regions()
-    if supported_regions and region not in supported_regions:
+    if region and supported_regions and region not in supported_regions:
         raise ValidationError(f"Unsupported runtime region: {region}. Allowed regions are: {', '.join(supported_regions)}")
 
-    snapshot = RuntimeCapacitySnapshot.objects.filter(provider=RuntimeCapacityProviders.GCP_COMPUTE_INSTANCE, region=region).first()
-    if snapshot and snapshot.effective_available <= 0:
-        raise ValidationError(f"Runtime capacity for region {region} is exhausted. Please choose a different region.")
-
-    runtime_settings["region"] = region
-    logger.info(
-        "Validated runtime settings for GCP bot create region=%s snapshot_found=%s effective_available=%s",
-        region,
-        snapshot is not None,
-        snapshot.effective_available if snapshot else None,
-    )
+    if region:
+        runtime_settings["region"] = region
+        logger.info("Validated runtime settings for runtime-backed bot create region=%s", region)
     return runtime_settings
 
 
@@ -91,8 +79,14 @@ def build_site_url(path=""):
     If EXTERNAL_WEBHOOK_SITE_DOMAIN is set, it takes priority (useful for webhooks that need
     to be accessible from external services like Microsoft/Google).
     """
-    # Use EXTERNAL_WEBHOOK_SITE_DOMAIN if set (for external webhooks), otherwise use SITE_DOMAIN
-    site_domain = os.getenv("EXTERNAL_WEBHOOK_SITE_DOMAIN") or settings.SITE_DOMAIN
+    # Prefer an explicit base URL when provided, otherwise fall back to the domain host.
+    site_domain = (
+        os.getenv("SITE_BASE_URL")
+        or os.getenv("EXTERNAL_WEBHOOK_SITE_DOMAIN")
+        or settings.SITE_DOMAIN
+    )
+    if site_domain.startswith(("http://", "https://")):
+        return f"{site_domain.rstrip('/')}{path}"
     protocol = "http" if site_domain.startswith("localhost") else "https"
     return f"{protocol}://{site_domain}{path}"
 
@@ -218,7 +212,7 @@ def validate_external_media_storage_settings(external_media_storage_settings, pr
 
 
 def normalize_r2_chunk_recording_settings_for_gcp(bot: Bot, recording_settings: dict | None) -> dict | None:
-    if os.getenv("LAUNCH_BOT_METHOD") != "gcp-compute-engine":
+    if not uses_hybrid_runtime_scheduler():
         return recording_settings
 
     meeting_type = meeting_type_from_url(bot.meeting_url)
@@ -338,7 +332,7 @@ def create_bot(data: dict, source: BotCreationSource, project: Project) -> tuple
                 source,
                 meeting_url,
                 (runtime_settings or {}).get("region"),
-                os.getenv("LAUNCH_BOT_METHOD", "celery"),
+                current_launch_method(),
             )
             bot = Bot.objects.create(
                 project=project,

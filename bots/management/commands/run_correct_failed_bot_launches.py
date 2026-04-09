@@ -9,6 +9,7 @@ from django.db import connection, models
 from django.utils import timezone
 from kubernetes import client, config
 
+from bots.launch_methods import uses_hybrid_runtime_scheduler
 from bots.launch_bot_utils import launch_bot
 from bots.models import Bot, BotEventTypes, BotStates
 from bots.runtime_providers import get_runtime_provider
@@ -102,7 +103,7 @@ class Command(BaseCommand):
     def runtime_is_active(self, bot: Bot) -> bool:
         if self.launch_method == "kubernetes":
             return self.bot_pod_is_active(bot.k8s_pod_name())
-        if self.launch_method in {"digitalocean-droplet", "gcp-compute-engine"}:
+        if uses_hybrid_runtime_scheduler():
             lease = getattr(bot, "runtime_lease", None)
             if lease is None:
                 return False

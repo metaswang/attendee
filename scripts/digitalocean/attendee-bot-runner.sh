@@ -13,6 +13,10 @@ RUNNER_LOG_PATH="${RUNNER_LOG_PATH:-${RUNNER_LOG_DIR}/runner.log}"
 CONTAINER_LOG_PATH="${CONTAINER_LOG_PATH:-${RUNNER_LOG_DIR}/container.log}"
 RUNNER_STATE_PATH="${RUNNER_STATE_PATH:-${RUNNER_LOG_DIR}/state.log}"
 LOG_TAIL_LINES="${LOG_TAIL_LINES:-120}"
+BOT_MEMORY_LIMIT="${BOT_MEMORY_LIMIT:-${MEETBOT_BOT_MEMORY_LIMIT:-512m}}"
+BOT_MEMORY_RESERVATION="${BOT_MEMORY_RESERVATION:-${MEETBOT_BOT_MEMORY_RESERVATION:-512m}}"
+BOT_SHM_SIZE="${BOT_SHM_SIZE:-${MEETBOT_BOT_SHM_SIZE:-1g}}"
+BOT_RUNTIME_SOURCE_ARCHIVE_URL="${BOT_RUNTIME_SOURCE_ARCHIVE_URL:-}"
 
 if [[ -f "$RUNTIME_ENV_PATH" ]]; then
   set -a
@@ -34,6 +38,58 @@ PY
 
 json_escape() {
   python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'
+}
+
+sync_attendee_source_archive() {
+  local repo_dir
+  local source_archive_url
+  local temp_dir
+  repo_dir="${ATTENDEE_REPO_DIR:-/opt/attendee}"
+  source_archive_url="${BOT_RUNTIME_SOURCE_ARCHIVE_URL:-}"
+  if [[ -z "$source_archive_url" ]]; then
+    return 0
+  fi
+  if [[ -z "${LEASE_SHUTDOWN_TOKEN:-}" ]]; then
+    log_runner "Skipping source archive sync because LEASE_SHUTDOWN_TOKEN is missing"
+    return 1
+  fi
+  temp_dir="$(mktemp -d)"
+  log_runner "Syncing source archive into $repo_dir from $source_archive_url"
+  if ! curl -fsSL --retry 3 --connect-timeout 10 --max-time 180 -H "Authorization: Bearer ${LEASE_SHUTDOWN_TOKEN}" "$source_archive_url" | tar -xzf - -C "$temp_dir"; then
+    rm -rf "$temp_dir"
+    log_runner "Source archive sync failed"
+    return 1
+  fi
+  rm -rf "$repo_dir"
+  mkdir -p "$repo_dir"
+  cp -a "$temp_dir/." "$repo_dir/"
+  rm -rf "$temp_dir"
+  log_runner "Source archive sync complete"
+  return 0
+}
+
+sync_attendee_repo() {
+  local git_bin
+  local repo_dir
+  local repo_url
+  local git_ref
+  git_bin="$(command -v git 2>/dev/null || true)"
+  repo_dir="${ATTENDEE_REPO_DIR:-/opt/attendee}"
+  repo_url="${ATTENDEE_REPO_URL:-}"
+  git_ref="${ATTENDEE_GIT_REF:-main}"
+  if [[ -z "$git_bin" || -z "$repo_url" ]]; then
+    return 0
+  fi
+  if [[ -d "$repo_dir/.git" ]]; then
+    timeout 120 "$git_bin" -C "$repo_dir" fetch --all --tags
+    if "$git_bin" -C "$repo_dir" show-ref --verify --quiet "refs/remotes/origin/${git_ref}"; then
+      timeout 120 "$git_bin" -C "$repo_dir" checkout -B "$git_ref" "origin/${git_ref}"
+    fi
+  else
+    rm -rf "$repo_dir"
+    timeout 120 "$git_bin" clone --depth 1 --branch "$git_ref" "$repo_url" "$repo_dir"
+  fi
+  return 0
 }
 
 mkdir -p "$RUNNER_LOG_DIR"
@@ -64,6 +120,10 @@ cp "$RUNTIME_ENV_PATH" "$CONTAINER_ENV_PATH"
 chmod 0644 "$CONTAINER_ENV_PATH"
 printf '%s runner_started_at=%s runner_started_at_ms=%s\n' "$(timestamp)" "$RUNNER_STARTED_AT" "$RUNNER_STARTED_AT_MS" >> "$RUNNER_STATE_PATH"
 
+if ! sync_attendee_source_archive; then
+  sync_attendee_repo || true
+fi
+
 set +e
 docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 CONTAINER_START_AT="$(timestamp)"
@@ -74,7 +134,9 @@ docker run \
   --network host \
   --user root \
   --security-opt seccomp=unconfined \
-  --shm-size=1g \
+  --memory="$BOT_MEMORY_LIMIT" \
+  --memory-reservation="$BOT_MEMORY_RESERVATION" \
+  --shm-size="$BOT_SHM_SIZE" \
   -v "$ATTENDEE_REPO_DIR:$ATTENDEE_CONTAINER_WORKDIR" \
   -v "$CONTAINER_ENV_PATH:/run/attendee/runtime.env:ro" \
   "$BOT_RUNTIME_IMAGE" \

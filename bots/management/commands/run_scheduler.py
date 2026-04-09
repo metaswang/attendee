@@ -17,6 +17,8 @@ from django.utils import timezone
 from accounts.models import Organization
 from bots.models import Bot, BotRuntimeLease, BotRuntimeLeaseStatuses, BotStates, Calendar, CalendarStates, ZoomOAuthConnection, ZoomOAuthConnectionStates
 from bots.runtime_providers import get_runtime_provider
+from bots.runtime_scheduler import idle_gcp_hosts, persist_targets_snapshot, pop_due_pending_bots
+from bots.tasks.launch_meetbot_runtime_task import launch_meetbot_runtime
 from bots.tasks.autopay_charge_task import enqueue_autopay_charge_task
 from bots.tasks.launch_scheduled_bot_task import launch_scheduled_bot
 from bots.tasks.refresh_zoom_oauth_connection_task import enqueue_refresh_zoom_oauth_connection_task
@@ -83,8 +85,10 @@ class Command(BaseCommand):
             began = time.monotonic()
             try:
                 self._log_celery_queue_sizes()
+                self._run_pending_meetbot_launches()
                 self._run_scheduled_bots()
                 self._reconcile_bot_runtime_leases()
+                self._reconcile_idle_gcp_hosts()
                 self._sync_runtime_capacity_if_enabled()
                 self._run_periodic_calendar_syncs()
                 self._run_periodic_zoom_oauth_connection_syncs()
@@ -114,12 +118,23 @@ class Command(BaseCommand):
         log.info("Scheduler daemon exited")
 
     def _sync_runtime_capacity_if_enabled(self):
-        if os.getenv("LAUNCH_BOT_METHOD") != "gcp-compute-engine":
-            return
         if os.getenv("GCP_RUNTIME_CAPACITY_SYNC_ON_SCHEDULER", "false").lower() != "true":
+            persist_targets_snapshot()
             return
         log.info("Syncing GCP runtime capacity snapshots")
         call_command("sync_gcp_runtime_capacity")
+        persist_targets_snapshot()
+
+    def _run_pending_meetbot_launches(self):
+        try:
+            bot_ids = pop_due_pending_bots(limit=50)
+            if not bot_ids:
+                return
+            log.info("Replaying %d pending meetbot launches", len(bot_ids))
+            for bot_id in bot_ids:
+                launch_meetbot_runtime.apply_async(args=[bot_id], countdown=0)
+        except Exception:
+            log.exception("Failed to replay pending meetbot launches")
 
     def _run_periodic_calendar_syncs(self):
         """
@@ -305,9 +320,6 @@ class Command(BaseCommand):
         log.info("Enqueued %d autopay tasks", len(organizations))
 
     def _reconcile_bot_runtime_leases(self):
-        if os.getenv("LAUNCH_BOT_METHOD") not in {"digitalocean-droplet", "gcp-compute-engine"}:
-            return
-
         leases = BotRuntimeLease.objects.select_related("bot").exclude(status=BotRuntimeLeaseStatuses.DELETED)
 
         for lease in leases:
@@ -325,3 +337,21 @@ class Command(BaseCommand):
                 provider.sync_lease(lease)
             except Exception:
                 log.exception("Failed to reconcile runtime lease %s for bot %s", lease.id, lease.bot.object_id)
+
+    def _reconcile_idle_gcp_hosts(self):
+        try:
+            idle_hosts = idle_gcp_hosts()
+            if not idle_hosts:
+                return
+            provider = get_runtime_provider("gcp_compute_instance")
+            for host in idle_hosts:
+                host_name = host.get("name") or host.get("host_name")
+                if not host_name:
+                    continue
+                try:
+                    provider.delete_host_instance(host_name)
+                    log.info("Deleted idle GCP host %s", host_name)
+                except Exception:
+                    log.exception("Failed deleting idle GCP host %s", host_name)
+        except Exception:
+            log.exception("Failed to reconcile idle GCP hosts")

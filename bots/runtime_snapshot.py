@@ -564,9 +564,6 @@ class RuntimeBotSnapshot:
     def ephemeral_container_name(self):
         return f"bot-{self.id}-{self.object_id}".lower().replace("_", "-")
 
-    def digitalocean_droplet_name(self):
-        return f"attendee-bot-{self.id}-{self.object_id}".lower().replace("_", "-")[:64]
-
     def gcp_instance_name(self):
         return f"attendee-bot-{self.id}-{self.object_id}".lower().replace("_", "-")[:63]
 

@@ -44,6 +44,13 @@ class TestBuildSiteUrl(TestCase):
         result = build_site_url("/callback")
         self.assertEqual(result, "http://localhost:9000/callback")
 
+    @patch("bots.bots_api_utils.settings")
+    @patch.dict("os.environ", {"SITE_BASE_URL": "http://10.88.0.2:8100"}, clear=True)
+    def test_build_site_url_uses_site_base_url_when_set(self, mock_settings):
+        mock_settings.SITE_DOMAIN = "10.88.0.2"
+        result = build_site_url("/internal/webhook")
+        self.assertEqual(result, "http://10.88.0.2:8100/internal/webhook")
+
 
 class TestValidateMeetingUrlAndCredentials(TestCase):
     def setUp(self):

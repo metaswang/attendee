@@ -34,7 +34,7 @@ class Command(BaseCommand):
         # There isn't really a safe way to terminate the bot if it's running as a celery task
         if os.getenv("LAUNCH_BOT_METHOD") == "kubernetes":
             self._terminate_kubernetes_pod(bot)
-        elif os.getenv("LAUNCH_BOT_METHOD") in {"digitalocean-droplet", "gcp-compute-engine"}:
+        elif getattr(bot, "runtime_lease", None) is not None:
             self._terminate_runtime_lease(bot)
         elif os.getenv("LAUNCH_BOT_METHOD") == "docker-compose-multi-host":
             self._terminate_ephemeral_docker_container(bot)

@@ -20,6 +20,7 @@ from rest_framework.views import APIView
 from .authentication import ApiKeyAuthentication
 from .bots_api_utils import BotCreationSource, create_bot, create_bot_chat_message_request, create_bot_media_request_for_image, delete_bot, patch_bot, patch_bot_transcription_settings, patch_bot_voice_agent_settings, send_sync_command
 from .meeting_url_utils import meeting_type_from_url
+from .runtime_scheduler import runtime_capacity_summary
 from .models import (
     AsyncTranscription,
     AsyncTranscriptionStates,
@@ -336,6 +337,10 @@ class RuntimeCapacityView(APIView):
             }
             for snapshot in snapshots
         ]
+        dynamic_payload = runtime_capacity_summary()
+        if provider:
+            dynamic_payload = [item for item in dynamic_payload if item.get("provider") == provider]
+        payload.extend(dynamic_payload)
         return Response(payload)
 
 

@@ -147,10 +147,19 @@ def _runtime_lease_for_request(lease_id: int, request):
 
     auth_header = request.headers.get("Authorization", "")
     expected_auth_header = f"Bearer {lease.shutdown_token}"
-    if auth_header != expected_auth_header:
+    internal_service_key = os.getenv("ATTENDEE_INTERNAL_SERVICE_KEY", "").strip()
+    provided_internal_service_key = request.headers.get("X-Internal-Service-Key", "").strip()
+    if auth_header != expected_auth_header and (not internal_service_key or provided_internal_service_key != internal_service_key):
         return None, JsonResponse({"error": "Unauthorized"}, status=401)
 
     return lease, None
+
+
+def _runtime_recording_complete_callback_url(lease: BotRuntimeLease) -> str:
+    runtime_api_base_url = os.getenv("MEETBOT_RUNTIME_API_BASE_URL", "").strip().rstrip("/")
+    if runtime_api_base_url:
+        return f"{runtime_api_base_url}/internal/attendee-runtime-leases/{lease.id}/recording-complete"
+    return build_site_url(f"/internal/bot-runtime-leases/{lease.id}/recording-complete")
 
 
 def _serialize_bot_runtime_snapshot(bot: Bot, lease: BotRuntimeLease) -> dict:
@@ -159,7 +168,7 @@ def _serialize_bot_runtime_snapshot(bot: Bot, lease: BotRuntimeLease) -> dict:
     callback_settings = bot_settings.get("callback_settings") or {}
     callback_settings_changed = False
 
-    if lease.provider == BotRuntimeProviderTypes.GCP_COMPUTE_INSTANCE and meeting_type_from_url(bot.meeting_url) in {MeetingTypes.GOOGLE_MEET, MeetingTypes.TEAMS}:
+    if lease.provider in {BotRuntimeProviderTypes.GCP_COMPUTE_INSTANCE, BotRuntimeProviderTypes.VPS_DOCKER} and meeting_type_from_url(bot.meeting_url) in {MeetingTypes.GOOGLE_MEET, MeetingTypes.TEAMS}:
         session_id = str((bot.metadata or {}).get("session_id") or "").strip() or bot.object_id
         recording_format = recording_settings.get("format") or RecordingFormats.MP3
         recording_settings["transport"] = "r2_chunks"
@@ -173,7 +182,7 @@ def _serialize_bot_runtime_snapshot(bot: Bot, lease: BotRuntimeLease) -> dict:
             recording_settings.pop("audio_chunk_prefix", None)
         recording_settings.setdefault("chunk_interval_ms", 5000)
         recording_complete = copy.deepcopy(callback_settings.get("recording_complete") or {})
-        recording_complete["url"] = build_site_url(f"/internal/bot-runtime-leases/{lease.id}/recording-complete")
+        recording_complete["url"] = _runtime_recording_complete_callback_url(lease)
         upstream_signing_secret = recording_complete.get("signing_secret")
         if upstream_signing_secret:
             if recording_complete.get("upstream_signing_secret") != upstream_signing_secret:

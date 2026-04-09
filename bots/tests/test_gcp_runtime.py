@@ -14,6 +14,7 @@ from bots.management.commands.clean_up_bots_with_heartbeat_timeout_or_that_never
 from bots.management.commands.sync_gcp_runtime_capacity import Command as SyncGCPRuntimeCapacityCommand
 from bots.models import ApiKey, AudioChunk, Bot, BotEvent, BotEventTypes, BotMediaRequest, BotMediaRequestMediaTypes, BotMediaRequestStates, BotRuntimeLease, BotRuntimeLeaseStatuses, BotRuntimeProviderTypes, BotStates, MediaBlob, Participant, ParticipantEvent, ParticipantEventTypes, Project, Recording, RecordingFormats, RecordingManager, RecordingTypes, RuntimeCapacityProviders, RuntimeCapacitySnapshot, TranscriptionTypes, Utterance
 from bots.runtime_providers.gcp_compute_engine import GCPComputeInstanceProvider
+from bots.runtime_providers.host_runtime import runtime_container_env
 from bots.runtime_snapshot import RuntimeBotSnapshot
 from bots.webhook_utils import sign_payload
 
@@ -64,9 +65,11 @@ class TestGCPRuntime(TestCase):
 
         self.assertEqual(lease.provider, BotRuntimeProviderTypes.GCP_COMPUTE_INSTANCE)
         self.assertEqual(lease.status, BotRuntimeLeaseStatuses.PROVISIONING)
-        self.assertEqual(lease.provider_instance_id, self.bot.gcp_instance_name())
+        self.assertTrue(lease.provider_instance_id.startswith("attendee-gcp-host-asia-southeast1-"))
         self.assertEqual(lease.region, "asia-southeast1")
         self.assertFalse(lease.metadata["request"]["private_only"])
+        self.assertEqual(lease.metadata["host"]["zone"], "asia-southeast1-b")
+        self.assertEqual(lease.metadata["slot"]["index"], 0)
 
         _, kwargs = mock_instances_client.insert.call_args
         self.assertEqual(kwargs["project"], "test-project")
@@ -126,23 +129,16 @@ class TestGCPRuntime(TestCase):
         mock_compute_v1.InstancesClient.return_value = mock_instances_client
         mock_compute_v1.ZoneOperationsClient.return_value = mock_zone_operations_client
 
-        created_instance = MagicMock()
-        created_instance.id = 123456
-        created_instance.name = self.bot.gcp_instance_name()
-        created_instance.status = "RUNNING"
-        mock_instances_client.get.return_value = created_instance
-        mock_instances_client.insert.side_effect = [Exception("409 POST https://compute.googleapis.com/... already exists"), MagicMock(name="operation-2")]
-
         provider = GCPComputeInstanceProvider()
         provider._build_instance = MagicMock(return_value=MagicMock())
         provider._wait_for_operation = MagicMock()
-        provider._wait_for_instance_absent = MagicMock()
 
         lease = provider.provision_bot(self.bot)
+        duplicate = provider.provision_bot(self.bot)
 
         self.assertEqual(lease.provider, BotRuntimeProviderTypes.GCP_COMPUTE_INSTANCE)
-        self.assertEqual(mock_instances_client.insert.call_count, 2)
-        provider._wait_for_instance_absent.assert_called_once_with("asia-southeast1-b", self.bot.gcp_instance_name())
+        self.assertEqual(duplicate.id, lease.id)
+        self.assertEqual(mock_instances_client.insert.call_count, 1)
 
     @patch.dict(
         "os.environ",
@@ -207,25 +203,24 @@ class TestGCPRuntime(TestCase):
             status=BotRuntimeLeaseStatuses.PROVISIONING,
         )
 
-        startup_script = provider._startup_script(self.bot, lease)
+        startup_script = provider._startup_script("attendee-gcp-host-asia-southeast1-test", lease, zone="asia-southeast1-b", region="asia-southeast1")
 
-        self.assertIn("cat >/etc/attendee/runtime.env <<'EOF'", startup_script)
+        self.assertIn("cat >/etc/attendee/runtime-agent.env <<'EOF_AGENT_ENV'", startup_script)
+        self.assertIn("cat >/usr/local/bin/attendee-runtime-agent <<'EOF_AGENT'", startup_script)
+        self.assertIn("cat >/etc/systemd/system/attendee-runtime-agent.service <<'EOF_AGENT_SERVICE'", startup_script)
         self.assertIn("cat >/usr/local/bin/attendee-bot-runner <<'EOF_RUNNER'", startup_script)
         self.assertIn("cat >/etc/systemd/system/attendee-bot-runner.service <<'EOF_SERVICE'", startup_script)
-        self.assertIn("source /etc/attendee/runtime.env", startup_script)
+        self.assertIn("systemctl enable --now attendee-runtime-agent.service", startup_script)
+        self.assertIn("systemctl restart attendee-runtime-agent.service", startup_script)
         self.assertIn("sync_attendee_source_archive() {", startup_script)
         self.assertIn("sync_attendee_repo() {", startup_script)
         self.assertIn("log_startup() {", startup_script)
         self.assertIn("curl -fsSL --retry 3 --connect-timeout 10 --max-time 180", startup_script)
         self.assertIn("timeout 120 \"$git_bin\" -C \"$repo_dir\" fetch --all --tags", startup_script)
         self.assertIn("if ! sync_attendee_source_archive; then", startup_script)
-        self.assertIn("Falling back to existing repo checkout", startup_script)
         self.assertIn("systemctl daemon-reload", startup_script)
-        self.assertIn("-v \"$ATTENDEE_REPO_DIR:$ATTENDEE_CONTAINER_WORKDIR\"", startup_script)
-        self.assertIn("docker image inspect \"$BOT_RUNTIME_IMAGE\" >/dev/null 2>&1", startup_script)
-        self.assertNotIn("docker build --platform linux/amd64", startup_script)
-        self.assertIn("systemctl restart attendee-bot-runner.service", startup_script)
-        self.assertNotIn("systemctl enable attendee-bot-runner.service", startup_script)
+        self.assertIn("MEETBOT_RUNTIME_HOST_NAME=attendee-gcp-host-asia-southeast1-test", startup_script)
+        self.assertNotIn("export MEETBOT_RUNTIME_HOST_NAME", startup_script)
 
     @patch.dict(
         "os.environ",
@@ -289,7 +284,7 @@ class TestGCPRuntime(TestCase):
             status=BotRuntimeLeaseStatuses.PROVISIONING,
         )
 
-        startup_script = provider._startup_script(self.bot, lease)
+        startup_script = provider._startup_script("attendee-gcp-host-asia-southeast1-test", lease, zone="asia-southeast1-b", region="asia-southeast1")
 
         self.assertNotIn("GOOGLE_APPLICATION_CREDENTIALS", startup_script)
         self.assertNotIn("/var/lib/attendee-gcloud/application_default_credentials.json", startup_script)
@@ -347,8 +342,28 @@ class TestGCPRuntime(TestCase):
 
         runtime_env = provider._serialized_runtime_env(self.bot, lease)
 
-        self.assertIn("export REDIS_URL=rediss://:token@ad.voxstudio.me:6363", runtime_env)
-        self.assertNotIn("export REDIS_URL=redis://redis:6379/5", runtime_env)
+        self.assertIn("REDIS_URL=rediss://:token@ad.voxstudio.me:6363", runtime_env)
+        self.assertNotIn("REDIS_URL=redis://redis:6379/5", runtime_env)
+
+    @patch.dict(
+        "os.environ",
+        {
+            "BOT_RUNTIME_REDIS_URL": "rediss://:token@ad.voxstudio.me:6363",
+            "ATTENDEE_REPO_DIR": "/opt/attendee",
+        },
+        clear=False,
+    )
+    def test_runtime_agent_env_file_contents_uses_plain_assignments(self):
+        from bots.runtime_providers.host_runtime import runtime_agent_env_file_contents
+
+        env_contents = runtime_agent_env_file_contents(
+            "attendee-gcp-host-asia-southeast1-test",
+            "meetbot:runtime:commands:attendee-gcp-host-asia-southeast1-test",
+        )
+
+        self.assertIn("MEETBOT_RUNTIME_HOST_NAME=attendee-gcp-host-asia-southeast1-test", env_contents)
+        self.assertIn("REDIS_URL=rediss://:token@ad.voxstudio.me:6363", env_contents)
+        self.assertNotIn("export ", env_contents)
 
     def test_bootstrap_view_returns_runtime_snapshot(self):
         session_id = "019d61ee-39d9-700b-80d8-1d554c5b5b70"
@@ -404,6 +419,89 @@ class TestGCPRuntime(TestCase):
         self.assertEqual(runtime_bot.project.object_id, self.project.object_id)
         self.assertEqual(runtime_bot.recording_complete_signing_secret(), lease.shutdown_token)
         self.assertEqual(runtime_bot.recording_complete_upstream_signing_secret(), "api-secret")
+
+    @patch.dict("os.environ", {"MEETBOT_RUNTIME_API_BASE_URL": "https://api.voxstudio.me"}, clear=False)
+    def test_bootstrap_view_uses_runtime_api_facade_for_recording_complete_url(self):
+        self.bot.settings = {
+            "runtime_settings": {"region": "asia-southeast1"},
+            "callback_settings": {
+                "recording_complete": {
+                    "url": "http://api:8000/v2/meeting/app/bot/recording/complete",
+                    "signing_secret": "api-secret",
+                }
+            },
+        }
+        self.bot.metadata = {"session_id": "session-1"}
+        self.bot.save(update_fields=["settings", "metadata", "updated_at"])
+
+        lease = BotRuntimeLease.objects.create(
+            bot=self.bot,
+            provider=BotRuntimeProviderTypes.GCP_COMPUTE_INSTANCE,
+            status=BotRuntimeLeaseStatuses.PROVISIONING,
+        )
+
+        response = self.client.get(
+            f"/internal/bot-runtime-leases/{lease.id}/bootstrap",
+            HTTP_AUTHORIZATION=f"Bearer {lease.shutdown_token}",
+            secure=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(
+            payload["bot"]["settings"]["callback_settings"]["recording_complete"]["url"],
+            f"https://api.voxstudio.me/internal/attendee-runtime-leases/{lease.id}/recording-complete",
+        )
+
+    @patch.dict("os.environ", {"ATTENDEE_INTERNAL_SERVICE_KEY": "svc-key"}, clear=False)
+    def test_bootstrap_view_accepts_internal_service_key(self):
+        lease = BotRuntimeLease.objects.create(
+            bot=self.bot,
+            provider=BotRuntimeProviderTypes.GCP_COMPUTE_INSTANCE,
+            status=BotRuntimeLeaseStatuses.PROVISIONING,
+        )
+
+        response = self.client.get(
+            f"/internal/bot-runtime-leases/{lease.id}/bootstrap",
+            HTTP_X_INTERNAL_SERVICE_KEY="svc-key",
+            secure=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["lease"]["id"], lease.id)
+
+    @patch.dict("os.environ", {"MEETBOT_RUNTIME_API_BASE_URL": "https://api.voxstudio.me"}, clear=False)
+    def test_runtime_container_env_points_runtime_calls_to_api_facade(self):
+        lease = BotRuntimeLease.objects.create(
+            bot=self.bot,
+            provider=BotRuntimeProviderTypes.VPS_DOCKER,
+            status=BotRuntimeLeaseStatuses.PROVISIONING,
+        )
+
+        env = runtime_container_env(
+            self.bot,
+            lease,
+            host_name="myvps",
+            slot_index=1,
+            provider=BotRuntimeProviderTypes.VPS_DOCKER,
+        )
+
+        self.assertEqual(
+            env["BOT_RUNTIME_BOOTSTRAP_URL"],
+            f"https://api.voxstudio.me/internal/attendee-runtime-leases/{lease.id}/bootstrap",
+        )
+        self.assertEqual(
+            env["BOT_RUNTIME_CONTROL_URL"],
+            f"https://api.voxstudio.me/internal/attendee-runtime-leases/{lease.id}/control",
+        )
+        self.assertEqual(
+            env["BOT_RUNTIME_SOURCE_ARCHIVE_URL"],
+            f"https://api.voxstudio.me/internal/attendee-runtime-leases/{lease.id}/source-archive",
+        )
+        self.assertEqual(
+            env["LEASE_CALLBACK_URL"],
+            f"https://api.voxstudio.me/internal/attendee-runtime-leases/{lease.id}/complete",
+        )
 
     @patch("bots.internal_views.requests.post")
     def test_recording_complete_view_forwards_signed_callback_to_upstream(self, mock_post):

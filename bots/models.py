@@ -542,8 +542,8 @@ class SessionTypes(models.IntegerChoices):
 
 
 class BotRuntimeProviderTypes(models.TextChoices):
-    DIGITALOCEAN_DROPLET = "digitalocean_droplet", "DigitalOcean Droplet"
     GCP_COMPUTE_INSTANCE = "gcp_compute_instance", "GCP Compute Instance"
+    VPS_DOCKER = "vps_docker", "VPS Docker"
 
 
 class BotRuntimeLeaseStatuses(models.TextChoices):
@@ -556,6 +556,7 @@ class BotRuntimeLeaseStatuses(models.TextChoices):
 
 class RuntimeCapacityProviders(models.TextChoices):
     GCP_COMPUTE_INSTANCE = "gcp_compute_instance", "GCP Compute Instance"
+    VPS_DOCKER = "vps_docker", "VPS Docker"
 
 
 class TranscriptionSettings:
@@ -1177,9 +1178,6 @@ class Bot(models.Model):
 
     def ephemeral_container_name(self):
         return f"bot-{self.id}-{self.object_id}".lower().replace("_", "-")
-
-    def digitalocean_droplet_name(self):
-        return f"attendee-bot-{self.id}-{self.object_id}".lower().replace("_", "-")[:64]
 
     def gcp_instance_name(self):
         return f"attendee-bot-{self.id}-{self.object_id}".lower().replace("_", "-")[:63]
