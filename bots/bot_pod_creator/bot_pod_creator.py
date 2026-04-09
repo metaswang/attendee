@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import logging
 import os
@@ -6,7 +8,11 @@ from typing import Dict, Optional
 
 import jsonpatch
 from django.conf import settings
-from kubernetes import client, config
+try:
+    from kubernetes import client, config
+except ImportError:
+    client = None  # type: ignore[assignment]
+    config = None  # type: ignore[assignment]
 
 from .bot_pod_spec import BotPodSpecType
 
