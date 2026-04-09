@@ -5,6 +5,8 @@ import hashlib
 import json
 import logging
 import os
+import shutil
+import tempfile
 import threading
 import time
 from time import sleep
@@ -630,8 +632,19 @@ class WebBotAdapter(BotAdapter):
     def init_driver(self):
         self.write_chrome_policies_file()
 
+        # Clean up previous user-data-dir to release any stale Chrome profile locks
+        prev_dir = getattr(self, "_chrome_user_data_dir", None)
+        if prev_dir and os.path.isdir(prev_dir):
+            try:
+                shutil.rmtree(prev_dir, ignore_errors=True)
+            except Exception as e:
+                logger.warning("Failed to remove previous Chrome user-data-dir %s: %s", prev_dir, e)
+
+        self._chrome_user_data_dir = tempfile.mkdtemp(prefix="chrome-profile-")
+
         options = webdriver.ChromeOptions()
 
+        options.add_argument(f"--user-data-dir={self._chrome_user_data_dir}")
         options.add_argument("--autoplay-policy=no-user-gesture-required")
         options.add_argument("--use-fake-device-for-media-stream")
         options.add_argument("--use-fake-ui-for-media-stream")
@@ -975,6 +988,15 @@ class WebBotAdapter(BotAdapter):
                 self.websocket_server.shutdown()
             except Exception as e:
                 logger.warning(f"Error shutting down websocket server: {e}")
+
+        # Clean up the temporary Chrome user-data-dir
+        chrome_dir = getattr(self, "_chrome_user_data_dir", None)
+        if chrome_dir and os.path.isdir(chrome_dir):
+            try:
+                shutil.rmtree(chrome_dir, ignore_errors=True)
+                logger.info("Removed Chrome user-data-dir %s", chrome_dir)
+            except Exception as e:
+                logger.warning("Failed to remove Chrome user-data-dir %s: %s", chrome_dir, e)
 
         self.cleaned_up = True
 
