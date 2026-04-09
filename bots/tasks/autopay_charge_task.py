@@ -3,8 +3,10 @@ import os
 
 try:
     import stripe
+    _stripe_retry_errors = (stripe.error.RateLimitError, stripe.error.APIConnectionError, stripe.error.APIError)
 except ImportError:
     stripe = None  # type: ignore[assignment]
+    _stripe_retry_errors = ()  # type: ignore[assignment]
 from celery import shared_task
 from django.db import transaction
 from django.utils import timezone
@@ -19,7 +21,7 @@ logger = logging.getLogger(__name__)
     bind=True,
     retry_backoff=True,  # Enable exponential backoff
     max_retries=3,
-    autoretry_for=(stripe.error.RateLimitError, stripe.error.APIConnectionError, stripe.error.APIError, TimeoutError),
+    autoretry_for=(*_stripe_retry_errors, TimeoutError),
 )
 def autopay_charge(self, organization_id):
     """
