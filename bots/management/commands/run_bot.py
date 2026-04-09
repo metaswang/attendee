@@ -2,7 +2,7 @@ import logging
 
 from django.core.management.base import BaseCommand
 
-from bots.tasks import run_bot  # Import your task
+from bots.tasks.run_bot_task import run_bot
 
 logger = logging.getLogger(__name__)
 
