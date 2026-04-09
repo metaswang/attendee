@@ -4,7 +4,6 @@ import logging
 import os
 import uuid
 
-import stripe
 from allauth.account.utils import send_email_confirmation
 from django.conf import settings
 from django.contrib.auth.mixins import LoginRequiredMixin
@@ -53,7 +52,7 @@ from .models import (
     ZoomOAuthApp,
 )
 from .tasks import launch_joining_bot
-from .stripe_utils import credit_amount_for_purchase_amount_dollars, process_checkout_session_completed
+from .stripe_utils import credit_amount_for_purchase_amount_dollars
 from .tasks.deliver_webhook_task import deliver_webhook
 from .utils import generate_recordings_json_for_bot_detail_view
 from .zoom_oauth_apps_api_utils import create_or_update_zoom_oauth_app
@@ -1157,89 +1156,18 @@ class ProjectBillingView(AdminRequiredMixin, ProjectUrlContextMixin, ListView):
         project = get_project_for_user(user=self.request.user, project_object_id=self.kwargs["object_id"])
         context.update(self.get_project_context(self.kwargs["object_id"], project))
 
-        # Check if organization has a valid payment method
-        has_payment_method = False
-        if project.organization.autopay_stripe_customer_id:
-            try:
-                # Retrieve the customer to check for default payment method
-                customer = stripe.Customer.retrieve(
-                    project.organization.autopay_stripe_customer_id,
-                    api_key=os.getenv("STRIPE_SECRET_KEY"),
-                )
-                # Check if customer has a default payment method
-                has_payment_method = customer.invoice_settings.default_payment_method is not None
-            except stripe.error.StripeError:
-                # If there's an error querying Stripe, assume no payment method
-                has_payment_method = False
-
-        context["has_payment_method"] = has_payment_method
+        context["has_payment_method"] = False
         return context
 
 
 class CheckoutSuccessView(LoginRequiredMixin, ProjectUrlContextMixin, View):
     def get(self, request, object_id):
-        session_id = request.GET.get("session_id")
-        if not session_id:
-            return HttpResponse("No session ID provided", status=400)
-
-        # Retrieve the session details
-        try:
-            checkout_session = stripe.checkout.Session.retrieve(session_id, api_key=os.getenv("STRIPE_SECRET_KEY"))
-        except Exception as e:
-            return HttpResponse(f"Error retrieving session details: {e}", status=400)
-
-        process_checkout_session_completed(checkout_session)
-
-        return redirect(reverse("bots:project-billing", kwargs={"object_id": object_id}))
+        return HttpResponse("Stripe payments have been removed.", status=410)
 
 
 class CreateCheckoutSessionView(LoginRequiredMixin, ProjectUrlContextMixin, View):
     def post(self, request, object_id):
-        # Get the purchase amount from the form submission
-        try:
-            purchase_amount = float(request.POST.get("purchase_amount", 50.0))
-            if purchase_amount < 1:
-                purchase_amount = 1.0
-        except (ValueError, TypeError):
-            purchase_amount = 50.0  # Default fallback
-
-        credit_amount = credit_amount_for_purchase_amount_dollars(purchase_amount)
-
-        # Convert purchase amount to cents for Stripe
-        unit_amount = int(purchase_amount * 100)  # in cents
-
-        if unit_amount > 1000000:  # $10000 limit
-            return HttpResponse("The maximum purchase amount is $10000.", status=400)
-
-        # Create checkout session
-        checkout_session = stripe.checkout.Session.create(
-            payment_method_types=["card"],
-            line_items=[
-                {
-                    "price_data": {
-                        "currency": "usd",
-                        "product_data": {
-                            "name": f"{credit_amount} Attendee Credits",
-                            "description": f"Purchase {credit_amount} Attendee credits for your account",
-                        },
-                        "unit_amount": unit_amount,
-                    },
-                    "quantity": 1,
-                }
-            ],
-            mode="payment",
-            success_url=request.build_absolute_uri(reverse("bots:checkout-success", kwargs={"object_id": object_id})) + "?session_id={CHECKOUT_SESSION_ID}",
-            cancel_url=request.build_absolute_uri(reverse("bots:project-billing", kwargs={"object_id": object_id})),
-            metadata={
-                "organization_id": str(request.user.organization.id),
-                "user_id": str(request.user.id),
-                "credit_amount": str(credit_amount),
-            },
-            api_key=os.getenv("STRIPE_SECRET_KEY"),
-        )
-
-        # Redirect directly to the Stripe checkout page
-        return redirect(checkout_session.url)
+        return HttpResponse("Stripe payments have been removed.", status=410)
 
 
 class CreateBotView(LoginRequiredMixin, ProjectUrlContextMixin, View):
@@ -1305,59 +1233,7 @@ class EditProjectView(AdminRequiredMixin, View):
 
 class ProjectAutopayStripePortalView(AdminRequiredMixin, View):
     def post(self, request, object_id):
-        """Create or update Stripe customer and redirect to billing portal for payment method setup."""
-        project = get_project_for_user(user=request.user, project_object_id=object_id)
-        organization = project.organization
-
-        try:
-            # Check if organization already has a Stripe customer
-            if not organization.autopay_stripe_customer_id:
-                # Create a new Stripe customer
-                customer = stripe.Customer.create(
-                    email=request.user.email,
-                    name=organization.name,
-                    metadata={
-                        "organization_id": str(organization.id),
-                        "user_id": str(request.user.id),
-                    },
-                    api_key=os.getenv("STRIPE_SECRET_KEY"),
-                )
-
-                # Save the customer ID to the organization
-                organization.autopay_stripe_customer_id = customer.id
-                organization.save()
-
-            # Check if customer already has a default payment method
-            customer = stripe.Customer.retrieve(
-                organization.autopay_stripe_customer_id,
-                api_key=os.getenv("STRIPE_SECRET_KEY"),
-            )
-            has_default_payment_method = customer.invoice_settings.default_payment_method is not None
-
-            # Create billing portal session with conditional flow_data
-            session_params = {
-                "customer": organization.autopay_stripe_customer_id,
-                "return_url": request.build_absolute_uri(reverse("projects:project-billing", args=[project.object_id])),
-                "api_key": os.getenv("STRIPE_SECRET_KEY"),
-            }
-
-            # Only add flow_data if customer doesn't have a default payment method
-            if not has_default_payment_method:
-                session_params["flow_data"] = {"type": "payment_method_update"}
-
-            session = stripe.billing_portal.Session.create(**session_params)
-
-            # Redirect to the billing portal
-            return redirect(session.url)
-
-        except stripe.error.StripeError as e:
-            error_id = str(uuid.uuid4())
-            logger.error(f"Error setting up payment method (error_id={error_id}): {e}")
-            return HttpResponse(f"Error setting up payment method. Error ID: {error_id}", status=400)
-        except Exception as e:
-            error_id = str(uuid.uuid4())
-            logger.error(f"An error occurred setting up payment method (error_id={error_id}): {e}")
-            return HttpResponse(f"An error occurred. Error ID: {error_id}", status=500)
+        return HttpResponse("Stripe billing portal has been removed.", status=410)
 
 
 class ProjectAutopayView(AdminRequiredMixin, View):

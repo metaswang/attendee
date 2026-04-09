@@ -111,7 +111,6 @@ control = [
     "gunicorn==23.0.0",
     "kubernetes==32.0.0",
     "modal==1.4.1.dev1",
-    "stripe==11.6.0",
 ]
 dev = [
     "ruff==0.9.6",
