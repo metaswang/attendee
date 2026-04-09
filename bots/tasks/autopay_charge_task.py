@@ -1,7 +1,10 @@
 import logging
 import os
 
-import stripe
+try:
+    import stripe
+except ImportError:
+    stripe = None  # type: ignore[assignment]
 from celery import shared_task
 from django.db import transaction
 from django.utils import timezone
