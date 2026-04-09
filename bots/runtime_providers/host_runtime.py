@@ -88,15 +88,15 @@ def runtime_container_env(bot, lease: BotRuntimeLease, *, host_name: str, slot_i
             continue
         env_vars[key] = value
 
+    timing_metadata = ((lease.metadata or {}).get("timings") or {}).copy()
     env_vars.update(
         {
             "BOT_ID": str(bot.id),
             "BOT_OBJECT_ID": bot.object_id,
-            "BOT_LAUNCH_REQUESTED_AT": timezone.now().isoformat(),
+            "BOT_LAUNCH_REQUESTED_AT": timing_metadata.get("launch_requested_at") or timezone.now().isoformat(),
             "BOT_RUNTIME_PROVIDER": provider,
             "BOT_RUNTIME_BOOTSTRAP_URL": _runtime_bootstrap_url(lease),
             "BOT_RUNTIME_CONTROL_URL": _runtime_control_url(lease),
-            "BOT_RUNTIME_SOURCE_ARCHIVE_URL": _runtime_source_archive_url(lease),
             "BOT_RUNTIME_HOST_NAME": host_name,
             "BOT_RUNTIME_SLOT_INDEX": str(slot_index),
             "BOT_RUNTIME_SLOT_WEIGHT": str(slot_weight),
@@ -110,7 +110,21 @@ def runtime_container_env(bot, lease: BotRuntimeLease, *, host_name: str, slot_i
             "MEETBOT_RUNTIME_SLOT_WEIGHT": str(slot_weight),
         }
     )
-    runtime_redis_url = os.getenv("BOT_RUNTIME_REDIS_URL", "").strip() or os.getenv("REDIS_URL", "").strip() or getattr(settings, "REDIS_URL_WITH_PARAMS", "")
+    if os.getenv("BOT_RUNTIME_ALLOW_BOOTSTRAP", "false").strip().lower() in {"1", "true", "yes", "on"}:
+        env_vars["BOT_RUNTIME_SOURCE_ARCHIVE_URL"] = _runtime_source_archive_url(lease)
+    for env_name, metadata_key in (
+        ("BOT_RUNTIME_GCP_INSERT_STARTED_AT", "gcp_insert_started_at"),
+        ("BOT_RUNTIME_GCP_INSTANCE_RUNNING_AT", "gcp_instance_running_at"),
+        ("BOT_RUNTIME_AGENT_HEARTBEAT_SEEN_AT", "runtime_agent_heartbeat_seen_at"),
+    ):
+        if timing_metadata.get(metadata_key):
+            env_vars[env_name] = str(timing_metadata[metadata_key])
+    runtime_redis_url = (
+        os.getenv("BOT_RUNTIME_REDIS_URL", "").strip()
+        or os.getenv("REDIS__URL", "").strip()
+        or os.getenv("REDIS_URL", "").strip()
+        or getattr(settings, "REDIS_URL_WITH_PARAMS", "")
+    )
     if runtime_redis_url:
         env_vars["REDIS_URL"] = runtime_redis_url
     return env_vars
@@ -149,7 +163,12 @@ def runtime_stop_payload(bot, lease: BotRuntimeLease, *, host_name: str, slot_in
 
 
 def runtime_agent_env(host_name: str, queue_key: str) -> dict[str, str]:
-    runtime_redis_url = os.getenv("BOT_RUNTIME_REDIS_URL", "").strip() or os.getenv("REDIS_URL", "").strip() or getattr(settings, "REDIS_URL_WITH_PARAMS", "")
+    runtime_redis_url = (
+        os.getenv("BOT_RUNTIME_REDIS_URL", "").strip()
+        or os.getenv("REDIS__URL", "").strip()
+        or os.getenv("REDIS_URL", "").strip()
+        or getattr(settings, "REDIS_URL_WITH_PARAMS", "")
+    )
     env = {
         "ATTENDEE_REPO_DIR": os.getenv("ATTENDEE_REPO_DIR", "/voxella/voxella-attendee"),
         "ATTENDEE_CONTAINER_WORKDIR": os.getenv("ATTENDEE_CONTAINER_WORKDIR", "/attendee"),

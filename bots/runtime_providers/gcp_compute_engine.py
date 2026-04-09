@@ -128,7 +128,7 @@ class GCPComputeInstanceProvider:
     def _host_name(self, region: str) -> str:
         return f"attendee-gcp-host-{region}-{uuid.uuid4().hex[:8]}"
 
-    def _startup_script(self, host_name: str, lease: BotRuntimeLease, zone: str, region: str) -> str:
+    def _bootstrap_startup_script(self, host_name: str, lease: BotRuntimeLease, zone: str, region: str) -> str:
         runner_script_contents = (Path(__file__).resolve().parents[2] / "scripts/digitalocean/attendee-bot-runner.sh").read_text()
         runner_service_contents = (Path(__file__).resolve().parents[2] / "scripts/digitalocean/attendee-bot-runner.service").read_text()
         runtime_agent_script_contents = (Path(__file__).resolve().parents[2] / "scripts/runtime_agent.py").read_text()
@@ -213,6 +213,25 @@ class GCPComputeInstanceProvider:
             ]
         )
 
+    def _startup_script(self, host_name: str, lease: BotRuntimeLease, zone: str, region: str) -> str:
+        if os.getenv("GCP_BOT_ALLOW_RUNTIME_BOOTSTRAP", "false").strip().lower() in {"1", "true", "yes", "on"}:
+            return self._bootstrap_startup_script(host_name, lease, zone=zone, region=region)
+
+        return "\n".join(
+            [
+                "#!/bin/bash",
+                "set -euo pipefail",
+                "mkdir -p /etc/attendee /var/log/attendee",
+                "cat >/etc/attendee/runtime-agent.env <<'EOF_AGENT_ENV'",
+                runtime_agent_env_file_contents(host_name, runtime_queue_key(host_name)),
+                "EOF_AGENT_ENV",
+                "chmod 0644 /etc/attendee/runtime-agent.env",
+                "systemctl daemon-reload",
+                "systemctl enable --now attendee-runtime-agent.service",
+                "systemctl restart attendee-runtime-agent.service",
+            ]
+        )
+
     def _zones_for_region(self, region: str) -> list[str]:
         raw_json = os.getenv("GCP_BOT_REGION_ZONES_JSON", "").strip()
         if raw_json:
@@ -281,13 +300,35 @@ class GCPComputeInstanceProvider:
             logger.warning("Unable to determine disk size for source image %s, using 100 GB fallback: %s", self._source_image(), exc)
             return 100
 
-    def _host_machine_type(self) -> str:
-        return os.getenv("GCP_BOT_HOST_MACHINE_TYPE", "n2-standard-2")
+    def _runtime_class_family(self, bot) -> str:
+        return "light" if bot.runtime_resource_class() in {"transcription_only", "audio_only"} else "web"
+
+    def _host_machine_type(self, bot) -> str:
+        return bot.gcp_machine_type()
+
+    def _slot_capacity_for(self, *, bot=None, machine_type: str | None = None, runtime_class_family: str | None = None) -> int:
+        if bot is not None:
+            machine_type = machine_type or self._host_machine_type(bot)
+            runtime_class_family = runtime_class_family or self._runtime_class_family(bot)
+
+        raw_machine_type_json = os.getenv("MEETBOT_GCP_VM_SLOT_CAPACITY_BY_MACHINE_TYPE_JSON", "").strip()
+        if raw_machine_type_json and machine_type:
+            machine_type_map = json.loads(raw_machine_type_json)
+            if machine_type in machine_type_map:
+                return int(machine_type_map[machine_type])
+
+        raw_family_json = os.getenv("MEETBOT_GCP_VM_SLOT_CAPACITY_BY_RUNTIME_CLASS_FAMILY_JSON", "").strip()
+        if raw_family_json and runtime_class_family:
+            family_map = json.loads(raw_family_json)
+            if runtime_class_family in family_map:
+                return int(family_map[runtime_class_family])
+
+        return gcp_vm_slot_capacity()
 
     def _host_name(self, region: str) -> str:
         return f"attendee-gcp-host-{region}-{uuid.uuid4().hex[:8]}"
 
-    def _register_host(self, host_name: str, region: str, zone: str, *, state: str = "provisioning") -> None:
+    def _register_host(self, host_name: str, region: str, zone: str, *, machine_type: str, runtime_class_family: str, slot_capacity: int, state: str = "provisioning") -> None:
         redis_client().hset(
             "meetbot:scheduler:gcp:instances",
             host_name,
@@ -297,12 +338,13 @@ class GCPComputeInstanceProvider:
                     "region": region,
                     "zone": zone,
                     "state": state,
-                    "slot_capacity": gcp_vm_slot_capacity(),
+                    "runtime_class_family": runtime_class_family,
+                    "slot_capacity": slot_capacity,
                     "created_at": timezone.now().isoformat(),
                     "last_active_at": timezone.now().isoformat(),
                     "heartbeat_key": f"meetbot:runtime:agent:{host_name}:heartbeat",
                     "queue_key": runtime_queue_key(host_name),
-                    "machine_type": self._host_machine_type(),
+                    "machine_type": machine_type,
                 },
                 sort_keys=True,
                 separators=(",", ":"),
@@ -316,8 +358,7 @@ class GCPComputeInstanceProvider:
         current.update(updates)
         client.hset("meetbot:scheduler:gcp:instances", host_name, json.dumps(current, sort_keys=True, separators=(",", ":")))
 
-    def _acquire_host_slot(self, host_name: str, bot, lease: BotRuntimeLease) -> int | None:
-        capacity = gcp_vm_slot_capacity()
+    def _acquire_host_slot(self, host_name: str, bot, lease: BotRuntimeLease, *, capacity: int) -> int | None:
         for slot_index in range(capacity):
             if redis_client().set(
                 f"meetbot:scheduler:slots:gcp:{host_name}:{slot_index}",
@@ -350,13 +391,17 @@ class GCPComputeInstanceProvider:
             logger.warning("Unable to verify GCP host %s in zone %s: %s", host_name, zone, exc)
             return False
 
-    def _select_existing_host(self, region: str, bot, lease: BotRuntimeLease) -> tuple[str, dict, int] | None:
+    def _select_existing_host(self, region: str, bot, lease: BotRuntimeLease, *, machine_type: str, runtime_class_family: str, slot_capacity: int) -> tuple[str, dict, int] | None:
         client = redis_client()
         raw_instances = client.hgetall("meetbot:scheduler:gcp:instances")
         for raw_host_name, raw_meta in raw_instances.items():
             host_name = raw_host_name.decode("utf-8") if isinstance(raw_host_name, bytes) else raw_host_name
             meta = json.loads(raw_meta) if raw_meta else {}
             if meta.get("region") != region:
+                continue
+            if meta.get("machine_type") != machine_type:
+                continue
+            if meta.get("runtime_class_family") != runtime_class_family:
                 continue
             if meta.get("state") not in {None, "provisioning", "active"}:
                 continue
@@ -366,16 +411,23 @@ class GCPComputeInstanceProvider:
                 continue
             heartbeat_key = meta.get("heartbeat_key") or runtime_agent_heartbeat_key(host_name)
             next_state = "active" if client.exists(heartbeat_key) else meta.get("state", "provisioning")
-            slot_index = self._acquire_host_slot(host_name, bot, lease)
+            update_fields = {
+                "last_active_at": timezone.now().isoformat(),
+                "state": next_state,
+                "heartbeat_key": heartbeat_key,
+            }
+            if client.exists(heartbeat_key) and not meta.get("runtime_agent_heartbeat_seen_at"):
+                update_fields["runtime_agent_heartbeat_seen_at"] = timezone.now().isoformat()
+            slot_index = self._acquire_host_slot(host_name, bot, lease, capacity=int(meta.get("slot_capacity") or slot_capacity))
             if slot_index is not None:
-                self._update_host_record(host_name, last_active_at=timezone.now().isoformat(), state=next_state, heartbeat_key=heartbeat_key)
+                self._update_host_record(host_name, **update_fields)
                 return host_name, meta, slot_index
         return None
 
-    def _build_instance(self, host_name: str, lease: BotRuntimeLease, zone: str, region: str):
-        machine_type_name = self._host_machine_type()
+    def _build_instance(self, bot, host_name: str, lease: BotRuntimeLease, zone: str, region: str):
+        machine_type_name = self._host_machine_type(bot)
         machine_type = f"zones/{zone}/machineTypes/{machine_type_name}"
-        requested_boot_disk_size_gb = int(os.getenv("GCP_BOT_HOST_BOOT_DISK_GB", "30"))
+        requested_boot_disk_size_gb = bot.gcp_boot_disk_size_gb()
         boot_disk_size_gb = max(requested_boot_disk_size_gb, self._source_image_min_disk_size_gb())
         if boot_disk_size_gb != requested_boot_disk_size_gb:
             logger.info(
@@ -463,25 +515,48 @@ class GCPComputeInstanceProvider:
                 time.sleep(5)
         raise GCPComputeEngineError(f"Timed out waiting for GCP instance {instance_name} to be deleted in zone {zone}")
 
-    def _select_or_create_host(self, bot, lease: BotRuntimeLease) -> tuple[str, str, str, int]:
+    def _select_or_create_host(self, bot, lease: BotRuntimeLease) -> tuple[str, str, str, int, str, str, int, dict]:
         region = bot.runtime_region(self._default_region())
-        existing = self._select_existing_host(region, bot, lease)
+        machine_type = self._host_machine_type(bot)
+        runtime_class_family = self._runtime_class_family(bot)
+        slot_capacity = self._slot_capacity_for(bot=bot, machine_type=machine_type, runtime_class_family=runtime_class_family)
+        existing = self._select_existing_host(
+            region,
+            bot,
+            lease,
+            machine_type=machine_type,
+            runtime_class_family=runtime_class_family,
+            slot_capacity=slot_capacity,
+        )
         if existing is not None:
             host_name, meta, slot_index = existing
-            return host_name, region, meta.get("zone") or self._zones_for_region(region)[0], slot_index
+            return host_name, region, meta.get("zone") or self._zones_for_region(region)[0], slot_index, machine_type, runtime_class_family, int(meta.get("slot_capacity") or slot_capacity), {}
 
         zone = self._zones_for_region(region)[0]
         host_name = self._host_name(region)
-        instance = self._build_instance(host_name, lease, zone=zone, region=region)
+        insert_started_at = timezone.now().isoformat()
+        instance = self._build_instance(bot, host_name, lease, zone=zone, region=region)
         request_id = str(uuid.uuid4())
         logger.info("Provisioning GCP host %s region=%s zone=%s request_id=%s", host_name, region, zone, request_id)
         operation = self.instances_client.insert(project=self.project_id, zone=zone, instance_resource=instance)
         self._wait_for_operation(zone, operation.name)
-        self._register_host(host_name, region, zone, state="provisioning")
-        slot_index = self._acquire_host_slot(host_name, bot, lease)
+        instance_running_at = timezone.now().isoformat()
+        self._register_host(
+            host_name,
+            region,
+            zone,
+            machine_type=machine_type,
+            runtime_class_family=runtime_class_family,
+            slot_capacity=slot_capacity,
+            state="provisioning",
+        )
+        slot_index = self._acquire_host_slot(host_name, bot, lease, capacity=slot_capacity)
         if slot_index is None:
             raise GCPComputeEngineError(f"Unable to reserve slot on newly created host {host_name}")
-        return host_name, region, zone, slot_index
+        return host_name, region, zone, slot_index, machine_type, runtime_class_family, slot_capacity, {
+            "gcp_insert_started_at": insert_started_at,
+            "gcp_instance_running_at": instance_running_at,
+        }
 
     def get_or_create_lease(self, bot) -> BotRuntimeLease:
         region = bot.runtime_region(self._default_region())
@@ -490,7 +565,7 @@ class GCPComputeInstanceProvider:
             defaults={
                 "provider": BotRuntimeProviderTypes.GCP_COMPUTE_INSTANCE,
                 "region": region,
-                "size_class": self._host_machine_type(),
+                "size_class": self._host_machine_type(bot),
                 "snapshot_id": self._source_image(),
             },
         )
@@ -502,31 +577,36 @@ class GCPComputeInstanceProvider:
             logger.info("Bot %s already has GCP lease %s (%s), skipping duplicate provision", bot.object_id, lease.id, lease.provider_instance_id)
             return lease
 
-        host_name, region, zone, slot_index = self._select_or_create_host(bot, lease)
+        host_name, region, zone, slot_index, machine_type, runtime_class_family, slot_capacity, timing_updates = self._select_or_create_host(bot, lease)
         lease.provider = BotRuntimeProviderTypes.GCP_COMPUTE_INSTANCE
         lease.status = BotRuntimeLeaseStatuses.PROVISIONING
         lease.provider_instance_id = host_name
         lease.provider_name = host_name
         lease.region = region
-        lease.size_class = self._host_machine_type()
+        lease.size_class = machine_type
         lease.snapshot_id = self._source_image()
+        timings = {**((lease.metadata or {}).get("timings") or {}), "launch_requested_at": timezone.now().isoformat(), **timing_updates}
         lease.metadata = {
             "host": {
                 "name": host_name,
                 "zone": zone,
                 "region": region,
-                "machine_type": self._host_machine_type(),
-                "slot_capacity": gcp_vm_slot_capacity(),
+                "machine_type": machine_type,
+                "runtime_class_family": runtime_class_family,
+                "slot_capacity": slot_capacity,
             },
             "slot": {
                 "index": slot_index,
                 "weight": 1,
             },
             "container_name": runtime_container_name(bot.id, lease.id),
+            "timings": timings,
             "request": {
                 "project_id": self.project_id,
                 "region": region,
                 "zone": zone,
+                "machine_type": machine_type,
+                "runtime_class_family": runtime_class_family,
                 "private_only": self._private_only(),
             },
         }
@@ -633,7 +713,15 @@ class GCPComputeInstanceProvider:
             return lease
 
         lease.provider_name = instance.get("host_name") or lease.provider_name
-        lease.metadata = {**(lease.metadata or {}), "host": instance}
+        updated_metadata = lease.metadata or {}
+        updated_metadata["host"] = instance
+        timings = dict(updated_metadata.get("timings") or {})
+        heartbeat_key = instance.get("heartbeat_key") or runtime_agent_heartbeat_key(lease.provider_instance_id)
+        if redis_client().exists(heartbeat_key) and not timings.get("runtime_agent_heartbeat_seen_at"):
+            timings["runtime_agent_heartbeat_seen_at"] = timezone.now().isoformat()
+            self._update_host_record(lease.provider_instance_id, runtime_agent_heartbeat_seen_at=timings["runtime_agent_heartbeat_seen_at"])
+        updated_metadata["timings"] = timings
+        lease.metadata = updated_metadata
         slot_index = int(((lease.metadata or {}).get("slot") or {}).get("index") or 0)
         client = redis_client()
         client.setex(

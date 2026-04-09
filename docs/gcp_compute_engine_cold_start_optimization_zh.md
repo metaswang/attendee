@@ -106,7 +106,10 @@ golden image 中预装：
 startup script 只保留：
 
 - 写 `/etc/attendee/runtime.env`
-- restart runner service
+- `systemctl enable --now attendee-runtime-agent.service`
+- `systemctl restart attendee-runtime-agent.service`
+
+不再在 startup script 中在线下发 runner/agent 文件，也不再做源码包同步或 `git clone/fetch`。
 
 ### 方案 B：Artifact Registry 同区部署
 

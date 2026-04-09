@@ -4,6 +4,7 @@ from io import BytesIO
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 from types import SimpleNamespace
+import tomllib
 
 from django.test import Client, TestCase, override_settings
 
@@ -107,7 +108,7 @@ class TestGCPRuntime(TestCase):
             status=BotRuntimeLeaseStatuses.PROVISIONING,
         )
 
-        provider._build_instance(self.bot, lease, zone="asia-southeast1-b", region="asia-southeast1")
+        provider._build_instance(self.bot, "attendee-gcp-host-asia-southeast1-test", lease, zone="asia-southeast1-b", region="asia-southeast1")
 
         mock_compute_v1.AccessConfig.assert_not_called()
 
@@ -206,21 +207,40 @@ class TestGCPRuntime(TestCase):
         startup_script = provider._startup_script("attendee-gcp-host-asia-southeast1-test", lease, zone="asia-southeast1-b", region="asia-southeast1")
 
         self.assertIn("cat >/etc/attendee/runtime-agent.env <<'EOF_AGENT_ENV'", startup_script)
-        self.assertIn("cat >/usr/local/bin/attendee-runtime-agent <<'EOF_AGENT'", startup_script)
-        self.assertIn("cat >/etc/systemd/system/attendee-runtime-agent.service <<'EOF_AGENT_SERVICE'", startup_script)
-        self.assertIn("cat >/usr/local/bin/attendee-bot-runner <<'EOF_RUNNER'", startup_script)
-        self.assertIn("cat >/etc/systemd/system/attendee-bot-runner.service <<'EOF_SERVICE'", startup_script)
         self.assertIn("systemctl enable --now attendee-runtime-agent.service", startup_script)
         self.assertIn("systemctl restart attendee-runtime-agent.service", startup_script)
-        self.assertIn("sync_attendee_source_archive() {", startup_script)
-        self.assertIn("sync_attendee_repo() {", startup_script)
-        self.assertIn("log_startup() {", startup_script)
-        self.assertIn("curl -fsSL --retry 3 --connect-timeout 10 --max-time 180", startup_script)
-        self.assertIn("timeout 120 \"$git_bin\" -C \"$repo_dir\" fetch --all --tags", startup_script)
-        self.assertIn("if ! sync_attendee_source_archive; then", startup_script)
         self.assertIn("systemctl daemon-reload", startup_script)
         self.assertIn("MEETBOT_RUNTIME_HOST_NAME=attendee-gcp-host-asia-southeast1-test", startup_script)
         self.assertNotIn("export MEETBOT_RUNTIME_HOST_NAME", startup_script)
+        self.assertNotIn("sync_attendee_source_archive", startup_script)
+        self.assertNotIn("sync_attendee_repo", startup_script)
+        self.assertNotIn("attendee-bot-runner <<'EOF_RUNNER'", startup_script)
+
+    @patch.dict(
+        "os.environ",
+        {
+            "GCP_PROJECT_ID": "test-project",
+            "GCP_BOT_SOURCE_IMAGE_FAMILY": "attendee-bot-golden",
+            "GCP_BOT_ALLOW_RUNTIME_BOOTSTRAP": "true",
+        },
+        clear=False,
+    )
+    @patch("bots.runtime_providers.gcp_compute_engine.compute_v1")
+    def test_startup_script_can_fallback_to_runtime_bootstrap_when_enabled(self, mock_compute_v1):
+        mock_compute_v1.InstancesClient.return_value = MagicMock()
+        mock_compute_v1.ZoneOperationsClient.return_value = MagicMock()
+
+        provider = GCPComputeInstanceProvider()
+        lease = BotRuntimeLease.objects.create(
+            bot=self.bot,
+            provider=BotRuntimeProviderTypes.GCP_COMPUTE_INSTANCE,
+            status=BotRuntimeLeaseStatuses.PROVISIONING,
+        )
+
+        startup_script = provider._startup_script("attendee-gcp-host-asia-southeast1-test", lease, zone="asia-southeast1-b", region="asia-southeast1")
+
+        self.assertIn("cat >/usr/local/bin/attendee-runtime-agent <<'EOF_AGENT'", startup_script)
+        self.assertIn("sync_attendee_source_archive() {", startup_script)
 
     @patch.dict(
         "os.environ",
@@ -251,7 +271,7 @@ class TestGCPRuntime(TestCase):
             status=BotRuntimeLeaseStatuses.PROVISIONING,
         )
 
-        provider._build_instance(self.bot, lease, zone="asia-southeast1-b", region="asia-southeast1")
+        provider._build_instance(self.bot, "attendee-gcp-host-asia-southeast1-test", lease, zone="asia-southeast1-b", region="asia-southeast1")
 
         self.assertEqual(mock_images_client.get.call_args.kwargs["project"], "test-project")
         self.assertEqual(mock_images_client.get.call_args.kwargs["image"], "attendee-bot-image")
@@ -315,8 +335,32 @@ class TestGCPRuntime(TestCase):
         self.assertNotIn("DATABASE_URL", runtime_env)
         self.assertIn("BOT_RUNTIME_BOOTSTRAP_URL", runtime_env)
         self.assertIn("BOT_RUNTIME_CONTROL_URL", runtime_env)
-        self.assertIn("BOT_RUNTIME_SOURCE_ARCHIVE_URL", runtime_env)
         self.assertIn("DJANGO_SETTINGS_MODULE", runtime_env)
+
+    @patch.dict(
+        "os.environ",
+        {
+            "GCP_PROJECT_ID": "test-project",
+            "GCP_BOT_SOURCE_IMAGE_FAMILY": "attendee-bot-golden",
+            "BOT_RUNTIME_ALLOW_BOOTSTRAP": "true",
+        },
+        clear=False,
+    )
+    @patch("bots.runtime_providers.gcp_compute_engine.compute_v1")
+    def test_serialized_runtime_env_includes_source_archive_url_only_when_bootstrap_enabled(self, mock_compute_v1):
+        mock_compute_v1.InstancesClient.return_value = MagicMock()
+        mock_compute_v1.ZoneOperationsClient.return_value = MagicMock()
+
+        provider = GCPComputeInstanceProvider()
+        lease = BotRuntimeLease.objects.create(
+            bot=self.bot,
+            provider=BotRuntimeProviderTypes.GCP_COMPUTE_INSTANCE,
+            status=BotRuntimeLeaseStatuses.PROVISIONING,
+        )
+
+        runtime_env = provider._serialized_runtime_env(self.bot, lease)
+
+        self.assertIn("BOT_RUNTIME_SOURCE_ARCHIVE_URL", runtime_env)
 
     @patch.dict(
         "os.environ",
@@ -494,10 +538,7 @@ class TestGCPRuntime(TestCase):
             env["BOT_RUNTIME_CONTROL_URL"],
             f"https://api.voxstudio.me/internal/attendee-runtime-leases/{lease.id}/control",
         )
-        self.assertEqual(
-            env["BOT_RUNTIME_SOURCE_ARCHIVE_URL"],
-            f"https://api.voxstudio.me/internal/attendee-runtime-leases/{lease.id}/source-archive",
-        )
+        self.assertNotIn("BOT_RUNTIME_SOURCE_ARCHIVE_URL", env)
         self.assertEqual(
             env["LEASE_CALLBACK_URL"],
             f"https://api.voxstudio.me/internal/attendee-runtime-leases/{lease.id}/complete",
@@ -797,6 +838,9 @@ class TestGCPRuntime(TestCase):
         self.bot.refresh_from_db()
         self.assertIsNotNone(self.bot.first_heartbeat_timestamp)
         self.assertIsNotNone(self.bot.last_heartbeat_timestamp)
+        payload = response.json()
+        self.assertIsNotNone(payload["first_heartbeat_at"])
+        self.assertIsNotNone(payload["last_heartbeat_at"])
 
     def test_media_request_status_view_updates_state(self):
         lease = BotRuntimeLease.objects.create(
@@ -874,6 +918,92 @@ class TestRuntimeSettingsAndCapacity(TestCase):
     def setUp(self):
         self.organization = Organization.objects.create(name="Test Org")
         self.project = Project.objects.create(name="Test Project", organization=self.organization)
+
+    @patch.dict(
+        "os.environ",
+        {
+            "GCP_PROJECT_ID": "test-project",
+            "GCP_BOT_SOURCE_IMAGE": "projects/test-project/global/images/attendee-bot-image",
+            "BOT_RUNTIME_CLASS_AUDIO_ONLY_GCP_MACHINE_TYPE": "e2-standard-2",
+            "BOT_RUNTIME_CLASS_WEB_AV_STANDARD_GCP_MACHINE_TYPE": "e2-standard-4",
+            "MEETBOT_GCP_VM_SLOT_CAPACITY_BY_MACHINE_TYPE_JSON": '{"e2-standard-2":2,"e2-standard-4":1}',
+            "MEETBOT_GCP_VM_SLOT_CAPACITY_BY_RUNTIME_CLASS_FAMILY_JSON": '{"light":2,"web":1}',
+        },
+        clear=False,
+    )
+    @patch("bots.runtime_providers.gcp_compute_engine.compute_v1")
+    def test_existing_gcp_host_must_match_machine_type_and_runtime_family(self, mock_compute_v1):
+        mock_instances_client = MagicMock()
+        mock_compute_v1.InstancesClient.return_value = mock_instances_client
+        mock_compute_v1.ImagesClient.return_value = MagicMock()
+        mock_compute_v1.ZoneOperationsClient.return_value = MagicMock()
+        mock_instances_client.get.return_value = MagicMock()
+
+        audio_bot = Bot.objects.create(
+            project=self.project,
+            name="Audio Bot",
+            meeting_url="https://zoom.us/j/123456789",
+            settings={"recording_settings": {"format": "mp3"}},
+        )
+        web_bot = Bot.objects.create(
+            project=self.project,
+            name="Web Bot",
+            meeting_url="https://meet.google.com/abc-defg-hij",
+        )
+        provider = GCPComputeInstanceProvider()
+
+        provider._register_host(
+            "attendee-gcp-host-asia-southeast1-audio",
+            "asia-southeast1",
+            "asia-southeast1-b",
+            machine_type="e2-standard-2",
+            runtime_class_family="light",
+            slot_capacity=2,
+            state="active",
+        )
+
+        audio_lease = BotRuntimeLease.objects.create(bot=audio_bot, provider=BotRuntimeProviderTypes.GCP_COMPUTE_INSTANCE)
+        web_lease = BotRuntimeLease.objects.create(bot=web_bot, provider=BotRuntimeProviderTypes.GCP_COMPUTE_INSTANCE)
+
+        audio_existing = provider._select_existing_host(
+            "asia-southeast1",
+            audio_bot,
+            audio_lease,
+            machine_type="e2-standard-2",
+            runtime_class_family="light",
+            slot_capacity=2,
+        )
+        web_existing = provider._select_existing_host(
+            "asia-southeast1",
+            web_bot,
+            web_lease,
+            machine_type="e2-standard-4",
+            runtime_class_family="web",
+            slot_capacity=1,
+        )
+
+        self.assertIsNotNone(audio_existing)
+        self.assertIsNone(web_existing)
+
+    def test_pyproject_splits_control_and_dev_dependencies_out_of_runtime_base(self):
+        pyproject = tomllib.loads(Path("pyproject.toml").read_text())
+        runtime_deps = set(pyproject["project"]["dependencies"])
+        control_group = set(pyproject["dependency-groups"]["control"])
+        dev_group = set(pyproject["dependency-groups"]["dev"])
+
+        self.assertNotIn("stripe==11.6.0", runtime_deps)
+        self.assertNotIn("google-cloud-compute==1.32.0", runtime_deps)
+        self.assertNotIn("ruff==0.9.6", runtime_deps)
+        self.assertIn("stripe==11.6.0", control_group)
+        self.assertIn("google-cloud-compute==1.32.0", control_group)
+        self.assertIn("ruff==0.9.6", dev_group)
+
+    def test_bot_runtime_settings_profile_excludes_control_plane_apps(self):
+        module_source = Path("attendee/settings/base.py").read_text()
+        self.assertIn('ROOT_URLCONF = "attendee.runtime_urls" if IS_BOT_RUNTIME_SETTINGS else "attendee.urls"', module_source)
+        self.assertIn('SETTINGS_PROFILE = "bot_runtime" if django_settings_module == "attendee.settings.bot_runtime" else "control"', module_source)
+        self.assertIn('"allauth"', module_source)
+        self.assertIn('"drf_spectacular"', module_source)
 
     @patch.dict(
         "os.environ",

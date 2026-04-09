@@ -125,7 +125,7 @@ FROM base AS deps
 
 # Copy dependency files first to leverage Docker cache
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --python /usr/bin/python3.11 --no-install-project --no-install-package zoom-meeting-sdk \
+RUN uv sync --frozen --python /usr/bin/python3.11 --group control --no-dev --no-install-project --no-install-package zoom-meeting-sdk \
     && uv pip install --python /opt/venv/bin/python --no-cache-dir --only-binary zoom-meeting-sdk "zoom-meeting-sdk==0.0.27" \
     && uv pip uninstall --python /opt/venv/bin/python av || true \
     && uv pip install --python /opt/venv/bin/python --no-cache-dir --no-binary av "av==12.0.0"

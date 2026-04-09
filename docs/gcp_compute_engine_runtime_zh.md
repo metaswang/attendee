@@ -4,7 +4,8 @@
 
 ## 核心行为
 
-- 每个 bot 对应一台短生命周期 Compute Engine VM
+- 每个 bot 对应一个 runtime lease；控制面会优先复用同规格 GCP host 上的空闲 slot
+- GCP host 按 `machine_type` 与 `runtime_class_family` 分池，避免轻量 host 承载重 UI bot
 - VM 默认不配置 public IP
 - 出网依赖 `Cloud NAT`
 - 访问 Google API 依赖 `Private Google Access`

@@ -7,11 +7,16 @@ import os
 import shlex
 import subprocess
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 
 LOG = logging.getLogger("attendee.runtime_agent")
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _env(name: str, default: str | None = None) -> str:
@@ -94,6 +99,7 @@ def _spawn_runner(payload: dict[str, object]) -> None:
             "ATTENDEE_REPO_DIR": _env("ATTENDEE_REPO_DIR"),
             "ATTENDEE_CONTAINER_WORKDIR": os.getenv("ATTENDEE_CONTAINER_WORKDIR", "/attendee"),
             "BOT_RUNTIME_IMAGE": _env("BOT_RUNTIME_IMAGE"),
+            "BOT_RUNTIME_AGENT_HEARTBEAT_SEEN_AT": os.getenv("BOT_RUNTIME_AGENT_HEARTBEAT_SEEN_AT", _utc_now_iso()),
         }
     )
 
@@ -138,6 +144,7 @@ def main() -> int:
     LOG.info("runtime agent starting queue=%s heartbeat_key=%s", queue_key, heartbeat_key)
     while True:
         try:
+            os.environ.setdefault("BOT_RUNTIME_AGENT_HEARTBEAT_SEEN_AT", _utc_now_iso())
             _redis_cli("SETEX", heartbeat_key, str(heartbeat_ttl_seconds), str(int(time.time())))
         except Exception as exc:
             LOG.warning("failed to refresh heartbeat key: %s", exc)

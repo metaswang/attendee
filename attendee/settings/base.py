@@ -26,98 +26,123 @@ BASE_DIR = Path(__file__).resolve().parent.parent.parent
 # SECURITY WARNING: keep the secret key used in production secret!
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY")
 
+SETTINGS_PROFILE = os.getenv("ATTENDEE_SETTINGS_PROFILE")
+if not SETTINGS_PROFILE:
+    django_settings_module = os.getenv("DJANGO_SETTINGS_MODULE", "")
+    SETTINGS_PROFILE = "bot_runtime" if django_settings_module == "attendee.settings.bot_runtime" else "control"
+IS_BOT_RUNTIME_SETTINGS = SETTINGS_PROFILE == "bot_runtime"
+
 # Application definition
-INSTALLED_APPS = [
-    "django.contrib.admin",
-    "django.contrib.auth",
-    "django.contrib.contenttypes",
-    "django.contrib.sessions",
-    "django.contrib.messages",
-    "django.contrib.staticfiles",
-    "django.contrib.sites",
-    "allauth",
-    "allauth.account",
-    "allauth.socialaccount",
-    "accounts",
-    "bots",
-    "rest_framework",
-    "concurrency",
-    "allauth.socialaccount.providers.google",
-    "drf_spectacular",
-    "storages",
-    "django_extensions",
-]
+if IS_BOT_RUNTIME_SETTINGS:
+    INSTALLED_APPS = [
+        "django.contrib.auth",
+        "django.contrib.contenttypes",
+        "django.contrib.sessions",
+        "accounts",
+        "bots",
+        "concurrency",
+        "storages",
+    ]
+else:
+    INSTALLED_APPS = [
+        "django.contrib.admin",
+        "django.contrib.auth",
+        "django.contrib.contenttypes",
+        "django.contrib.sessions",
+        "django.contrib.messages",
+        "django.contrib.staticfiles",
+        "django.contrib.sites",
+        "allauth",
+        "allauth.account",
+        "allauth.socialaccount",
+        "accounts",
+        "bots",
+        "rest_framework",
+        "concurrency",
+        "allauth.socialaccount.providers.google",
+        "drf_spectacular",
+        "storages",
+        "django_extensions",
+    ]
 
 CREDENTIALS_ENCRYPTION_KEY = os.getenv("CREDENTIALS_ENCRYPTION_KEY")
 
 AUTH_USER_MODEL = "accounts.User"
 
-AUTHENTICATION_BACKENDS = [
-    "django.contrib.auth.backends.ModelBackend",
-    "allauth.account.auth_backends.AuthenticationBackend",
-]
+AUTHENTICATION_BACKENDS = ["django.contrib.auth.backends.ModelBackend"]
+if not IS_BOT_RUNTIME_SETTINGS:
+    AUTHENTICATION_BACKENDS.append("allauth.account.auth_backends.AuthenticationBackend")
 
 # Django allauth config
 SITE_ID = 1
-if os.getenv("DISABLE_SIGNUP") and os.getenv("DISABLE_SIGNUP") != "false":
-    ACCOUNT_ADAPTER = "accounts.adapters.NoNewUsersAccountAdapter"
-else:
-    ACCOUNT_ADAPTER = "accounts.adapters.StandardAccountAdapter"
-ACCOUNT_AUTHENTICATION_METHOD = "email"
-ACCOUNT_EMAIL_REQUIRED = True
-ACCOUNT_USERNAME_REQUIRED = False
-ACCOUNT_EMAIL_VERIFICATION = "mandatory"
-ACCOUNT_UNIQUE_EMAIL = True
-LOGIN_REDIRECT_URL = "/"
 EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
-ACCOUNT_CONFIRM_EMAIL_ON_GET = True
-ACCOUNT_LOGIN_ON_EMAIL_CONFIRMATION = True
-ACCOUNT_LOGIN_ON_PASSWORD_RESET = True
-ACCOUNT_USER_MODEL_USERNAME_FIELD = None
-SOCIALACCOUNT_QUERY_EMAIL = True
-SOCIALACCOUNT_ENABLED = True
-SOCIALACCOUNT_EMAIL_AUTHENTICATION = True
-SOCIALACCOUNT_LOGIN_ON_GET = False
-SOCIALACCOUNT_EMAIL_REQUIRED = True
+if not IS_BOT_RUNTIME_SETTINGS:
+    if os.getenv("DISABLE_SIGNUP") and os.getenv("DISABLE_SIGNUP") != "false":
+        ACCOUNT_ADAPTER = "accounts.adapters.NoNewUsersAccountAdapter"
+    else:
+        ACCOUNT_ADAPTER = "accounts.adapters.StandardAccountAdapter"
+    ACCOUNT_AUTHENTICATION_METHOD = "email"
+    ACCOUNT_EMAIL_REQUIRED = True
+    ACCOUNT_USERNAME_REQUIRED = False
+    ACCOUNT_EMAIL_VERIFICATION = "mandatory"
+    ACCOUNT_UNIQUE_EMAIL = True
+    LOGIN_REDIRECT_URL = "/"
+    ACCOUNT_CONFIRM_EMAIL_ON_GET = True
+    ACCOUNT_LOGIN_ON_EMAIL_CONFIRMATION = True
+    ACCOUNT_LOGIN_ON_PASSWORD_RESET = True
+    ACCOUNT_USER_MODEL_USERNAME_FIELD = None
+    SOCIALACCOUNT_QUERY_EMAIL = True
+    SOCIALACCOUNT_ENABLED = True
+    SOCIALACCOUNT_EMAIL_AUTHENTICATION = True
+    SOCIALACCOUNT_LOGIN_ON_GET = False
+    SOCIALACCOUNT_EMAIL_REQUIRED = True
 
 STATIC_ROOT = os.path.join(BASE_DIR, "staticfiles")
 STATIC_URL = "static/"
-STATICFILES_DIRS = [
-    os.path.join(BASE_DIR, "static"),
-]
+STATICFILES_DIRS = [os.path.join(BASE_DIR, "static")] if not IS_BOT_RUNTIME_SETTINGS else []
 
-MIDDLEWARE = [
-    "django.middleware.security.SecurityMiddleware",
-    "whitenoise.middleware.WhiteNoiseMiddleware",
-    "django.contrib.sessions.middleware.SessionMiddleware",
-    "django.middleware.common.CommonMiddleware",
-    "django.middleware.csrf.CsrfViewMiddleware",
-    "django.contrib.auth.middleware.AuthenticationMiddleware",
-    "django.contrib.messages.middleware.MessageMiddleware",
-    "django.middleware.clickjacking.XFrameOptionsMiddleware",
-    "allauth.account.middleware.AccountMiddleware",
-]
+if IS_BOT_RUNTIME_SETTINGS:
+    MIDDLEWARE = [
+        "django.contrib.sessions.middleware.SessionMiddleware",
+        "django.middleware.common.CommonMiddleware",
+        "django.contrib.auth.middleware.AuthenticationMiddleware",
+    ]
+else:
+    MIDDLEWARE = [
+        "django.middleware.security.SecurityMiddleware",
+        "whitenoise.middleware.WhiteNoiseMiddleware",
+        "django.contrib.sessions.middleware.SessionMiddleware",
+        "django.middleware.common.CommonMiddleware",
+        "django.middleware.csrf.CsrfViewMiddleware",
+        "django.contrib.auth.middleware.AuthenticationMiddleware",
+        "django.contrib.messages.middleware.MessageMiddleware",
+        "django.middleware.clickjacking.XFrameOptionsMiddleware",
+        "allauth.account.middleware.AccountMiddleware",
+    ]
 
-ROOT_URLCONF = "attendee.urls"
+ROOT_URLCONF = "attendee.runtime_urls" if IS_BOT_RUNTIME_SETTINGS else "attendee.urls"
 
-TEMPLATES = [
-    {
-        "BACKEND": "django.template.backends.django.DjangoTemplates",
-        "DIRS": [
-            os.path.join(BASE_DIR, "templates"),
-            os.path.join(BASE_DIR, "accounts", "templates"),
-        ],
-        "APP_DIRS": True,
-        "OPTIONS": {
-            "context_processors": [
-                "django.template.context_processors.debug",
-                "django.template.context_processors.request",
-                "django.contrib.auth.context_processors.auth",
-                "django.contrib.messages.context_processors.messages",
+if IS_BOT_RUNTIME_SETTINGS:
+    TEMPLATES = []
+else:
+    TEMPLATES = [
+        {
+            "BACKEND": "django.template.backends.django.DjangoTemplates",
+            "DIRS": [
+                os.path.join(BASE_DIR, "templates"),
+                os.path.join(BASE_DIR, "accounts", "templates"),
             ],
+            "APP_DIRS": True,
+            "OPTIONS": {
+                "context_processors": [
+                    "django.template.context_processors.debug",
+                    "django.template.context_processors.request",
+                    "django.contrib.auth.context_processors.auth",
+                    "django.contrib.messages.context_processors.messages",
+                ],
+            },
         },
-    },
-]
+    ]
 
 WSGI_APPLICATION = "attendee.wsgi.application"
 
@@ -170,7 +195,10 @@ elif os.getenv("REDIS_SSL_REQUIREMENTS"):
     redis_params["ssl_cert_reqs"] = os.getenv("REDIS_SSL_REQUIREMENTS")
 redis_params_query_string = "&".join([f"{key}={value}" for key, value in redis_params.items()])
 
-REDIS_URL_WITH_PARAMS = os.getenv("REDIS_URL") + ("?" + redis_params_query_string if redis_params_query_string else "")
+raw_redis_url = os.getenv("REDIS__URL") or os.getenv("REDIS_URL")
+if not raw_redis_url:
+    raise RuntimeError("REDIS__URL or REDIS_URL must be set")
+REDIS_URL_WITH_PARAMS = raw_redis_url + ("?" + redis_params_query_string if redis_params_query_string else "")
 
 CELERY_BROKER_URL = REDIS_URL_WITH_PARAMS
 CELERY_RESULT_BACKEND = REDIS_URL_WITH_PARAMS
@@ -212,28 +240,29 @@ if os.getenv("IS_A_BOT_POD", "false") == "true" and os.getenv("CONSERVE_BOT_POD_
     CELERY_TASK_IGNORE_RESULT = True
 
 REST_FRAMEWORK = {
-    # YOUR SETTINGS
-    "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
     "DEFAULT_THROTTLE_RATES": {
         "project_post": os.getenv("PROJECT_POST_THROTTLE_RATE", "3000/min"),
     },
 }
+if not IS_BOT_RUNTIME_SETTINGS:
+    REST_FRAMEWORK["DEFAULT_SCHEMA_CLASS"] = "drf_spectacular.openapi.AutoSchema"
 
 DISABLE_RATE_LIMITING = os.getenv("DISABLE_RATE_LIMITING", "false") == "true"
-SPECTACULAR_SETTINGS = {
-    "TITLE": "Attendee API",
-    "DESCRIPTION": "Meetings bots made easy",
-    "VERSION": "1.0.0",
-    "SERVE_INCLUDE_SCHEMA": False,
-    "COMPONENT_SPLIT_REQUEST": True,
-    "PARSER_WHITELIST": ["rest_framework.parsers.JSONParser"],
-    "TAGS": [
-        {"name": "Bots", "description": "Bot management endpoints"},
-    ],
-    "SERVERS": [
-        {"url": "https://app.attendee.dev", "description": "Production server"},
-    ],
-}
+if not IS_BOT_RUNTIME_SETTINGS:
+    SPECTACULAR_SETTINGS = {
+        "TITLE": "Attendee API",
+        "DESCRIPTION": "Meetings bots made easy",
+        "VERSION": "1.0.0",
+        "SERVE_INCLUDE_SCHEMA": False,
+        "COMPONENT_SPLIT_REQUEST": True,
+        "PARSER_WHITELIST": ["rest_framework.parsers.JSONParser"],
+        "TAGS": [
+            {"name": "Bots", "description": "Bot management endpoints"},
+        ],
+        "SERVERS": [
+            {"url": "https://app.attendee.dev", "description": "Production server"},
+        ],
+    }
 
 # publish with python manage.py spectacular --color --file docs/openapi.yml
 

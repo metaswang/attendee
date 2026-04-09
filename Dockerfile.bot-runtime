@@ -1,0 +1,191 @@
+FROM --platform=linux/amd64 ubuntu:22.04 AS build-base
+
+SHELL ["/bin/bash", "-c"]
+
+ENV project=attendee
+ENV cwd=/$project
+ENV UV_PYTHON_INSTALL_DIR="/opt/uv/python"
+ENV UV_PROJECT_ENVIRONMENT="/opt/venv"
+ENV PATH="/opt/venv/bin:/root/.local/bin:/usr/local/bin:$PATH"
+
+WORKDIR $cwd
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    cmake \
+    curl \
+    ffmpeg \
+    gfortran \
+    git \
+    gstreamer1.0-alsa \
+    gstreamer1.0-plugins-bad \
+    gstreamer1.0-plugins-base \
+    gstreamer1.0-plugins-good \
+    gstreamer1.0-plugins-ugly \
+    gstreamer1.0-tools \
+    libasound2 \
+    libasound2-plugins \
+    libcairo2-dev \
+    libdbus-1-3 \
+    libgbm1 \
+    libgirepository1.0-dev \
+    libgl1-mesa-dri \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    libglib2.0-dev \
+    libgstreamer-plugins-base1.0-dev \
+    libgstreamer1.0-dev \
+    libopencv-dev \
+    libpq-dev \
+    libssl-dev \
+    libvulkan1 \
+    libx11-dev \
+    libx11-xcb1 \
+    libxcb-image0 \
+    libxcb-keysyms1 \
+    libxcb-randr0 \
+    libxcb-shape0 \
+    libxcb-shm0 \
+    libxcb-xfixes0 \
+    libxcb-xtest0 \
+    libxfixes3 \
+    linux-libc-dev \
+    meson \
+    ninja-build \
+    pkgconf \
+    pulseaudio \
+    pulseaudio-utils \
+    python3-gi \
+    python3.11 \
+    python3.11-dev \
+    python3.11-venv \
+    unzip \
+    wget \
+    x11-xkb-utils \
+    xdg-utils \
+    xvfb \
+    xfonts-100dpi \
+    xfonts-75dpi \
+    xfonts-cyrillic \
+    xfonts-scalable \
+    gir1.2-gst-plugins-base-1.0 \
+    gir1.2-gstreamer-1.0 \
+    --fix-missing \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fL --retry 5 --retry-all-errors --connect-timeout 15 \
+    -o chrome-linux64.zip \
+    https://storage.googleapis.com/chrome-for-testing-public/134.0.6998.88/linux64/chrome-linux64.zip \
+    && unzip chrome-linux64.zip \
+    && mv chrome-linux64 /opt/chrome-linux64 \
+    && ln -sf /opt/chrome-linux64/chrome /usr/local/bin/google-chrome \
+    && ln -sf /opt/chrome-linux64/chrome /usr/local/bin/google-chrome-stable \
+    && rm -f chrome-linux64.zip
+
+RUN wget -q https://storage.googleapis.com/chrome-for-testing-public/134.0.6998.88/linux64/chromedriver-linux64.zip \
+    && unzip chromedriver-linux64.zip \
+    && mv chromedriver-linux64/chromedriver /usr/local/bin/chromedriver \
+    && chmod +x /usr/local/bin/chromedriver \
+    && rm -rf chromedriver-linux64 chromedriver-linux64.zip
+
+RUN update-ca-certificates \
+    && ln -sf /usr/bin/python3.11 /usr/bin/python
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
+    && mv /root/.local/bin/uv /usr/local/bin/uv
+
+FROM build-base AS deps
+
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --python /usr/bin/python3.11 --no-dev --no-install-project --no-install-package zoom-meeting-sdk \
+    && uv pip install --python /opt/venv/bin/python --no-cache-dir --only-binary zoom-meeting-sdk "zoom-meeting-sdk==0.0.27" \
+    && uv pip uninstall --python /opt/venv/bin/python av || true \
+    && uv pip install --python /opt/venv/bin/python --no-cache-dir --no-binary av "av==12.0.0"
+
+ENV TINI_VERSION=v0.19.0
+ADD https://github.com/krallin/tini/releases/download/${TINI_VERSION}/tini /tini
+RUN chmod +x /tini
+
+FROM --platform=linux/amd64 ubuntu:22.04 AS runtime
+
+SHELL ["/bin/bash", "-c"]
+
+ENV project=attendee
+ENV cwd=/$project
+ENV PATH="/opt/venv/bin:/usr/local/bin:$PATH"
+
+WORKDIR $cwd
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    ffmpeg \
+    fonts-liberation \
+    gstreamer1.0-alsa \
+    gstreamer1.0-plugins-bad \
+    gstreamer1.0-plugins-base \
+    gstreamer1.0-plugins-good \
+    gstreamer1.0-plugins-ugly \
+    gstreamer1.0-tools \
+    libasound2 \
+    libasound2-plugins \
+    libdbus-1-3 \
+    libgbm1 \
+    libgl1-mesa-dri \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    libgirepository-1.0-1 \
+    libpq5 \
+    libvulkan1 \
+    libx11-xcb1 \
+    libxcb-image0 \
+    libxcb-keysyms1 \
+    libxcb-randr0 \
+    libxcb-shape0 \
+    libxcb-shm0 \
+    libxcb-xfixes0 \
+    libxcb-xtest0 \
+    libxfixes3 \
+    pulseaudio \
+    pulseaudio-utils \
+    python3-gi \
+    python3.11 \
+    python3.11-venv \
+    x11-xkb-utils \
+    xdg-utils \
+    xvfb \
+    xfonts-100dpi \
+    xfonts-75dpi \
+    xfonts-cyrillic \
+    xfonts-scalable \
+    gir1.2-gst-plugins-base-1.0 \
+    gir1.2-gstreamer-1.0 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build-base /opt/chrome-linux64 /opt/chrome-linux64
+COPY --from=build-base /usr/local/bin/google-chrome /usr/local/bin/google-chrome
+COPY --from=build-base /usr/local/bin/google-chrome-stable /usr/local/bin/google-chrome-stable
+COPY --from=build-base /usr/local/bin/chromedriver /usr/local/bin/chromedriver
+COPY --from=deps /opt/venv /opt/venv
+COPY --from=deps /tini /tini
+
+RUN ln -sf /usr/bin/python3.11 /usr/bin/python \
+    && useradd -m -u 1000 -s /bin/bash app \
+    && mkdir -p /etc/opt/chrome/policies/managed \
+    && ln -s /tmp/attendee-chrome-policies.json /etc/opt/chrome/policies/managed/attendee-chrome-policies.json
+
+COPY --chown=app:app entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod 0755 /usr/local/bin/entrypoint.sh
+COPY --chown=app:app . .
+RUN mkdir -p "$cwd/staticfiles" && chown -R app:app "$cwd/staticfiles"
+
+USER app
+
+ENTRYPOINT ["/tini","--","/usr/local/bin/entrypoint.sh"]
+CMD ["bash"]

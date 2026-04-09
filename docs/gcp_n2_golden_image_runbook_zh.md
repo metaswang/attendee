@@ -54,7 +54,7 @@ sudo ATTENDEE_REPO_URL=https://github.com/<org>/<repo>.git \
 
 1. 安装 Docker、`cloud-init` 和基础工具
 2. 拉取或更新仓库到指定 ref
-3. 执行 `docker build --platform linux/amd64 -t $BOT_RUNTIME_IMAGE .`
+3. 执行 `docker build --platform linux/amd64 -f Dockerfile.bot-runtime -t $BOT_RUNTIME_IMAGE .`
 4. 执行 `docker pull $BOT_RUNTIME_IMAGE`
 5. 安装 `attendee-bot-runner` 和 systemd service
 6. 确保 `attendee-bot-runner.service` 处于 disabled 状态
@@ -94,9 +94,15 @@ GCP_BOT_SOURCE_IMAGE_PROJECT=<image-project>
 
 ## 当前仓库行为
 
-当前仓库中的 GCP provider 已按 golden image 模型收敛为最小 startup script：
+当前仓库中的 GCP provider 默认已按 golden image 模型收敛为最小 startup script：
 
 - 写 `/etc/attendee/runtime.env`
-- `systemctl restart attendee-bot-runner.service`
+- `systemctl enable --now attendee-runtime-agent.service`
+- `systemctl restart attendee-runtime-agent.service`
 
-这意味着 runner/service 必须已经包含在 source image 中。
+如需手工排障回退旧的 runtime bootstrap 逻辑，可显式打开：
+
+- `GCP_BOT_ALLOW_RUNTIME_BOOTSTRAP=true`
+- `BOT_RUNTIME_ALLOW_BOOTSTRAP=true`
+
+正常生产路径下应保持关闭。这意味着 runner/service 必须已经包含在 source image 中。

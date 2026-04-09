@@ -1,6 +1,8 @@
 import os
 import sys
 
+os.environ.setdefault("ATTENDEE_SETTINGS_PROFILE", "bot_runtime")
+
 from .base import *
 from .base import LOG_FORMATTERS
 

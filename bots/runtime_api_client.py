@@ -53,6 +53,8 @@ class BotRuntimeApiClient:
                     time.monotonic() - request_started_at,
                     response.status_code,
                 )
+                if url == self.bootstrap_url:
+                    os.environ.setdefault("BOT_RUNTIME_BOOTSTRAP_FETCHED_AT", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
                 return response.json()
             except requests.exceptions.RequestException as exc:
                 last_error = exc
@@ -116,7 +118,12 @@ class BotRuntimeApiClient:
         return self._post_json(f"{self.control_url.rsplit('/control', 1)[0]}/resource-snapshots", payload)
 
     def post_heartbeat(self) -> dict[str, Any]:
-        return self._post_json(f"{self.control_url.rsplit('/control', 1)[0]}/heartbeat", {})
+        payload = self._post_json(f"{self.control_url.rsplit('/control', 1)[0]}/heartbeat", {})
+        if payload.get("first_heartbeat_at"):
+            os.environ.setdefault("BOT_RUNTIME_FIRST_HEARTBEAT_AT", str(payload["first_heartbeat_at"]))
+        elif payload.get("first_heartbeat_timestamp") is not None:
+            os.environ.setdefault("BOT_RUNTIME_FIRST_HEARTBEAT_AT", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(payload["first_heartbeat_timestamp"]))))
+        return payload
 
     def post_media_request_status(self, request_id: int, payload: dict[str, Any]) -> dict[str, Any]:
         return self._post_json(f"{self.control_url.rsplit('/control', 1)[0]}/media-requests/{request_id}/status", payload)

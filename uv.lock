@@ -237,23 +237,17 @@ dependencies = [
     { name = "deepgram-sdk" },
     { name = "dj-database-url" },
     { name = "django" },
-    { name = "django-allauth" },
     { name = "django-concurrency" },
-    { name = "django-extensions" },
     { name = "django-storages" },
-    { name = "djangorestframework" },
     { name = "docker" },
-    { name = "drf-spectacular" },
     { name = "durationpy" },
     { name = "gdown" },
     { name = "google-api-core" },
     { name = "google-auth" },
-    { name = "google-cloud-compute" },
     { name = "google-cloud-texttospeech" },
     { name = "googleapis-common-protos" },
     { name = "grpcio" },
     { name = "grpcio-status" },
-    { name = "gunicorn" },
     { name = "h11" },
     { name = "idna" },
     { name = "inflection" },
@@ -263,8 +257,6 @@ dependencies = [
     { name = "jsonschema" },
     { name = "jsonschema-specifications" },
     { name = "kombu" },
-    { name = "kubernetes" },
-    { name = "modal" },
     { name = "msgpack" },
     { name = "numpy" },
     { name = "oauthlib" },
@@ -295,7 +287,6 @@ dependencies = [
     { name = "requests-oauthlib" },
     { name = "rpds-py" },
     { name = "rsa" },
-    { name = "ruff" },
     { name = "s3transfer" },
     { name = "selenium" },
     { name = "sentry-sdk", extra = ["celery", "django"] },
@@ -304,7 +295,6 @@ dependencies = [
     { name = "sniffio" },
     { name = "sortedcontainers" },
     { name = "sqlparse" },
-    { name = "stripe" },
     { name = "tldextract" },
     { name = "trio" },
     { name = "trio-websocket" },
@@ -321,6 +311,22 @@ dependencies = [
     { name = "whitenoise" },
     { name = "wsproto" },
     { name = "zoom-meeting-sdk", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+]
+
+[package.dev-dependencies]
+control = [
+    { name = "django-allauth" },
+    { name = "django-extensions" },
+    { name = "djangorestframework" },
+    { name = "drf-spectacular" },
+    { name = "google-cloud-compute" },
+    { name = "gunicorn" },
+    { name = "kubernetes" },
+    { name = "modal" },
+    { name = "stripe" },
+]
+dev = [
+    { name = "ruff" },
 ]
 
 [package.metadata]
@@ -347,23 +353,17 @@ requires-dist = [
     { name = "deepgram-sdk", specifier = "==4.3.0" },
     { name = "dj-database-url", specifier = "==2.3.0" },
     { name = "django", specifier = "==5.1.14" },
-    { name = "django-allauth", specifier = "==65.1.0" },
     { name = "django-concurrency", specifier = "==2.6.0" },
-    { name = "django-extensions", specifier = "==3.2.3" },
     { name = "django-storages", specifier = "==1.14.4" },
-    { name = "djangorestframework", specifier = "==3.15.2" },
     { name = "docker", specifier = "==7.1.0" },
-    { name = "drf-spectacular", specifier = "==0.27.2" },
     { name = "durationpy", specifier = "==0.9" },
     { name = "gdown" },
     { name = "google-api-core", specifier = "==2.24.1" },
     { name = "google-auth", specifier = "==2.38.0" },
-    { name = "google-cloud-compute", specifier = "==1.32.0" },
     { name = "google-cloud-texttospeech", specifier = "==2.24.0" },
     { name = "googleapis-common-protos", specifier = "==1.66.0" },
     { name = "grpcio", specifier = "==1.70.0" },
     { name = "grpcio-status", specifier = "==1.70.0" },
-    { name = "gunicorn", specifier = "==23.0.0" },
     { name = "h11", specifier = "==0.16.0" },
     { name = "idna", specifier = "==3.10" },
     { name = "inflection", specifier = "==0.5.1" },
@@ -373,8 +373,6 @@ requires-dist = [
     { name = "jsonschema", specifier = "==4.23.0" },
     { name = "jsonschema-specifications", specifier = "==2024.10.1" },
     { name = "kombu", specifier = "==5.4.2" },
-    { name = "kubernetes", specifier = "==32.0.0" },
-    { name = "modal", specifier = "==1.4.1.dev1" },
     { name = "msgpack", specifier = "==1.1.0" },
     { name = "numpy", specifier = "==2.1.3" },
     { name = "oauthlib", specifier = "==3.2.2" },
@@ -405,7 +403,6 @@ requires-dist = [
     { name = "requests-oauthlib", specifier = "==2.0.0" },
     { name = "rpds-py", specifier = "==0.21.0" },
     { name = "rsa", specifier = "==4.9" },
-    { name = "ruff", specifier = "==0.9.6" },
     { name = "s3transfer", specifier = "==0.10.3" },
     { name = "selenium", specifier = "==4.27.1" },
     { name = "sentry-sdk", extras = ["celery", "django"], specifier = ">=2.0.0" },
@@ -414,7 +411,6 @@ requires-dist = [
     { name = "sniffio", specifier = "==1.3.1" },
     { name = "sortedcontainers", specifier = "==2.4.0" },
     { name = "sqlparse", specifier = "==0.5.1" },
-    { name = "stripe", specifier = "==11.6.0" },
     { name = "tldextract", specifier = "==5.3.0" },
     { name = "trio", specifier = "==0.28.0" },
     { name = "trio-websocket", specifier = "==0.11.1" },
@@ -432,6 +428,20 @@ requires-dist = [
     { name = "wsproto", specifier = "==1.2.0" },
     { name = "zoom-meeting-sdk", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = "==0.0.27" },
 ]
+
+[package.metadata.requires-dev]
+control = [
+    { name = "django-allauth", specifier = "==65.1.0" },
+    { name = "django-extensions", specifier = "==3.2.3" },
+    { name = "djangorestframework", specifier = "==3.15.2" },
+    { name = "drf-spectacular", specifier = "==0.27.2" },
+    { name = "google-cloud-compute", specifier = "==1.32.0" },
+    { name = "gunicorn", specifier = "==23.0.0" },
+    { name = "kubernetes", specifier = "==32.0.0" },
+    { name = "modal", specifier = "==1.4.1.dev1" },
+    { name = "stripe", specifier = "==11.6.0" },
+]
+dev = [{ name = "ruff", specifier = "==0.9.6" }]
 
 [[package]]
 name = "attrs"

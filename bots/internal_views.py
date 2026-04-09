@@ -8,6 +8,7 @@ import os
 import subprocess
 import tarfile
 import time
+from datetime import datetime, timezone as datetime_timezone
 from io import BytesIO
 from pathlib import Path
 from textwrap import shorten
@@ -390,6 +391,27 @@ class BotRuntimeLeaseCompletionView(View):
         final_state = payload.get("final_state")
         reason = payload.get("reason")
         log_tail = (payload.get("log_tail") or "").strip()
+        timing_updates = {
+            key: str(payload[key])
+            for key in (
+                "bot_launch_requested_at",
+                "gcp_insert_started_at",
+                "gcp_instance_running_at",
+                "runtime_agent_heartbeat_seen_at",
+                "runner_started_at",
+                "container_start_at",
+                "container_finished_at",
+                "bootstrap_fetched_at",
+                "run_bot_entered_at",
+                "first_heartbeat_at",
+            )
+            if payload.get(key)
+        }
+        if timing_updates:
+            metadata = lease.metadata or {}
+            metadata["timings"] = {**(metadata.get("timings") or {}), **timing_updates}
+            lease.metadata = metadata
+            lease.save(update_fields=["metadata", "updated_at"])
         if exit_code not in (None, 0) or final_state == "failed":
             summary_parts = [f"exit_code={exit_code}", f"final_state={final_state}", f"reason={reason}"]
             if log_tail:
@@ -1022,10 +1044,14 @@ class BotRuntimeLeaseHeartbeatView(View):
 
         lease.bot.set_heartbeat()
         lease.mark_active()
+        first_heartbeat_at = datetime.fromtimestamp(lease.bot.first_heartbeat_timestamp, tz=datetime_timezone.utc).isoformat() if lease.bot.first_heartbeat_timestamp else None
+        last_heartbeat_at = datetime.fromtimestamp(lease.bot.last_heartbeat_timestamp, tz=datetime_timezone.utc).isoformat() if lease.bot.last_heartbeat_timestamp else None
         return JsonResponse(
             {
                 "first_heartbeat_timestamp": lease.bot.first_heartbeat_timestamp,
                 "last_heartbeat_timestamp": lease.bot.last_heartbeat_timestamp,
+                "first_heartbeat_at": first_heartbeat_at,
+                "last_heartbeat_at": last_heartbeat_at,
                 "lease_status": lease.status,
             },
             status=200,

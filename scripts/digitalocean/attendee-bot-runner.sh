@@ -17,6 +17,7 @@ BOT_MEMORY_LIMIT="${BOT_MEMORY_LIMIT:-${MEETBOT_BOT_MEMORY_LIMIT:-512m}}"
 BOT_MEMORY_RESERVATION="${BOT_MEMORY_RESERVATION:-${MEETBOT_BOT_MEMORY_RESERVATION:-512m}}"
 BOT_SHM_SIZE="${BOT_SHM_SIZE:-${MEETBOT_BOT_SHM_SIZE:-1g}}"
 BOT_RUNTIME_SOURCE_ARCHIVE_URL="${BOT_RUNTIME_SOURCE_ARCHIVE_URL:-}"
+BOT_RUNTIME_ALLOW_BOOTSTRAP="${BOT_RUNTIME_ALLOW_BOOTSTRAP:-false}"
 
 if [[ -f "$RUNTIME_ENV_PATH" ]]; then
   set -a
@@ -121,7 +122,9 @@ chmod 0644 "$CONTAINER_ENV_PATH"
 printf '%s runner_started_at=%s runner_started_at_ms=%s\n' "$(timestamp)" "$RUNNER_STARTED_AT" "$RUNNER_STARTED_AT_MS" >> "$RUNNER_STATE_PATH"
 
 if ! sync_attendee_source_archive; then
-  sync_attendee_repo || true
+  if [[ "$BOT_RUNTIME_ALLOW_BOOTSTRAP" == "true" ]]; then
+    sync_attendee_repo || true
+  fi
 fi
 
 set +e
@@ -183,6 +186,14 @@ if [[ -n "${LEASE_CALLBACK_URL:-}" && -n "${LEASE_SHUTDOWN_TOKEN:-}" ]]; then
     "${CONTAINER_FINISHED_AT}" \
     "${CONTAINER_FINISHED_AT_MS}" \
     "${BOT_LAUNCH_REQUESTED_AT:-}")"
+  CALLBACK_PAYLOAD="$(printf '%s' "$CALLBACK_PAYLOAD" | python3 -c 'import json,sys; payload=json.load(sys.stdin); payload.update({k:v for k,v in {
+    "gcp_insert_started_at": __import__("os").environ.get("BOT_RUNTIME_GCP_INSERT_STARTED_AT"),
+    "gcp_instance_running_at": __import__("os").environ.get("BOT_RUNTIME_GCP_INSTANCE_RUNNING_AT"),
+    "runtime_agent_heartbeat_seen_at": __import__("os").environ.get("BOT_RUNTIME_AGENT_HEARTBEAT_SEEN_AT"),
+    "bootstrap_fetched_at": __import__("os").environ.get("BOT_RUNTIME_BOOTSTRAP_FETCHED_AT"),
+    "run_bot_entered_at": __import__("os").environ.get("BOT_RUNTIME_RUN_BOT_ENTERED_AT"),
+    "first_heartbeat_at": __import__("os").environ.get("BOT_RUNTIME_FIRST_HEARTBEAT_AT"),
+  }.items() if v}); print(json.dumps(payload, separators=(\",\", \":\")))')"
   curl -fsS \
     -X POST \
     -H "Authorization: Bearer ${LEASE_SHUTDOWN_TOKEN}" \

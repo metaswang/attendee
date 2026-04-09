@@ -47,7 +47,12 @@ _redis_client = None
 def redis_client():
     global _redis_client
     if _redis_client is None:
-        _redis_client = redis.from_url(settings.REDIS_URL_WITH_PARAMS)
+        runtime_redis_url = (
+            os.getenv("BOT_RUNTIME_REDIS_URL", "").strip()
+            or os.getenv("REDIS__URL", "").strip()
+        )
+        redis_url = runtime_redis_url or settings.REDIS_URL_WITH_PARAMS
+        _redis_client = redis.from_url(redis_url)
     return _redis_client
 
 

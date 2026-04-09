@@ -1,6 +1,7 @@
 import logging
 import os
 import signal
+from datetime import datetime, timezone
 
 from celery import shared_task
 from celery.signals import worker_shutting_down
@@ -14,6 +15,7 @@ logger = logging.getLogger(__name__)
 @shared_task(bind=True, soft_time_limit=3600)
 def run_bot(self, bot_id=None, lease_id=None):
     logger.info("Running bot task bot_id=%s lease_id=%s", bot_id, lease_id)
+    os.environ.setdefault("BOT_RUNTIME_RUN_BOT_ENTERED_AT", datetime.now(timezone.utc).isoformat())
     runtime_api_client = BotRuntimeApiClient.from_environment()
     if lease_id is not None and runtime_api_client is not None:
         bootstrap = runtime_api_client.get_bootstrap()

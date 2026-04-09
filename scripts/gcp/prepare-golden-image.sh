@@ -11,6 +11,7 @@ RUNNER_SERVICE_SOURCE="${RUNNER_SERVICE_SOURCE:-scripts/digitalocean/attendee-bo
 BUILD_RUNTIME_IMAGE="${BUILD_RUNTIME_IMAGE:-true}"
 PULL_RUNTIME_IMAGE="${PULL_RUNTIME_IMAGE:-true}"
 DOCKER_PLATFORM="${DOCKER_PLATFORM:-linux/amd64}"
+BOT_RUNTIME_DOCKERFILE="${BOT_RUNTIME_DOCKERFILE:-Dockerfile.bot-runtime}"
 PYTHON_BIN="${PYTHON_BIN:-python3.11}"
 
 export DEBIAN_FRONTEND=noninteractive
@@ -38,7 +39,7 @@ else
 fi
 
 if [[ "$BUILD_RUNTIME_IMAGE" == "true" ]]; then
-  docker build --platform "$DOCKER_PLATFORM" -t "$BOT_RUNTIME_IMAGE" .
+  docker build --platform "$DOCKER_PLATFORM" -f "$BOT_RUNTIME_DOCKERFILE" -t "$BOT_RUNTIME_IMAGE" .
 fi
 
 if [[ "$PULL_RUNTIME_IMAGE" == "true" ]]; then
@@ -72,3 +73,4 @@ echo "Next steps:"
 echo "  1. Stop this VM."
 echo "  2. Create a custom image from this disk."
 echo "  3. Publish or update the image family backing GCP_BOT_SOURCE_IMAGE_FAMILY."
+echo "  4. Point BOT_RUNTIME_IMAGE at the pre-pulled runtime image digest baked into this image."
