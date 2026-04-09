@@ -71,6 +71,9 @@ def _runtime_env_path() -> Path:
 
 
 def _runner_script_path() -> Path:
+    baked = Path("/usr/local/bin/attendee-bot-runner")
+    if baked.exists():
+        return baked
     repo_dir = Path(_env("ATTENDEE_REPO_DIR"))
     return repo_dir / "scripts/digitalocean/attendee-bot-runner.sh"
 

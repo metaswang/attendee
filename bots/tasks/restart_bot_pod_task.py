@@ -9,7 +9,7 @@ from bots.models import Bot, BotEventTypes
 logger = logging.getLogger(__name__)
 from django.conf import settings
 
-from bots.bot_pod_creator import BotPodCreator
+from bots.bot_pod_creator.bot_pod_creator import BotPodCreator
 
 
 @shared_task(bind=True, soft_time_limit=3600)
