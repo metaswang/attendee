@@ -36,12 +36,6 @@ from .models import (
     WebhookSubscription,
     WebhookTriggerTypes,
 )
-from .serializers import (
-    CreateBotSerializer,
-    PatchBotSerializer,
-    PatchBotTranscriptionSettingsSerializer,
-    PatchBotVoiceAgentSettingsSerializer,
-)
 from .utils import transcription_provider_from_bot_creation_data
 
 logger = logging.getLogger(__name__)
@@ -251,6 +245,8 @@ class BotCreationSource(str, Enum):
 
 
 def create_bot(data: dict, source: BotCreationSource, project: Project) -> tuple[Bot | None, dict | None]:
+    from .serializers import CreateBotSerializer
+
     # Given them a small grace period before we start rejecting requests
     if project.organization.out_of_credits():
         logger.error(f"Organization {project.organization.id} has insufficient credits. Please add credits in the Account -> Billing page.")
@@ -389,6 +385,8 @@ def create_bot(data: dict, source: BotCreationSource, project: Project) -> tuple
 
 
 def patch_bot_voice_agent_settings(bot: Bot, data: dict) -> tuple[Bot | None, dict | None]:
+    from .serializers import PatchBotVoiceAgentSettingsSerializer
+
     # Check if bot is in a state that allows updating voice agent settings
     if not BotEventManager.is_state_that_can_update_voice_agent_settings(bot.state):
         return None, {"error": f"Bot is in state {BotStates.state_to_api_code(bot.state)} and cannot update voice agent settings"}
@@ -423,6 +421,8 @@ def patch_bot_voice_agent_settings(bot: Bot, data: dict) -> tuple[Bot | None, di
 
 
 def patch_bot_transcription_settings(bot: Bot, data: dict) -> tuple[Bot | None, dict | None]:
+    from .serializers import PatchBotTranscriptionSettingsSerializer
+
     # Check if bot is in a state that allows updating transcription settings
     if not BotEventManager.is_state_that_can_update_transcription_settings(bot.state):
         return None, {"error": f"Bot is in state {BotStates.state_to_api_code(bot.state)} and cannot update transcription settings"}
@@ -460,6 +460,8 @@ def patch_bot_transcription_settings(bot: Bot, data: dict) -> tuple[Bot | None, 
 
 
 def patch_bot(bot: Bot, data: dict) -> tuple[Bot | None, dict | None]:
+    from .serializers import PatchBotSerializer
+
     """
     Updates a scheduled bot with the provided data.
 

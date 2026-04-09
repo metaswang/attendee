@@ -7,15 +7,29 @@ from celery import Celery
 # Set the default Django settings module
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "attendee.settings")
 
+
+def _normalize_redis_ssl_requirements(value: str | None) -> str | None:
+    if not value:
+        return None
+    normalized = value.strip().lower()
+    alias_map = {
+        "cert_none": "none",
+        "cert_optional": "optional",
+        "cert_required": "required",
+    }
+    return alias_map.get(normalized, normalized)
+
+
 sslCertRequirements = None
 if os.getenv("DISABLE_REDIS_SSL"):
     sslCertRequirements = ssl.CERT_NONE
 elif os.getenv("REDIS_SSL_REQUIREMENTS"):
-    if os.getenv("REDIS_SSL_REQUIREMENTS") == "none":
+    redis_ssl_requirements = _normalize_redis_ssl_requirements(os.getenv("REDIS_SSL_REQUIREMENTS"))
+    if redis_ssl_requirements == "none":
         sslCertRequirements = ssl.CERT_NONE
-    elif os.getenv("REDIS_SSL_REQUIREMENTS") == "optional":
+    elif redis_ssl_requirements == "optional":
         sslCertRequirements = ssl.CERT_OPTIONAL
-    elif os.getenv("REDIS_SSL_REQUIREMENTS") == "required":
+    elif redis_ssl_requirements == "required":
         sslCertRequirements = ssl.CERT_REQUIRED
 
 # Create the Celery app

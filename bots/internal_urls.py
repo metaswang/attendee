@@ -4,90 +4,103 @@ from . import internal_views
 
 app_name = "bots_internal"
 
-urlpatterns = [
-    path(
-        "bot-runtime-leases/<int:lease_id>/complete",
+_LEASE_PATHS = [
+    (
+        "<int:lease_id>/complete",
         internal_views.BotRuntimeLeaseCompletionView.as_view(),
-        name="bot-runtime-lease-complete",
+        "bot-runtime-lease-complete",
     ),
-    path(
-        "bot-runtime-leases/<int:lease_id>/recording-complete",
+    (
+        "<int:lease_id>/recording-complete",
         internal_views.BotRuntimeLeaseRecordingCompleteView.as_view(),
-        name="bot-runtime-lease-recording-complete",
+        "bot-runtime-lease-recording-complete",
     ),
-    path(
-        "bot-runtime-leases/<int:lease_id>/bootstrap",
+    (
+        "<int:lease_id>/bootstrap",
         internal_views.BotRuntimeLeaseBootstrapView.as_view(),
-        name="bot-runtime-lease-bootstrap",
+        "bot-runtime-lease-bootstrap",
     ),
-    path(
-        "bot-runtime-leases/<int:lease_id>/control",
+    (
+        "<int:lease_id>/control",
         internal_views.BotRuntimeLeaseControlView.as_view(),
-        name="bot-runtime-lease-control",
+        "bot-runtime-lease-control",
     ),
-    path(
-        "bot-runtime-leases/<int:lease_id>/source-archive",
+    (
+        "<int:lease_id>/source-archive",
         internal_views.BotRuntimeLeaseSourceArchiveView.as_view(),
-        name="bot-runtime-lease-source-archive",
+        "bot-runtime-lease-source-archive",
     ),
-    path(
-        "bot-runtime-leases/<int:lease_id>/recordings/<int:recording_id>/file",
+    (
+        "<int:lease_id>/recordings/<int:recording_id>/file",
         internal_views.BotRuntimeLeaseRecordingFileView.as_view(),
-        name="bot-runtime-lease-recording-file",
+        "bot-runtime-lease-recording-file",
     ),
-    path(
-        "bot-runtime-leases/<int:lease_id>/bot-events",
+    (
+        "<int:lease_id>/bot-events",
         internal_views.BotRuntimeLeaseBotEventsView.as_view(),
-        name="bot-runtime-lease-bot-events",
+        "bot-runtime-lease-bot-events",
     ),
-    path(
-        "bot-runtime-leases/<int:lease_id>/participants/events",
+    (
+        "<int:lease_id>/participants/events",
         internal_views.BotRuntimeLeaseParticipantEventsView.as_view(),
-        name="bot-runtime-lease-participant-events",
+        "bot-runtime-lease-participant-events",
     ),
-    path(
-        "bot-runtime-leases/<int:lease_id>/chat-messages",
+    (
+        "<int:lease_id>/chat-messages",
         internal_views.BotRuntimeLeaseChatMessagesView.as_view(),
-        name="bot-runtime-lease-chat-messages",
+        "bot-runtime-lease-chat-messages",
     ),
-    path(
-        "bot-runtime-leases/<int:lease_id>/captions",
+    (
+        "<int:lease_id>/captions",
         internal_views.BotRuntimeLeaseCaptionsView.as_view(),
-        name="bot-runtime-lease-captions",
+        "bot-runtime-lease-captions",
     ),
-    path(
-        "bot-runtime-leases/<int:lease_id>/audio-chunks",
+    (
+        "<int:lease_id>/audio-chunks",
         internal_views.BotRuntimeLeaseAudioChunksView.as_view(),
-        name="bot-runtime-lease-audio-chunks",
+        "bot-runtime-lease-audio-chunks",
     ),
-    path(
-        "bot-runtime-leases/<int:lease_id>/bot-logs",
+    (
+        "<int:lease_id>/bot-logs",
         internal_views.BotRuntimeLeaseBotLogsView.as_view(),
-        name="bot-runtime-lease-bot-logs",
+        "bot-runtime-lease-bot-logs",
     ),
-    path(
-        "bot-runtime-leases/<int:lease_id>/resource-snapshots",
+    (
+        "<int:lease_id>/resource-snapshots",
         internal_views.BotRuntimeLeaseResourceSnapshotsView.as_view(),
-        name="bot-runtime-lease-resource-snapshots",
+        "bot-runtime-lease-resource-snapshots",
     ),
-    path(
-        "bot-runtime-leases/<int:lease_id>/heartbeat",
+    (
+        "<int:lease_id>/heartbeat",
         internal_views.BotRuntimeLeaseHeartbeatView.as_view(),
-        name="bot-runtime-lease-heartbeat",
+        "bot-runtime-lease-heartbeat",
     ),
-    path(
-        "bot-runtime-leases/<int:lease_id>/media-requests/<int:request_id>/status",
+    (
+        "<int:lease_id>/media-requests/<int:request_id>/status",
         internal_views.BotRuntimeLeaseMediaRequestStatusView.as_view(),
-        name="bot-runtime-lease-media-request-status",
+        "bot-runtime-lease-media-request-status",
     ),
-    path(
-        "bot-runtime-leases/<int:lease_id>/chat-message-requests/<int:request_id>/status",
+    (
+        "<int:lease_id>/chat-message-requests/<int:request_id>/status",
         internal_views.BotRuntimeLeaseChatMessageRequestStatusView.as_view(),
-        name="bot-runtime-lease-chat-message-request-status",
+        "bot-runtime-lease-chat-message-request-status",
     ),
-    path(
-        "bot-runtime-leases/<int:lease_id>/media-blobs/<str:object_id>",
+    (
+        "<int:lease_id>/media-blobs/<str:object_id>",
         internal_views.BotRuntimeLeaseMediaBlobView.as_view(),
-        name="bot-runtime-lease-media-blob",
+        "bot-runtime-lease-media-blob",
     ),
+]
+
+
+def _build_lease_paths(prefix: str, *, namespaced: bool) -> list:
+    return [
+        path(f"{prefix}/{suffix}", view, name=name if namespaced else None)
+        for suffix, view, name in _LEASE_PATHS
+    ]
+
+
+urlpatterns = [
+    *_build_lease_paths("bot-runtime-leases", namespaced=True),
+    *_build_lease_paths("attendee-runtime-leases", namespaced=False),
 ]
