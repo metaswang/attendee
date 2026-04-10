@@ -14,6 +14,44 @@
     };
   })();
 
+const teamsVideoProbeCanvas = document.createElement('canvas');
+teamsVideoProbeCanvas.width = 8;
+teamsVideoProbeCanvas.height = 8;
+const teamsVideoProbeCtx = teamsVideoProbeCanvas.getContext('2d', { willReadFrequently: true });
+
+function summarizeDrawablePixels(drawable, width, height) {
+    if (!teamsVideoProbeCtx || !width || !height) {
+        return null;
+    }
+
+    teamsVideoProbeCtx.clearRect(0, 0, teamsVideoProbeCanvas.width, teamsVideoProbeCanvas.height);
+    teamsVideoProbeCtx.drawImage(drawable, 0, 0, width, height, 0, 0, teamsVideoProbeCanvas.width, teamsVideoProbeCanvas.height);
+    const imageData = teamsVideoProbeCtx.getImageData(0, 0, teamsVideoProbeCanvas.width, teamsVideoProbeCanvas.height).data;
+
+    let totalLuma = 0;
+    let nonBlackPixels = 0;
+    let hash = 0;
+    for (let i = 0; i < imageData.length; i += 4) {
+        const r = imageData[i];
+        const g = imageData[i + 1];
+        const b = imageData[i + 2];
+        const a = imageData[i + 3];
+        const luma = Math.round(0.2126 * r + 0.7152 * g + 0.0722 * b);
+        totalLuma += luma;
+        if (luma > 16 || a > 16) {
+            nonBlackPixels += 1;
+        }
+        hash = ((hash * 131) + r * 3 + g * 5 + b * 7 + a * 11) >>> 0;
+    }
+
+    const pixelCount = imageData.length / 4;
+    return {
+        avg_luma: Math.round(totalLuma / pixelCount),
+        non_black_ratio: Number((nonBlackPixels / pixelCount).toFixed(3)),
+        hash: hash.toString(16),
+    };
+}
+
 class StyleManager {
     constructor() {
         this.audioContext = null;
@@ -205,7 +243,7 @@ class StyleManager {
         }, { once: true });
     }
 
-    getVideoTrackForRecording() {
+    getVideoTrackEntryForRecording() {
         const desiredStreamId = virtualStreamToPhysicalStreamMappingManager?.getVideoStreamIdToSend?.();
         const liveTracks = Array.from(this.videoTracks.values()).filter((item) => item.track?.readyState === 'live');
         if (!liveTracks.length) {
@@ -214,10 +252,71 @@ class StyleManager {
         if (desiredStreamId) {
             const desiredTrack = liveTracks.find((item) => item.streamId === desiredStreamId);
             if (desiredTrack) {
-                return desiredTrack.track;
+                return desiredTrack;
             }
         }
-        return liveTracks.sort((a, b) => b.firstSeenAt - a.firstSeenAt)[0].track;
+        return liveTracks.sort((a, b) => b.firstSeenAt - a.firstSeenAt)[0] || null;
+    }
+
+    getVideoTrackForRecording() {
+        return this.getVideoTrackEntryForRecording()?.track || null;
+    }
+
+    getRenderableElementForRecording() {
+        const centralElement = document.querySelector('[data-test-segment-type="central"]');
+        const scopes = centralElement ? [centralElement, document.body] : [document.body];
+        const candidates = [];
+
+        const isVisible = (element) => {
+            if (!element?.isConnected) {
+                return false;
+            }
+            const style = window.getComputedStyle(element);
+            if (!style || style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) {
+                return false;
+            }
+            const rect = element.getBoundingClientRect();
+            return rect.width >= 32 && rect.height >= 32;
+        };
+
+        for (const scope of scopes) {
+            for (const element of scope.querySelectorAll('video, canvas')) {
+                if (element === window.ws?.videoChunkCanvas || element === window.ws?.videoChunkSourceCanvas) {
+                    continue;
+                }
+                if (!isVisible(element)) {
+                    continue;
+                }
+                if (element.tagName === 'VIDEO' && !(element.videoWidth > 0 && element.videoHeight > 0)) {
+                    continue;
+                }
+                if (element.tagName === 'CANVAS' && !(element.width > 0 && element.height > 0)) {
+                    continue;
+                }
+                const rect = element.getBoundingClientRect();
+                candidates.push({
+                    element,
+                    area: rect.width * rect.height,
+                    inCentralPane: !!centralElement && centralElement.contains(element),
+                });
+            }
+            if (candidates.length) {
+                break;
+            }
+        }
+
+        if (!candidates.length) {
+            return null;
+        }
+
+        candidates.sort((a, b) => {
+            if (a.inCentralPane !== b.inCentralPane) {
+                return a.inCentralPane ? -1 : 1;
+            }
+            return b.area - a.area;
+        });
+
+        return candidates[0].element;
     }
 
     async processMixedAudioTrack() {
@@ -1229,10 +1328,24 @@ class WebSocketClient {
         this.videoChunkFlushInterval = null;
         this.videoChunkCanvas = null;
         this.videoChunkCanvasCtx = null;
-        this.videoChunkVideoElement = null;
+        this.videoChunkSourceCanvas = null;
+        this.videoChunkSourceCanvasCtx = null;
         this.videoChunkAnimationFrame = null;
+        this.videoChunkFrameReader = null;
+        this.videoChunkSourceGeneration = 0;
         this.videoChunkSourceTrackId = null;
+        this.videoChunkSourceStreamId = null;
         this.videoChunkSourceTrackClone = null;
+        this.videoChunkSourceTrackSettings = null;
+        this.videoChunkDomSourceElement = null;
+        this.videoChunkDomSourceKey = null;
+        this.videoChunkLastHealthyFrameAt = null;
+        this.videoChunkFirstFrameLoggedAt = null;
+        this.videoChunkLastFrameDimensionsKey = null;
+        this.videoChunkStallLogState = null;
+        this.videoChunkLastLoggedTrackInfo = null;
+        this.videoProbeInterval = null;
+        this.videoTrackProbePromises = new Map();
         /*
         We no longer need this because we're not using MediaStreamTrackProcessor's
         this.lastVideoFrameTime = performance.now();
@@ -1282,6 +1395,7 @@ class WebSocketClient {
         window.receiverManager.startPollingReceivers();
         window.styleManager.start();
         window.callManager.syncParticipants();
+        this.startVideoProbeLoop();
         if (window.initialData.sendEncodedVideoChunks) {
             await this.startVideoChunkRecording();
         }
@@ -1295,6 +1409,7 @@ class WebSocketClient {
     async disableMediaSending() {
         await this.stopVideoChunkRecording();
         await this.stopAudioChunkRecording();
+        this.stopVideoProbeLoop();
         window.styleManager.stop();
         //window.fullCaptureManager.stop();
         // Give the media recorder a bit of time to send the final data
@@ -1347,6 +1462,261 @@ class WebSocketClient {
         } catch (error) {
             console.error('Error sending WebSocket message:', error);
             console.error('Message data:', data);
+        }
+    }
+
+    startVideoProbeLoop() {
+        if (this.videoProbeInterval) {
+            return;
+        }
+
+        const runProbe = async () => {
+            try {
+                await this.runVideoProbe();
+            } catch (error) {
+                console.error('Video probe loop failed', error);
+            }
+        };
+
+        runProbe();
+        this.videoProbeInterval = setInterval(runProbe, 5000);
+    }
+
+    stopVideoProbeLoop() {
+        if (this.videoProbeInterval) {
+            clearInterval(this.videoProbeInterval);
+            this.videoProbeInterval = null;
+        }
+    }
+
+    async runVideoProbe() {
+        if (!this.mediaSendingEnabled) {
+            return;
+        }
+
+        this.sendJson({
+            type: 'VideoProbeHeartbeat',
+            at_ms: Date.now(),
+            track_count: window.styleManager?.videoTracks?.size || 0,
+        });
+
+        await Promise.allSettled([
+            this.probeReceiverStats(),
+            this.probeDomMediaElements(),
+        ]);
+
+        const liveTrackEntries = Array.from(window.styleManager?.videoTracks?.values?.() || []).filter((item) => item.track?.readyState === 'live');
+        for (const trackEntry of liveTrackEntries) {
+            if (this.videoTrackProbePromises.has(trackEntry.track.id)) {
+                continue;
+            }
+            const probePromise = this.probeVideoTrackEntry(trackEntry)
+                .catch((error) => {
+                    console.error('Video track probe failed', error);
+                })
+                .finally(() => {
+                    this.videoTrackProbePromises.delete(trackEntry.track.id);
+                });
+            this.videoTrackProbePromises.set(trackEntry.track.id, probePromise);
+        }
+    }
+
+    async probeReceiverStats() {
+        const peerConnections = Array.from(window.__attendeePeerConnections || []);
+        for (const peerConnection of peerConnections) {
+            const receivers = typeof peerConnection.getReceivers === 'function' ? peerConnection.getReceivers() : [];
+            for (const receiver of receivers) {
+                if (receiver.track?.kind !== 'video') {
+                    continue;
+                }
+                try {
+                    const stats = await receiver.getStats();
+                    const summary = {};
+                    stats.forEach((report) => {
+                        if (report.type === 'inbound-rtp' && !report.isRemote) {
+                            summary.inbound = {
+                                bytes_received: report.bytesReceived ?? null,
+                                frames_decoded: report.framesDecoded ?? null,
+                                frame_width: report.frameWidth ?? null,
+                                frame_height: report.frameHeight ?? null,
+                                decoder_implementation: report.decoderImplementation ?? null,
+                                key_frames_decoded: report.keyFramesDecoded ?? null,
+                            };
+                        }
+                        if (report.type === 'track') {
+                            summary.track = {
+                                frames_decoded: report.framesDecoded ?? null,
+                                frames_received: report.framesReceived ?? null,
+                                frame_width: report.frameWidth ?? null,
+                                frame_height: report.frameHeight ?? null,
+                            };
+                        }
+                    });
+                    this.sendJson({
+                        type: 'VideoProbeReceiverStats',
+                        track_id: receiver.track?.id || null,
+                        ready_state: receiver.track?.readyState || null,
+                        stream_ids: receiver.track ? Array.from(window.styleManager?.videoTracks?.values?.() || []).filter((item) => item.track?.id === receiver.track.id).map((item) => item.streamId) : [],
+                        stats: summary,
+                    });
+                } catch (error) {
+                    this.sendJson({
+                        type: 'VideoProbeReceiverStatsError',
+                        track_id: receiver.track?.id || null,
+                        message: error?.message || String(error),
+                    });
+                }
+            }
+        }
+    }
+
+    async probeDomMediaElements() {
+        const centralElement = document.querySelector('[data-test-segment-type="central"]');
+        const elements = Array.from(document.querySelectorAll('video, canvas')).filter((element) => (
+            element !== this.videoChunkCanvas &&
+            element !== this.videoChunkSourceCanvas &&
+            element.isConnected
+        ));
+
+        const summaries = [];
+        for (const element of elements.slice(0, 20)) {
+            const rect = element.getBoundingClientRect();
+            if (rect.width < 16 || rect.height < 16) {
+                continue;
+            }
+            const isVideo = element.tagName === 'VIDEO';
+            const width = isVideo ? element.videoWidth : element.width;
+            const height = isVideo ? element.videoHeight : element.height;
+            const pixelSummary = width > 0 && height > 0 ? summarizeDrawablePixels(element, width, height) : null;
+            summaries.push({
+                tag_name: element.tagName,
+                id: element.id || null,
+                class_name: element.className || null,
+                rect: {
+                    width: Math.round(rect.width),
+                    height: Math.round(rect.height),
+                },
+                media_size: {
+                    width: width || null,
+                    height: height || null,
+                },
+                ready_state: isVideo ? element.readyState : null,
+                in_central_pane: !!centralElement && centralElement.contains(element),
+                pixels: pixelSummary,
+            });
+        }
+
+        this.sendJson({
+            type: 'VideoProbeDomMedia',
+            total_candidates: summaries.length,
+            media_elements: summaries,
+        });
+    }
+
+    async probeVideoTrackEntry(trackEntry) {
+        const track = trackEntry?.track;
+        if (!track || track.readyState !== 'live') {
+            return;
+        }
+
+        const processorSummary = await this.probeVideoTrackViaProcessor(trackEntry);
+        const hiddenVideoSummary = await this.probeVideoTrackViaHiddenVideo(trackEntry);
+        this.sendJson({
+            type: 'VideoProbeTrackSummary',
+            track_id: track.id,
+            stream_id: trackEntry.streamId || null,
+            processor: processorSummary,
+            hidden_video: hiddenVideoSummary,
+        });
+    }
+
+    async probeVideoTrackViaProcessor(trackEntry) {
+        const clone = trackEntry.track.clone();
+        let reader = null;
+        try {
+            const processor = new MediaStreamTrackProcessor({ track: clone });
+            reader = processor.readable.getReader();
+            const frames = [];
+            const deadline = Date.now() + 4000;
+            while (frames.length < 5 && Date.now() < deadline) {
+                const readResult = await Promise.race([
+                    reader.read(),
+                    new Promise((resolve) => setTimeout(() => resolve({ timeout: true }), 700)),
+                ]);
+                if (readResult?.timeout) {
+                    continue;
+                }
+                const { value: frame, done } = readResult;
+                if (done) {
+                    break;
+                }
+                if (!frame) {
+                    continue;
+                }
+                try {
+                    const width = frame.displayWidth || frame.codedWidth || 0;
+                    const height = frame.displayHeight || frame.codedHeight || 0;
+                    frames.push({
+                        width,
+                        height,
+                        timestamp: frame.timestamp ?? null,
+                        pixels: width > 0 && height > 0 ? summarizeDrawablePixels(frame, width, height) : null,
+                    });
+                } finally {
+                    frame.close();
+                }
+            }
+            return {
+                frame_count: frames.length,
+                frames,
+            };
+        } catch (error) {
+            return {
+                error: error?.message || String(error),
+            };
+        } finally {
+            if (reader) {
+                try {
+                    await reader.cancel();
+                } catch (_) {}
+                try {
+                    reader.releaseLock();
+                } catch (_) {}
+            }
+            try {
+                clone.stop();
+            } catch (_) {}
+        }
+    }
+
+    async probeVideoTrackViaHiddenVideo(trackEntry) {
+        const clone = trackEntry.track.clone();
+        const video = document.createElement('video');
+        video.autoplay = true;
+        video.muted = true;
+        video.playsInline = true;
+        video.srcObject = new MediaStream([clone]);
+        try {
+            await video.play();
+            await new Promise((resolve) => setTimeout(resolve, 500));
+            const width = video.videoWidth || 0;
+            const height = video.videoHeight || 0;
+            return {
+                ready_state: video.readyState,
+                width,
+                height,
+                pixels: width > 0 && height > 0 ? summarizeDrawablePixels(video, width, height) : null,
+            };
+        } catch (error) {
+            return {
+                error: error?.message || String(error),
+                ready_state: video.readyState,
+            };
+        } finally {
+            video.srcObject = null;
+            try {
+                clone.stop();
+            } catch (_) {}
         }
     }
   
@@ -1406,11 +1776,11 @@ class WebSocketClient {
             this.videoChunkCanvas.height = window.initialData.videoFrameHeight || 720;
             this.videoChunkCanvasCtx = this.videoChunkCanvas.getContext('2d');
         }
-        if (!this.videoChunkVideoElement) {
-            this.videoChunkVideoElement = document.createElement('video');
-            this.videoChunkVideoElement.autoplay = true;
-            this.videoChunkVideoElement.muted = true;
-            this.videoChunkVideoElement.playsInline = true;
+        if (!this.videoChunkSourceCanvas) {
+            this.videoChunkSourceCanvas = document.createElement('canvas');
+            this.videoChunkSourceCanvas.width = this.videoChunkCanvas.width;
+            this.videoChunkSourceCanvas.height = this.videoChunkCanvas.height;
+            this.videoChunkSourceCanvasCtx = this.videoChunkSourceCanvas.getContext('2d');
         }
     }
 
@@ -1422,6 +1792,15 @@ class WebSocketClient {
     }
 
     cleanupVideoChunkSourceTrack() {
+        this.videoChunkSourceGeneration = (this.videoChunkSourceGeneration || 0) + 1;
+        if (this.videoChunkFrameReader) {
+            try {
+                this.videoChunkFrameReader.cancel().catch(() => {});
+            } catch (error) {
+                console.warn('Video chunk frame reader cleanup failed', error);
+            }
+            this.videoChunkFrameReader = null;
+        }
         if (this.videoChunkSourceTrackClone) {
             try {
                 this.videoChunkSourceTrackClone.stop();
@@ -1431,28 +1810,229 @@ class WebSocketClient {
             this.videoChunkSourceTrackClone = null;
         }
         this.videoChunkSourceTrackId = null;
-        if (this.videoChunkVideoElement) {
-            this.videoChunkVideoElement.srcObject = null;
+        this.videoChunkSourceStreamId = null;
+        this.videoChunkSourceTrackSettings = null;
+    }
+
+    cleanupVideoChunkDomSourceElement() {
+        this.videoChunkDomSourceElement = null;
+        this.videoChunkDomSourceKey = null;
+    }
+
+    cleanupVideoChunkSource() {
+        this.cleanupVideoChunkDomSourceElement();
+        this.cleanupVideoChunkSourceTrack();
+    }
+
+    trackVideoChunkHealthyFrame(width, height) {
+        const now = performance.now();
+        this.videoChunkLastHealthyFrameAt = now;
+        const dimensionsKey = `${width}x${height}`;
+        if (!this.videoChunkFirstFrameLoggedAt) {
+            this.videoChunkFirstFrameLoggedAt = now;
+            console.log(
+                'Video chunk source received first frame',
+                JSON.stringify({
+                    source_type: this.videoChunkDomSourceElement ? 'dom_element' : 'track_processor',
+                    track_id: this.videoChunkSourceTrackId,
+                    stream_id: this.videoChunkSourceStreamId,
+                    dom_source_key: this.videoChunkDomSourceKey,
+                    width: width,
+                    height: height,
+                }),
+            );
+        } else if (this.videoChunkLastFrameDimensionsKey !== dimensionsKey) {
+            console.log(
+                'Video chunk source frame dimensions changed',
+                JSON.stringify({
+                    source_type: this.videoChunkDomSourceElement ? 'dom_element' : 'track_processor',
+                    track_id: this.videoChunkSourceTrackId,
+                    stream_id: this.videoChunkSourceStreamId,
+                    dom_source_key: this.videoChunkDomSourceKey,
+                    width: width,
+                    height: height,
+                }),
+            );
         }
+        this.videoChunkLastFrameDimensionsKey = dimensionsKey;
+        if (this.videoChunkStallLogState !== 'healthy') {
+            console.log(
+                'Video chunk source is healthy',
+                JSON.stringify({
+                    source_type: this.videoChunkDomSourceElement ? 'dom_element' : 'track_processor',
+                    track_id: this.videoChunkSourceTrackId,
+                    stream_id: this.videoChunkSourceStreamId,
+                    dom_source_key: this.videoChunkDomSourceKey,
+                    width: width,
+                    height: height,
+                }),
+            );
+            this.videoChunkStallLogState = 'healthy';
+        }
+    }
+
+    async startVideoChunkSourcePump(trackEntry) {
+        if (!trackEntry?.track || trackEntry.track.readyState !== 'live') {
+            return;
+        }
+
+        this.cleanupVideoChunkSource();
+        this.ensureVideoChunkCanvas();
+
+        const sourceTrack = trackEntry.track;
+        const sourceStreamId = trackEntry.streamId || null;
+        const sourceTrackClone = sourceTrack.clone();
+        const sourceGeneration = (this.videoChunkSourceGeneration || 0) + 1;
+        this.videoChunkSourceGeneration = sourceGeneration;
+        this.videoChunkSourceTrackClone = sourceTrackClone;
+        this.videoChunkSourceTrackId = sourceTrack.id;
+        this.videoChunkSourceStreamId = sourceStreamId;
+        this.videoChunkSourceTrackSettings = typeof sourceTrack.getSettings === 'function' ? sourceTrack.getSettings() : null;
+        this.videoChunkLastHealthyFrameAt = null;
+        this.videoChunkLastFrameDimensionsKey = null;
+        this.videoChunkStallLogState = null;
+
+        console.log(
+            'Video chunk source selected',
+            JSON.stringify({
+                track_id: this.videoChunkSourceTrackId,
+                stream_id: this.videoChunkSourceStreamId,
+                kind: sourceTrack.kind,
+                ready_state: sourceTrack.readyState,
+                settings: this.videoChunkSourceTrackSettings,
+            }),
+        );
+
+        let processor;
+        try {
+            processor = new MediaStreamTrackProcessor({ track: sourceTrackClone });
+        } catch (error) {
+            console.error('Video chunk source processor setup failed', error);
+            return;
+        }
+
+        const reader = processor.readable.getReader();
+        this.videoChunkFrameReader = reader;
+
+        try {
+            while (this.videoChunkSourceGeneration === sourceGeneration) {
+                const { value: frame, done } = await reader.read();
+                if (done) {
+                    break;
+                }
+                if (!frame) {
+                    continue;
+                }
+
+                try {
+                    const width = frame.displayWidth || frame.codedWidth || 0;
+                    const height = frame.displayHeight || frame.codedHeight || 0;
+                    if (!width || !height) {
+                        continue;
+                    }
+
+                    const sourceCanvas = this.videoChunkSourceCanvas;
+                    const sourceCtx = this.videoChunkSourceCanvasCtx;
+                    if (!sourceCanvas || !sourceCtx) {
+                        continue;
+                    }
+
+                    if (sourceCanvas.width !== width || sourceCanvas.height !== height) {
+                        sourceCanvas.width = width;
+                        sourceCanvas.height = height;
+                    }
+
+                    sourceCtx.drawImage(frame, 0, 0, width, height);
+                    this.trackVideoChunkHealthyFrame(width, height);
+                } catch (error) {
+                    console.error('Video chunk frame pump failed to render frame', error);
+                } finally {
+                    frame.close();
+                }
+            }
+        } catch (error) {
+            if (this.videoChunkSourceGeneration === sourceGeneration) {
+                console.error(
+                    'Video chunk source pump failed',
+                    JSON.stringify({
+                        track_id: this.videoChunkSourceTrackId,
+                        stream_id: this.videoChunkSourceStreamId,
+                        message: error?.message || String(error),
+                    }),
+                );
+            }
+        } finally {
+            if (this.videoChunkFrameReader === reader) {
+                this.videoChunkFrameReader = null;
+            }
+            try {
+                reader.releaseLock();
+            } catch (error) {
+                console.warn('Video chunk frame reader release failed', error);
+            }
+        }
+    }
+
+    syncVideoChunkDomSourceElement() {
+        const nextElement = window.styleManager?.getRenderableElementForRecording?.();
+        if (!nextElement) {
+            if (this.videoChunkLastLoggedTrackInfo !== 'missing_dom_element') {
+                console.warn('Video chunk recording has no renderable central media element');
+                this.videoChunkLastLoggedTrackInfo = 'missing_dom_element';
+            }
+            this.cleanupVideoChunkDomSourceElement();
+            return false;
+        }
+
+        const nextKey = [
+            nextElement.tagName,
+            nextElement.id || '',
+            nextElement.className || '',
+            nextElement.srcObject?.id || '',
+            nextElement.currentSrc || '',
+        ].join('|');
+
+        if (this.videoChunkDomSourceElement === nextElement && this.videoChunkDomSourceKey === nextKey) {
+            return true;
+        }
+
+        this.cleanupVideoChunkSource();
+        this.videoChunkDomSourceElement = nextElement;
+        this.videoChunkDomSourceKey = nextKey;
+        this.videoChunkLastLoggedTrackInfo = nextKey;
+        this.videoChunkSourceTrackSettings = null;
+        console.log(
+            'Video chunk DOM source selected',
+            JSON.stringify({
+                dom_source_key: this.videoChunkDomSourceKey,
+                tag_name: nextElement.tagName,
+                class_name: nextElement.className || null,
+                id: nextElement.id || null,
+            }),
+        );
+        return true;
     }
 
     syncVideoChunkSourceTrack() {
         this.ensureVideoChunkCanvas();
-        const nextTrack = window.styleManager?.getVideoTrackForRecording?.();
-        if (!nextTrack || nextTrack.readyState !== 'live') {
-            this.cleanupVideoChunkSourceTrack();
+        if (this.syncVideoChunkDomSourceElement()) {
             return;
         }
-        if (this.videoChunkSourceTrackId === nextTrack.id) {
+        const nextTrackEntry = window.styleManager?.getVideoTrackEntryForRecording?.();
+        if (!nextTrackEntry?.track || nextTrackEntry.track.readyState !== 'live') {
+            if (this.videoChunkLastLoggedTrackInfo !== 'missing_track') {
+                console.warn('Video chunk recording has no live source track');
+                this.videoChunkLastLoggedTrackInfo = 'missing_track';
+            }
+            this.cleanupVideoChunkSource();
             return;
         }
-        this.cleanupVideoChunkSourceTrack();
-        this.videoChunkSourceTrackClone = nextTrack.clone();
-        this.videoChunkSourceTrackId = nextTrack.id;
-        console.log('Video chunk recording attached live video track', this.videoChunkSourceTrackId);
-        this.videoChunkVideoElement.srcObject = new MediaStream([this.videoChunkSourceTrackClone]);
-        this.videoChunkVideoElement.play().catch((error) => {
-            console.warn('Video chunk preview play failed', error);
+        if (this.videoChunkSourceTrackId === nextTrackEntry.track.id) {
+            return;
+        }
+        this.videoChunkLastLoggedTrackInfo = nextTrackEntry.track.id;
+        this.startVideoChunkSourcePump(nextTrackEntry).catch((error) => {
+            console.error('Video chunk source pump start failed', error);
         });
     }
 
@@ -1465,18 +2045,64 @@ class WebSocketClient {
         this.syncVideoChunkSourceTrack();
         const ctx = this.videoChunkCanvasCtx;
         const canvas = this.videoChunkCanvas;
-        const video = this.videoChunkVideoElement;
         if (!ctx || !canvas) {
             return;
         }
 
-        if (video && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth && video.videoHeight) {
-            if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
-                canvas.width = video.videoWidth;
-                canvas.height = video.videoHeight;
+        const domSource = this.videoChunkDomSourceElement;
+        if (domSource?.isConnected) {
+            const isVideo = domSource.tagName === 'VIDEO';
+            const sourceWidth = isVideo ? domSource.videoWidth : domSource.width;
+            const sourceHeight = isVideo ? domSource.videoHeight : domSource.height;
+            const isRenderable = isVideo
+                ? domSource.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && sourceWidth > 0 && sourceHeight > 0
+                : sourceWidth > 0 && sourceHeight > 0;
+            if (isRenderable) {
+                if (canvas.width !== sourceWidth || canvas.height !== sourceHeight) {
+                    canvas.width = sourceWidth;
+                    canvas.height = sourceHeight;
+                }
+                ctx.drawImage(domSource, 0, 0, canvas.width, canvas.height);
+                this.trackVideoChunkHealthyFrame(sourceWidth, sourceHeight);
+                this.videoChunkAnimationFrame = requestAnimationFrame(this.drawVideoChunkFrame);
+                return;
             }
-            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        }
+
+        const sourceCanvas = this.videoChunkSourceCanvas;
+        const lastHealthyFrameAgeMs = this.videoChunkLastHealthyFrameAt == null
+            ? Number.POSITIVE_INFINITY
+            : performance.now() - this.videoChunkLastHealthyFrameAt;
+        if (sourceCanvas && this.videoChunkLastHealthyFrameAt != null && lastHealthyFrameAgeMs < 3000) {
+            if (canvas.width !== sourceCanvas.width || canvas.height !== sourceCanvas.height) {
+                canvas.width = sourceCanvas.width;
+                canvas.height = sourceCanvas.height;
+            }
+            ctx.drawImage(sourceCanvas, 0, 0, canvas.width, canvas.height);
+            if (this.videoChunkStallLogState && this.videoChunkStallLogState !== 'healthy') {
+                console.log(
+                    'Video chunk recording recovered from stalled frames',
+                    JSON.stringify({
+                        track_id: this.videoChunkSourceTrackId,
+                        stream_id: this.videoChunkSourceStreamId,
+                        last_healthy_frame_age_ms: Math.round(lastHealthyFrameAgeMs),
+                    }),
+                );
+                this.videoChunkStallLogState = 'healthy';
+            }
         } else {
+            if (this.videoChunkStallLogState !== 'stalled') {
+                console.warn(
+                    'Video chunk recording has no recent renderable frames; drawing black frame',
+                    JSON.stringify({
+                        track_id: this.videoChunkSourceTrackId,
+                        stream_id: this.videoChunkSourceStreamId,
+                        last_healthy_frame_age_ms: Number.isFinite(lastHealthyFrameAgeMs) ? Math.round(lastHealthyFrameAgeMs) : null,
+                        track_settings: this.videoChunkSourceTrackSettings,
+                    }),
+                );
+                this.videoChunkStallLogState = 'stalled';
+            }
             ctx.fillStyle = 'black';
             ctx.fillRect(0, 0, canvas.width, canvas.height);
         }
@@ -1495,9 +2121,12 @@ class WebSocketClient {
 
         this.ensureVideoChunkCanvas();
         this.syncVideoChunkSourceTrack();
-        if (!this.videoChunkSourceTrackClone) {
-            console.warn('No meeting video track available for video chunk recording yet; starting canvas recorder with black frames');
+        if (!this.videoChunkDomSourceElement && !this.videoChunkSourceTrackClone) {
+            console.warn('No meeting video source available for video chunk recording yet; starting canvas recorder with black frames');
         }
+        this.videoChunkFirstFrameLoggedAt = null;
+        this.videoChunkLastFrameDimensionsKey = null;
+        this.videoChunkStallLogState = null;
 
         const recorderStream = this.videoChunkCanvas.captureStream(30);
         const meetingAudioStream = window.styleManager?.getMeetingAudioStream?.();
@@ -1507,7 +2136,20 @@ class WebSocketClient {
         }
 
         const selectedMimeType = this.getPreferredVideoChunkMimeType();
-        console.log('Starting video chunk recording with mime type', selectedMimeType || 'browser-default');
+        console.log(
+            'Starting video chunk recording',
+            JSON.stringify({
+                mime_type: selectedMimeType || 'browser-default',
+                source_type: this.videoChunkDomSourceElement ? 'dom_element' : 'track_processor',
+                track_id: this.videoChunkSourceTrackId,
+                stream_id: this.videoChunkSourceStreamId,
+                dom_source_key: this.videoChunkDomSourceKey,
+                canvas: {
+                    width: this.videoChunkCanvas?.width || null,
+                    height: this.videoChunkCanvas?.height || null,
+                },
+            }),
+        );
         this.videoChunkRecorder = selectedMimeType
             ? new MediaRecorder(recorderStream, { mimeType: selectedMimeType })
             : new MediaRecorder(recorderStream);
@@ -1538,7 +2180,7 @@ class WebSocketClient {
         }
         if (!this.videoChunkRecorder || this.videoChunkRecorder.state === 'inactive') {
             this.stopVideoChunkCanvasLoop();
-            this.cleanupVideoChunkSourceTrack();
+            this.cleanupVideoChunkSource();
             return;
         }
 
@@ -1554,7 +2196,20 @@ class WebSocketClient {
         });
         this.videoChunkRecorder = null;
         this.stopVideoChunkCanvasLoop();
-        this.cleanupVideoChunkSourceTrack();
+        console.log(
+            'Stopping video chunk recording',
+            JSON.stringify({
+                source_type: this.videoChunkDomSourceElement ? 'dom_element' : 'track_processor',
+                track_id: this.videoChunkSourceTrackId,
+                stream_id: this.videoChunkSourceStreamId,
+                dom_source_key: this.videoChunkDomSourceKey,
+                last_healthy_frame_age_ms: this.videoChunkLastHealthyFrameAt == null
+                    ? null
+                    : Math.round(performance.now() - this.videoChunkLastHealthyFrameAt),
+                saw_first_frame: this.videoChunkFirstFrameLoggedAt != null,
+            }),
+        );
+        this.cleanupVideoChunkSource();
     }
 
     startAudioChunkRecording() {
@@ -1944,6 +2599,16 @@ function handleConversationEnd(eventDataObject) {
     }
 
     realConsole?.log('handleConversationEnd, sending meeting ended message');
+    try {
+        const disableResult = window.ws?.disableMediaSending?.();
+        if (disableResult && typeof disableResult.catch === 'function') {
+            disableResult.catch((error) => {
+                realConsole?.warn('handleConversationEnd failed to disable media sending', error);
+            });
+        }
+    } catch (error) {
+        realConsole?.warn('handleConversationEnd failed to disable media sending', error);
+    }
     window.ws?.sendJson({
         type: 'MeetingStatusChange',
         change: 'meeting_ended'
@@ -2685,7 +3350,16 @@ const handleVideoTrack = async (event) => {
 // LOOK FOR https://teams.live.com/api/chatsvc/consumer/v1/threads?view=msnp24Equivalent&threadIds=19%3Ameeting_Y2U4ZDk5NzgtOWQwYS00YzNjLTg2ODktYmU5MmY2MGEyNzJj%40thread.v2
 new RTCInterceptor({
     onPeerConnectionCreate: (peerConnection) => {
+        if (!window.__attendeePeerConnections) {
+            window.__attendeePeerConnections = new Set();
+        }
+        window.__attendeePeerConnections.add(peerConnection);
         realConsole?.log('New RTCPeerConnection created:', peerConnection);
+        peerConnection.addEventListener('connectionstatechange', () => {
+            if (peerConnection.connectionState === 'closed' || peerConnection.connectionState === 'failed') {
+                window.__attendeePeerConnections?.delete(peerConnection);
+            }
+        });
         peerConnection.addEventListener('datachannel', (event) => {
             realConsole?.log('datachannel', event);
             realConsole?.log('datachannel label', event.channel.label);
@@ -2724,6 +3398,7 @@ new RTCInterceptor({
             }
             if (event.track?.kind === 'video') {
                 window.styleManager.addVideoTrack(event);
+                window.ws?.runVideoProbe?.();
             }
         });
 

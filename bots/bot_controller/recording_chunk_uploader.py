@@ -35,9 +35,20 @@ class RecordingChunkUploader:
         self._next_chunk_index = 0
         self._workers = []
 
-        # video/ prefix → recording bucket (voxella-video)
-        # customer_audio/ prefix → audio chunk bucket (vox)
-        is_video_prefix = chunk_prefix.startswith("video/")
+        # Strict prefix-to-bucket contract (no fallback):
+        #   video/...         → AWS_RECORDING_STORAGE_BUCKET_NAME  (vox-video)
+        #   customer_audio/.. → AWS_AUDIO_CHUNK_STORAGE_BUCKET_NAME (vox)
+        # Any other prefix is rejected to prevent silent misrouting.
+        normalized_prefix = chunk_prefix.lstrip("/")
+        if normalized_prefix.startswith("video/"):
+            is_video_prefix = True
+        elif normalized_prefix.startswith("customer_audio/"):
+            is_video_prefix = False
+        else:
+            raise ValueError(
+                f"chunk_prefix must start with 'video/' (video bucket) or 'customer_audio/' (audio bucket). "
+                f"Got: {chunk_prefix!r}"
+            )
 
         if settings.STORAGE_PROTOCOL == "azure":
             from azure.storage.blob import BlobServiceClient, ContentSettings
@@ -67,6 +78,18 @@ class RecordingChunkUploader:
             self._azure_service_client = None
             self._azure_container = None
             self._azure_content_settings_class = None
+
+        resolved_bucket = (
+            (settings.AWS_RECORDING_STORAGE_BUCKET_NAME if is_video_prefix else settings.AWS_AUDIO_CHUNK_STORAGE_BUCKET_NAME)
+            if settings.STORAGE_PROTOCOL != "azure"
+            else None
+        )
+        logger.info(
+            "RecordingChunkUploader initialized chunk_prefix=%r is_video_prefix=%s s3_bucket=%r",
+            self.chunk_prefix,
+            is_video_prefix,
+            resolved_bucket,
+        )
 
         for _ in range(max(1, worker_count)):
             worker = threading.Thread(target=self._upload_worker, daemon=True)

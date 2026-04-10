@@ -6,6 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=-/etc/attendee/runtime-agent.env
+ExecStartPre=/usr/bin/test -f /etc/attendee/runtime-agent.env
 ExecStart=/usr/local/bin/attendee-runtime-agent
 Restart=always
 RestartSec=5

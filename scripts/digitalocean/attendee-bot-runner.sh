@@ -19,12 +19,29 @@ BOT_SHM_SIZE="${BOT_SHM_SIZE:-${MEETBOT_BOT_SHM_SIZE:-1g}}"
 BOT_RUNTIME_SOURCE_ARCHIVE_URL="${BOT_RUNTIME_SOURCE_ARCHIVE_URL:-}"
 BOT_RUNTIME_ALLOW_BOOTSTRAP="${BOT_RUNTIME_ALLOW_BOOTSTRAP:-false}"
 
+normalize_docker_memory_arg() {
+  local raw="${1:-}"
+  local normalized
+  normalized="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')"
+  normalized="${normalized//ib/}"
+  case "$normalized" in
+    *gi) echo "${normalized%gi}g" ;;
+    *mi) echo "${normalized%mi}m" ;;
+    *ki) echo "${normalized%ki}k" ;;
+    *) echo "$normalized" ;;
+  esac
+}
+
 if [[ -f "$RUNTIME_ENV_PATH" ]]; then
   set -a
   # shellcheck disable=SC1090
   source "$RUNTIME_ENV_PATH"
   set +a
 fi
+
+BOT_MEMORY_LIMIT="$(normalize_docker_memory_arg "$BOT_MEMORY_LIMIT")"
+BOT_MEMORY_RESERVATION="$(normalize_docker_memory_arg "$BOT_MEMORY_RESERVATION")"
+BOT_SHM_SIZE="$(normalize_docker_memory_arg "$BOT_SHM_SIZE")"
 
 timestamp() {
   date -u +"%Y-%m-%dT%H:%M:%SZ"
@@ -65,6 +82,7 @@ sync_attendee_source_archive() {
   mkdir -p "$repo_dir"
   cp -a "$temp_dir/." "$repo_dir/"
   rm -rf "$temp_dir"
+  chmod -R u+rwX,go+rX "$repo_dir"
   log_runner "Source archive sync complete"
   return 0
 }
@@ -90,6 +108,7 @@ sync_attendee_repo() {
     rm -rf "$repo_dir"
     timeout 120 "$git_bin" clone --depth 1 --branch "$git_ref" "$repo_url" "$repo_dir"
   fi
+  chmod -R u+rwX,go+rX "$repo_dir"
   return 0
 }
 

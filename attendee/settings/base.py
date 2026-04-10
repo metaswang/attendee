@@ -293,7 +293,20 @@ AZURE_RECORDING_STORAGE_CONTAINER_NAME = os.getenv("AZURE_RECORDING_STORAGE_CONT
 # Audio chunk storage settings
 USE_REMOTE_STORAGE_FOR_AUDIO_CHUNKS = os.getenv("USE_REMOTE_STORAGE_FOR_AUDIO_CHUNKS", "false") == "true"
 FALLBACK_TO_DB_STORAGE_FOR_AUDIO_CHUNKS_IF_REMOTE_STORAGE_FAILS = os.getenv("FALLBACK_TO_DB_STORAGE_FOR_AUDIO_CHUNKS_IF_REMOTE_STORAGE_FAILS", "false") == "true"
-AWS_AUDIO_CHUNK_STORAGE_BUCKET_NAME = os.getenv("AWS_AUDIO_CHUNK_STORAGE_BUCKET_NAME") or AWS_RECORDING_STORAGE_BUCKET_NAME
+# AWS_AUDIO_CHUNK_STORAGE_BUCKET_NAME must be set explicitly.
+# Strict prefix-to-bucket contract:
+#   customer_audio/... → AWS_AUDIO_CHUNK_STORAGE_BUCKET_NAME  (e.g. vox)
+#   video/...          → AWS_RECORDING_STORAGE_BUCKET_NAME    (e.g. vox-video)
+# Never allow audio chunks to silently land in the video recording bucket.
+_raw_audio_chunk_bucket = os.getenv("AWS_AUDIO_CHUNK_STORAGE_BUCKET_NAME")
+if not _raw_audio_chunk_bucket and STORAGE_PROTOCOL == "s3" and AWS_RECORDING_STORAGE_BUCKET_NAME:
+    raise ValueError(
+        "AWS_AUDIO_CHUNK_STORAGE_BUCKET_NAME must be explicitly set when "
+        "AWS_RECORDING_STORAGE_BUCKET_NAME is configured. "
+        "audio chunks (customer_audio/...) and video chunks (video/...) must reside in separate buckets. "
+        "Set AWS_AUDIO_CHUNK_STORAGE_BUCKET_NAME to the audio-only bucket (e.g. vox)."
+    )
+AWS_AUDIO_CHUNK_STORAGE_BUCKET_NAME = _raw_audio_chunk_bucket or AWS_RECORDING_STORAGE_BUCKET_NAME
 AZURE_AUDIO_CHUNK_STORAGE_CONTAINER_NAME = os.getenv("AZURE_AUDIO_CHUNK_STORAGE_CONTAINER_NAME") or AZURE_RECORDING_STORAGE_CONTAINER_NAME
 
 if STORAGE_PROTOCOL == "azure":

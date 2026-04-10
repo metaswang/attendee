@@ -221,13 +221,13 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build-base /opt/chrome-linux64 /opt/chrome-linux64
-COPY --from=build-base /usr/local/bin/google-chrome /usr/local/bin/google-chrome
-COPY --from=build-base /usr/local/bin/google-chrome-stable /usr/local/bin/google-chrome-stable
 COPY --from=build-base /usr/local/bin/chromedriver /usr/local/bin/chromedriver
 COPY --from=deps /opt/venv /opt/venv
 COPY --from=deps /tini /tini
 
 RUN ln -sf /usr/bin/python3.11 /usr/bin/python \
+    && ln -sf /opt/chrome-linux64/chrome /usr/local/bin/google-chrome \
+    && ln -sf /opt/chrome-linux64/chrome /usr/local/bin/google-chrome-stable \
     && useradd -m -u 1000 -s /bin/bash app \
     && mkdir -p /etc/opt/chrome/policies/managed \
     && ln -s /tmp/attendee-chrome-policies.json /etc/opt/chrome/policies/managed/attendee-chrome-policies.json

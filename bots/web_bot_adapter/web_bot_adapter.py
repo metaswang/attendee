@@ -304,12 +304,25 @@ class WebBotAdapter(BotAdapter):
             self.only_one_participant_in_meeting_at = None
 
     def handle_removed_from_meeting(self):
+        self.stop_media_sending_for_meeting_end()
         self.left_meeting = True
+        self.was_removed_from_meeting = True
         self.send_message_callback({"message": self.Messages.MEETING_ENDED})
 
     def handle_meeting_ended(self):
+        self.stop_media_sending_for_meeting_end()
         self.left_meeting = True
         self.send_message_callback({"message": self.Messages.MEETING_ENDED})
+
+    def stop_media_sending_for_meeting_end(self):
+        if not self.driver:
+            return
+
+        try:
+            logger.info("disable media sending due to meeting end")
+            self.driver.execute_script("window.ws?.disableMediaSending();")
+        except Exception as e:
+            logger.warning(f"Error disabling media sending after meeting end: {e}")
 
     def handle_failed_to_join(self, reason):
         logger.info(f"failed to join meeting with reason {reason}")
@@ -644,6 +657,8 @@ class WebBotAdapter(BotAdapter):
 
         options = webdriver.ChromeOptions()
 
+        chrome_binary_path = "/opt/chrome-linux64/chrome"
+
         options.add_argument(f"--user-data-dir={self._chrome_user_data_dir}")
         options.add_argument("--autoplay-policy=no-user-gesture-required")
         options.add_argument("--use-fake-device-for-media-stream")
@@ -675,6 +690,9 @@ class WebBotAdapter(BotAdapter):
             "profile.password_manager_enabled": False,
         }
         options.add_experimental_option("prefs", prefs)
+        if os.path.exists(chrome_binary_path):
+            # Chrome for Testing crashes when launched through /usr/local/bin/google-chrome in the GCP runtime image.
+            options.binary_location = chrome_binary_path
 
         self.add_subclass_specific_chrome_options(options)
 
