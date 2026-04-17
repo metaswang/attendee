@@ -104,3 +104,8 @@ db.sqlite3
 custom/
 docker-compose.yaml
 .idea/
+
+# TLS certs and keys (never commit)
+deploy/nginx/ssl/*.key
+deploy/nginx/ssl/*.crt
+deploy/nginx/ssl/*.pem

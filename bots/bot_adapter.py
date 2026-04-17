@@ -10,6 +10,7 @@ class BotAdapter:
         BOT_PUT_IN_WAITING_ROOM = "Bot put in waiting room"
         BOT_JOINED_MEETING = "Bot joined meeting"
         BOT_RECORDING_PERMISSION_GRANTED = "Bot recording permission granted"
+        RECORDING_CHUNK_RECORDER_STATE = "Recording chunk recorder state"
         MEETING_ENDED = "Meeting ended"
         NEW_UTTERANCE = "New utterance"
         UI_ELEMENT_NOT_FOUND = "UI Element Not Found"

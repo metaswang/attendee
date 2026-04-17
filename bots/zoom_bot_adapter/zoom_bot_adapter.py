@@ -1,5 +1,6 @@
 import os
 import time
+import audioop
 from datetime import datetime, timedelta
 
 import cv2
@@ -201,6 +202,104 @@ class ZoomBotAdapter(BotAdapter):
         self.should_retry_after_meeting_ends = False
         self.attempts_to_join_started_at = time.time()
 
+        self._diagnostic_started_at = time.monotonic()
+        self._one_way_audio_chunk_count = 0
+        self._mixed_audio_chunk_count = 0
+        self._one_way_audio_bytes = 0
+        self._mixed_audio_bytes = 0
+        self._active_speaker_change_count = 0
+        self._participant_audio_stats = {}
+        self._last_one_way_diagnostic_log_at = 0.0
+        self._last_mixed_diagnostic_log_at = 0.0
+
+    def _participant_label(self, participant_id):
+        if not participant_id:
+            return "<none>"
+        participant = self._participant_cache.get(participant_id) or self.get_participant(participant_id)
+        name = (participant or {}).get("participant_full_name") or "<unknown>"
+        return f"{participant_id}:{name}"
+
+    def _audio_rms(self, data):
+        if not data:
+            return 0
+        try:
+            return int(audioop.rms(data, 2))
+        except Exception:
+            return 0
+
+    def _should_emit_diagnostic(self, *, last_logged_at, chunk_boundary_hit):
+        now = time.monotonic()
+        if now - last_logged_at >= 5.0:
+            return True, now
+        if chunk_boundary_hit:
+            return True, last_logged_at
+        return False, last_logged_at
+
+    def _log_one_way_audio_diagnostic(self, *, participant_id, chunk_len, rms):
+        stats = self._participant_audio_stats.setdefault(
+            participant_id,
+            {
+                "chunks": 0,
+                "bytes": 0,
+                "first_seen_at": time.monotonic(),
+                "last_seen_at": None,
+                "max_rms": 0,
+            },
+        )
+        stats["chunks"] += 1
+        stats["bytes"] += chunk_len
+        stats["last_seen_at"] = time.monotonic()
+        stats["max_rms"] = max(int(stats["max_rms"]), int(rms))
+
+        should_log, next_at = self._should_emit_diagnostic(
+            last_logged_at=self._last_one_way_diagnostic_log_at,
+            chunk_boundary_hit=self._one_way_audio_chunk_count % 250 == 0,
+        )
+        if not should_log:
+            return
+        self._last_one_way_diagnostic_log_at = next_at
+
+        participant_summaries = []
+        for pid, participant_stats in sorted(
+            self._participant_audio_stats.items(),
+            key=lambda item: (-int(item[1]["chunks"]), item[0]),
+        )[:5]:
+            participant_summaries.append(
+                f"{self._participant_label(pid)} chunks={participant_stats['chunks']} "
+                f"bytes={participant_stats['bytes']} max_rms={participant_stats['max_rms']}"
+            )
+
+        logger.info(
+            "Zoom one-way audio diagnostic total_chunks=%s total_bytes=%s active_speaker=%s "
+            "latest_participant=%s latest_chunk_bytes=%s latest_rms=%s participants=[%s]",
+            self._one_way_audio_chunk_count,
+            self._one_way_audio_bytes,
+            self._participant_label(self.active_speaker_id),
+            self._participant_label(participant_id),
+            chunk_len,
+            rms,
+            "; ".join(participant_summaries),
+        )
+
+    def _log_mixed_audio_diagnostic(self, *, chunk_len, rms):
+        should_log, next_at = self._should_emit_diagnostic(
+            last_logged_at=self._last_mixed_diagnostic_log_at,
+            chunk_boundary_hit=self._mixed_audio_chunk_count % 250 == 0,
+        )
+        if not should_log:
+            return
+        self._last_mixed_diagnostic_log_at = next_at
+        logger.info(
+            "Zoom mixed audio diagnostic total_chunks=%s total_bytes=%s latest_chunk_bytes=%s latest_rms=%s "
+            "active_speaker=%s participant_audio_sources=%s",
+            self._mixed_audio_chunk_count,
+            self._mixed_audio_bytes,
+            chunk_len,
+            rms,
+            self._participant_label(self.active_speaker_id),
+            len(self._participant_audio_stats),
+        )
+
     def pause_recording(self):
         self.recording_is_paused = True
         if not self.raw_recording_active:
@@ -284,6 +383,14 @@ class ZoomBotAdapter(BotAdapter):
         if new_speaker_id == old_speaker_id:
             return
 
+        self._active_speaker_change_count += 1
+        logger.info(
+            "Zoom active speaker changed count=%s old=%s new=%s",
+            self._active_speaker_change_count,
+            self._participant_label(old_speaker_id),
+            self._participant_label(new_speaker_id),
+        )
+
         if old_speaker_id:
             self.send_participant_event(old_speaker_id, event_type=ParticipantEventTypes.SPEECH_STOP)
 
@@ -299,6 +406,13 @@ class ZoomBotAdapter(BotAdapter):
 
         if self.active_speaker_id == user_ids[0]:
             return
+
+        logger.info(
+            "Zoom on_user_active_audio_change_callback user_ids=%s current_active=%s next_active=%s",
+            list(user_ids),
+            self._participant_label(self.active_speaker_id),
+            self._participant_label(user_ids[0]),
+        )
 
         self.create_participant_events_for_active_speaker_change(
             new_speaker_id=user_ids[0],
@@ -862,12 +976,24 @@ class ZoomBotAdapter(BotAdapter):
 
         current_time = datetime.utcnow()
         self.last_audio_received_at = time.time()
-        self.add_audio_chunk_callback(node_id, current_time, data.GetBuffer())
+        chunk = data.GetBuffer()
+        chunk_len = len(chunk)
+        rms = self._audio_rms(chunk)
+        self._one_way_audio_chunk_count += 1
+        self._one_way_audio_bytes += chunk_len
+        self._log_one_way_audio_diagnostic(participant_id=node_id, chunk_len=chunk_len, rms=rms)
+        self.add_audio_chunk_callback(node_id, current_time, chunk)
 
     def add_mixed_audio_chunk_convert_to_bytes(self, data):
         if self.recording_is_paused:
             return
-        self.add_mixed_audio_chunk_callback(chunk=data.GetBuffer())
+        chunk = data.GetBuffer()
+        chunk_len = len(chunk)
+        rms = self._audio_rms(chunk)
+        self._mixed_audio_chunk_count += 1
+        self._mixed_audio_bytes += chunk_len
+        self._log_mixed_audio_diagnostic(chunk_len=chunk_len, rms=rms)
+        self.add_mixed_audio_chunk_callback(chunk=chunk)
 
     def handle_recording_permission_granted(self):
         if not self.recording_permission_granted:

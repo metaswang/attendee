@@ -1,6 +1,7 @@
 import gi
 
 gi.require_version("Gst", "1.0")
+import audioop
 import logging
 import time
 
@@ -56,6 +57,11 @@ class GstreamerPipeline:
 
         self.queue_drops = {}
         self.last_reported_drops = {}
+        self.audio_push_count = 0
+        self.audio_push_failures = 0
+        self.audio_push_total_ns = 0
+        self.audio_max_rms = 0
+        self.last_audio_push_log_monotonic = 0.0
 
     def on_new_sample_from_appsink(self, sink):
         """Handle new samples from the appsink"""
@@ -256,6 +262,10 @@ class GstreamerPipeline:
         try:
             current_time_ns = timestamp if timestamp else time.time_ns()
             buffer_bytes = data
+            chunk_len = len(buffer_bytes)
+            rms = int(audioop.rms(buffer_bytes, 2)) if buffer_bytes else 0
+            self.audio_push_count += 1
+            self.audio_max_rms = max(self.audio_max_rms, rms)
             buffer = Gst.Buffer.new_wrapped(buffer_bytes)
 
             # Initialize start time if not set
@@ -265,9 +275,30 @@ class GstreamerPipeline:
             # Calculate timestamp relative to same start time as video
             buffer.pts = current_time_ns - self.start_time_ns
 
+            push_started_at = time.monotonic_ns()
             ret = audio_appsrc.emit("push-buffer", buffer)
+            push_elapsed_ns = time.monotonic_ns() - push_started_at
+            self.audio_push_total_ns += push_elapsed_ns
             if ret != Gst.FlowReturn.OK:
+                self.audio_push_failures += 1
                 logger.info(f"Warning: Failed to push audio buffer to pipeline: {ret}")
+            now = time.monotonic()
+            if now - self.last_audio_push_log_monotonic >= 5.0 or self.audio_push_count % 250 == 0:
+                self.last_audio_push_log_monotonic = now
+                avg_push_ms = (self.audio_push_total_ns / self.audio_push_count) / 1_000_000 if self.audio_push_count else 0.0
+                logger.info(
+                    "GStreamer mixed audio diagnostic chunks=%s latest_chunk_bytes=%s latest_rms=%s "
+                    "max_rms=%s latest_push_ms=%.3f avg_push_ms=%.3f failures=%s audio_idx=%s pause_frame=%s",
+                    self.audio_push_count,
+                    chunk_len,
+                    rms,
+                    self.audio_max_rms,
+                    push_elapsed_ns / 1_000_000,
+                    avg_push_ms,
+                    self.audio_push_failures,
+                    audio_appsrc_idx,
+                    is_pause_frame,
+                )
         except Exception as e:
             logger.warning(f"Error processing audio data: {e}")
 

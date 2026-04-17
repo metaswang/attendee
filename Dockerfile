@@ -13,8 +13,22 @@ WORKDIR $cwd
 ARG DEBIAN_FRONTEND=noninteractive
 
 #  Install Dependencies
-RUN apt-get update  \
-    && apt-get install -y --no-install-recommends \
+RUN set -eux; \
+    retry_apt() { \
+        local attempt=1 max_attempts=5; \
+        while true; do \
+            if "$@"; then \
+                return 0; \
+            fi; \
+            if [ "$attempt" -ge "$max_attempts" ]; then \
+                return 1; \
+            fi; \
+            sleep "$((attempt * 10))"; \
+            attempt=$((attempt + 1)); \
+        done; \
+    }; \
+    retry_apt apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o APT::Update::Error-Mode=any; \
+    retry_apt apt-get install -y --no-install-recommends \
     build-essential \
     ca-certificates \
     cmake \
@@ -88,8 +102,8 @@ RUN apt-get update  \
     python3.11-venv \
     gir1.2-gstreamer-1.0 \
     gir1.2-gst-plugins-base-1.0 \
-    --fix-missing \
-    && rm -rf /var/lib/apt/lists/*
+    --fix-missing; \
+    rm -rf /var/lib/apt/lists/*
 # Install a pinned Chrome build directly from chrome-for-testing.
 RUN curl -fL --retry 5 --retry-all-errors --connect-timeout 15 \
     -o chrome-linux64.zip \
@@ -117,9 +131,23 @@ RUN ln -sf /usr/bin/python3.11 /usr/bin/python
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
     && mv /root/.local/bin/uv /usr/local/bin/uv
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends python3.11-dev \
-    && rm -rf /var/lib/apt/lists/*
+RUN set -eux; \
+    retry_apt() { \
+        local attempt=1 max_attempts=5; \
+        while true; do \
+            if "$@"; then \
+                return 0; \
+            fi; \
+            if [ "$attempt" -ge "$max_attempts" ]; then \
+                return 1; \
+            fi; \
+            sleep "$((attempt * 10))"; \
+            attempt=$((attempt + 1)); \
+        done; \
+    }; \
+    retry_apt apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o APT::Update::Error-Mode=any; \
+    retry_apt apt-get install -y --no-install-recommends python3.11-dev; \
+    rm -rf /var/lib/apt/lists/*
 
 FROM base AS deps
 

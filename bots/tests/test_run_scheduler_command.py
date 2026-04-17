@@ -8,7 +8,7 @@ from django.utils import timezone as django_timezone
 
 from accounts.models import Organization
 from bots.management.commands.run_scheduler import CALENDAR_SYNC_THRESHOLD_HOURS, Command
-from bots.models import Bot, BotStates, Calendar, CalendarPlatform, CalendarStates, Project, ZoomOAuthApp, ZoomOAuthConnection, ZoomOAuthConnectionStates
+from bots.models import Bot, BotRuntimeLease, BotRuntimeLeaseStatuses, BotRuntimeProviderTypes, BotStates, Calendar, CalendarPlatform, CalendarStates, Project, ZoomOAuthApp, ZoomOAuthConnection, ZoomOAuthConnectionStates
 
 
 def _build_celery_unacked_entry(bot_id, join_at_iso):
@@ -298,6 +298,31 @@ class RunSchedulerCommandTestCase(TestCase):
         connection_just_under.refresh_from_db()
         self.assertEqual(connection_boundary.token_refresh_task_enqueued_at, self.now)
         self.assertEqual(connection_just_under.token_refresh_task_enqueued_at, just_under_30_days_ago)
+
+    @patch("bots.management.commands.run_scheduler.get_runtime_provider")
+    def test_cleanup_stale_runtime_leases_deletes_stale_provisioning_lease(self, mock_get_runtime_provider):
+        bot = Bot.objects.create(
+            project=self.project,
+            name="Stale Launch Bot",
+            meeting_url="https://example.zoom.us/j/123456789",
+            state=BotStates.JOINING,
+            join_at=self.now - django_timezone.timedelta(hours=2),
+        )
+        lease = BotRuntimeLease.objects.create(
+            bot=bot,
+            provider=BotRuntimeProviderTypes.VPS_DOCKER,
+            status=BotRuntimeLeaseStatuses.PROVISIONING,
+            provider_instance_id="myvps",
+            metadata={"host_name": "myvps", "slot_index": 0},
+        )
+        mock_provider = MagicMock()
+        mock_get_runtime_provider.return_value = mock_provider
+
+        command = Command()
+        with patch("django.utils.timezone.now", return_value=self.now):
+            command._cleanup_stale_runtime_leases()
+
+        mock_provider.delete_lease.assert_called_once_with(lease)
 
     def test_run_scheduled_bots_with_jitter_launches_immediately_below_threshold(self):
         """Test that bots with join_at below the jitter start threshold are launched immediately via .delay()"""

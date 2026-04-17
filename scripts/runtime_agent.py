@@ -86,12 +86,32 @@ def _write_runtime_env(runtime_env: dict[str, str]) -> None:
     os.chmod(path, 0o644)
 
 
+def _apply_host_bot_resource_overrides(runtime_env: dict[str, str]) -> None:
+    """
+    Per-VPS caps for docker: set on each host in /etc/attendee/runtime-agent.env via systemd.
+    Overrides scheduler payload so the same bot model can run with different CPU/mem on myvps vs myvps2.
+    """
+    cpus = os.getenv("MEETBOT_RUNTIME_HOST_BOT_CPUS", "").strip()
+    mem_limit = os.getenv("MEETBOT_RUNTIME_HOST_BOT_MEMORY_LIMIT", "").strip()
+    mem_reservation = os.getenv("MEETBOT_RUNTIME_HOST_BOT_MEMORY_RESERVATION", "").strip()
+    if cpus:
+        runtime_env["BOT_CPUS"] = cpus
+    if mem_limit:
+        runtime_env["BOT_MEMORY_LIMIT"] = mem_limit
+        if not mem_reservation:
+            runtime_env["BOT_MEMORY_RESERVATION"] = mem_limit
+    if mem_reservation:
+        runtime_env["BOT_MEMORY_RESERVATION"] = mem_reservation
+
+
 def _spawn_runner(payload: dict[str, object]) -> None:
     runtime_env = payload.get("runtime_env")
     if not isinstance(runtime_env, dict):
         raise RuntimeError("launch payload is missing runtime_env")
 
-    _write_runtime_env({str(key): str(value) for key, value in runtime_env.items()})
+    merged_env = {str(key): str(value) for key, value in runtime_env.items()}
+    _apply_host_bot_resource_overrides(merged_env)
+    _write_runtime_env(merged_env)
 
     env = os.environ.copy()
     env.update(

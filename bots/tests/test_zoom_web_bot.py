@@ -206,6 +206,65 @@ class TestZoomWebBot(TransactionTestCase):
             # Close the database connection since we're in a thread
             connection.close()
 
+    def test_recording_chunk_recorder_started_sets_recording_chunks_started_at(self):
+        controller = BotController.__new__(BotController)
+        controller.bot_in_db = MagicMock(object_id="bot-1")
+        controller.recording_chunks_started_at = None
+        controller.recording_resize_events = ["existing"]
+        controller.recording_chunk_recorder_states = {}
+        controller.recording_chunk_recorder_failure = None
+        controller.recording_chunk_uploader = MagicMock()
+
+        with patch("bots.bot_controller.bot_controller.time.time", return_value=123.456):
+            controller.handle_recording_chunk_recorder_state_from_adapter(
+                kind="video",
+                state="started",
+                reason=None,
+                payload={"mime_type": "video/webm"},
+            )
+
+        self.assertEqual(controller.recording_chunks_started_at, 123.456)
+        self.assertIsNone(controller.recording_resize_events)
+        self.assertEqual(controller.recording_chunk_recorder_states["video"]["state"], "started")
+
+    def test_cleanup_marks_recording_completion_failure_when_no_chunks_uploaded(self):
+        controller = BotController.__new__(BotController)
+        controller.bot_in_db = self.bot
+        controller.bot_in_db.metadata = {"session_id": "session-1"}
+        controller.runtime_mode = False
+        controller.cleanup_called = False
+        controller.recording_chunks_started_at = 123.0
+        controller.recording_resize_events = None
+        controller.recording_chunk_recorder_states = {}
+        controller.recording_chunk_recorder_failure = None
+        controller.run_failure_exception = None
+        controller.gstreamer_pipeline = None
+        controller.rtmp_client = None
+        controller.main_loop = MagicMock()
+        controller.main_loop.is_running.return_value = True
+        controller.main_loop.quit = MagicMock()
+        controller.adapter = MagicMock()
+        controller.adapter.leave = MagicMock()
+        controller.adapter.cleanup = MagicMock()
+        controller.realtime_audio_output_manager = None
+        controller.webpage_streamer_manager = None
+        controller.websocket_client_manager = None
+        controller.audio_chunk_uploader = None
+        controller.recording_chunk_uploader = MagicMock()
+        controller.recording_chunk_uploader.wait_for_uploads.side_effect = RuntimeError("No recording chunks were uploaded")
+        controller.recording_chunk_uploader.shutdown = MagicMock()
+        controller.bot_in_db.recording_complete_callback_url = MagicMock(return_value="https://example.com/recording-complete")
+        controller.bot_in_db.recording_complete_signing_secret = MagicMock(return_value="test-secret")
+        controller.create_bot_event = MagicMock()
+
+        controller.cleanup()
+
+        self.assertIsNotNone(controller.run_failure_exception)
+        self.assertEqual(str(controller.run_failure_exception), "No recording chunks were uploaded")
+        self.assertGreaterEqual(controller.main_loop.quit.call_count, 1)
+        controller.recording_chunk_uploader.shutdown.assert_called_once_with(wait_for_uploads=False)
+        controller.create_bot_event.assert_called()
+
     @patch("bots.zoom_oauth_connections_utils.requests.post")
     @patch("bots.web_bot_adapter.web_bot_adapter.Display")
     @patch("bots.web_bot_adapter.web_bot_adapter.webdriver.Chrome")

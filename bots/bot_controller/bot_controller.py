@@ -577,6 +577,11 @@ class BotController:
             raise Exception(f"Could not determine meeting type for meeting url {self.bot_in_db.meeting_url}")
         return meeting_type
 
+    def validate_runtime_recording_strategy(self):
+        meeting_type = self.get_meeting_type()
+        if meeting_type == MeetingTypes.ZOOM and self.bot_in_db.use_zoom_web_adapter() and self.bot_in_db.uses_r2_chunk_recording():
+            raise ValueError("Zoom web adapter does not support transport='r2_chunks'. Use zoom_settings.sdk='native' or Zoom RTMS instead.")
+
     def get_per_participant_audio_utterance_delay_ms(self):
         meeting_type = self.get_meeting_type()
         if meeting_type == MeetingTypes.TEAMS:
@@ -661,6 +666,11 @@ class BotController:
                 return None
             return int(self.gstreamer_pipeline.start_time_ns / 1_000_000) + self.adapter.get_first_buffer_timestamp_ms_offset()
 
+        # R2 chunk recording: no screen recorder / gstreamer pipeline; anchor to chunk session start.
+        if self.recording_chunks_started_at is not None:
+            return int(self.recording_chunks_started_at * 1000)
+        return None
+
     def recording_file_saved(self, s3_storage_key):
         if self.runtime_mode:
             recording = self.get_default_recording()
@@ -685,10 +695,78 @@ class BotController:
         recording.first_buffer_timestamp_ms = self.get_first_buffer_timestamp_ms()
         recording.save()
 
+    def upload_recording_to_external_media_storage_if_enabled(self):
+        if not self.bot_in_db.external_media_storage_bucket_name():
+            return
+
+        external_media_storage_credentials_record = self.bot_in_db.project.credentials.filter(
+            credential_type=Credentials.CredentialTypes.EXTERNAL_MEDIA_STORAGE
+        ).first()
+        if not external_media_storage_credentials_record:
+            logger.error("No external media storage credentials found for bot %s", self.bot_in_db.id)
+            return
+
+        external_media_storage_credentials = external_media_storage_credentials_record.get_credentials()
+        if not external_media_storage_credentials:
+            logger.error("External media storage credentials data not found for bot %s", self.bot_in_db.id)
+            return
+
+        try:
+            logger.info(
+                "Uploading recording to external media storage bucket %s",
+                self.bot_in_db.external_media_storage_bucket_name(),
+            )
+            file_uploader = S3FileUploader(
+                bucket=self.bot_in_db.external_media_storage_bucket_name(),
+                filename=self.bot_in_db.external_media_storage_recording_file_name() or self.get_recording_filename(),
+                endpoint_url=external_media_storage_credentials.get("endpoint_url") or None,
+                region_name=external_media_storage_credentials.get("region_name"),
+                access_key_id=external_media_storage_credentials.get("access_key_id"),
+                access_key_secret=external_media_storage_credentials.get("access_key_secret"),
+            )
+            file_uploader.upload_file(self.get_recording_file_location())
+            file_uploader.wait_for_upload()
+            logger.info(
+                "File uploader finished uploading file to external media storage bucket %s",
+                self.bot_in_db.external_media_storage_bucket_name(),
+            )
+        except Exception as exc:
+            logger.exception(
+                "Error uploading recording to external media storage bucket %s: %s",
+                self.bot_in_db.external_media_storage_bucket_name(),
+                exc,
+            )
+
+    def get_file_uploader(self):
+        if settings.STORAGE_PROTOCOL == "azure":
+            return AzureFileUploader(
+                container=settings.AZURE_RECORDING_STORAGE_CONTAINER_NAME,
+                filename=self.get_recording_filename(),
+                connection_string=settings.RECORDING_STORAGE_BACKEND.get("OPTIONS").get("connection_string"),
+                account_key=settings.RECORDING_STORAGE_BACKEND.get("OPTIONS").get("account_key"),
+                account_name=settings.RECORDING_STORAGE_BACKEND.get("OPTIONS").get("account_name"),
+            )
+
+        return S3FileUploader(
+            bucket=settings.AWS_RECORDING_STORAGE_BUCKET_NAME,
+            filename=self.get_recording_filename(),
+            endpoint_url=settings.RECORDING_STORAGE_BACKEND.get("OPTIONS").get("endpoint_url"),
+        )
+
     def recording_chunk_duration_sec(self):
         if not self.recording_chunks_started_at:
             return 0
         return max(1, int(time.time() - self.recording_chunks_started_at))
+
+    def recording_output_duration_sec(self):
+        if self.recording_chunks_started_at:
+            return self.recording_chunk_duration_sec()
+
+        adapter_joined_at = getattr(getattr(self, "adapter", None), "joined_at", None)
+        if adapter_joined_at:
+            return max(1, int(time.time() - adapter_joined_at))
+
+        return 1
 
     def recording_session_id(self):
         metadata_session_id = str((self.bot_in_db.metadata or {}).get("session_id") or "").strip()
@@ -707,16 +785,24 @@ class BotController:
         if not self.recording_chunk_uploader:
             logger.warning("Received recording audio chunk but no recording chunk uploader is configured")
             return
+        if self.has_recording_complete_handoff() and self.recording_chunks_started_at is None:
+            self.recording_chunks_started_at = time.time()
+            self.recording_resize_events = None
         self.recording_chunk_uploader.enqueue_chunk(chunk_bytes)
 
     def on_recording_video_chunk_from_adapter(self, chunk_bytes):
         if not self.recording_chunk_uploader:
             logger.warning("Received recording video chunk but no recording chunk uploader is configured")
             return
+        if self.has_recording_complete_handoff() and self.recording_chunks_started_at is None:
+            self.recording_chunks_started_at = time.time()
+            self.recording_resize_events = None
         self.recording_chunk_uploader.enqueue_chunk(chunk_bytes)
 
     def update_recording_chunk_metadata_from_adapter(self, kind: str, mime_type: str, extension: str):
-        if kind != "audio" or self.bot_in_db.uses_muxed_screen_recording_chunks():
+        if kind == "video" and not self.bot_in_db.uses_muxed_screen_recording_chunks():
+            return
+        if kind == "audio" and self.bot_in_db.uses_muxed_screen_recording_chunks():
             return
         if not self.recording_chunk_uploader:
             logger.warning("Received recording chunk metadata update but no recording chunk uploader is configured")
@@ -728,6 +814,47 @@ class BotController:
             chunk_ext=extension,
             chunk_mime_type=mime_type,
         )
+
+    def handle_recording_chunk_recorder_state_from_adapter(self, *, kind: str, state: str, reason=None, payload=None):
+        if kind not in {"audio", "video"}:
+            logger.warning("Received recording chunk recorder state with invalid kind=%s state=%s reason=%s payload=%s", kind, state, reason, payload)
+            return
+
+        payload = payload or {}
+        self.recording_chunk_recorder_states[kind] = {
+            "kind": kind,
+            "state": state,
+            "reason": reason,
+            "payload": copy.deepcopy(payload),
+        }
+        logger.info(
+            "Received recording chunk recorder state from adapter bot=%s kind=%s state=%s reason=%s payload=%s",
+            self.bot_in_db.object_id,
+            kind,
+            state,
+            reason,
+            payload,
+        )
+
+        if state == "started" and self.has_recording_complete_handoff() and self.recording_chunks_started_at is None:
+            self.recording_chunks_started_at = time.time()
+            self.recording_resize_events = None
+            logger.info(
+                "Recording chunks started for bot=%s kind=%s started_at=%s",
+                self.bot_in_db.object_id,
+                kind,
+                self.recording_chunks_started_at,
+            )
+            return
+
+        if state == "failed":
+            self.recording_chunk_recorder_failure = {
+                "kind": kind,
+                "state": state,
+                "reason": reason,
+                "payload": copy.deepcopy(payload),
+            }
+            return
 
     def update_recording_resize_events_from_adapter(self, resize_events):
         self.recording_resize_events = copy.deepcopy(resize_events or [])
@@ -784,8 +911,138 @@ class BotController:
             "chunk_ext": "mp4",
             "chunk_mime_type": "video/mp4",
             "chunk_interval_ms": None,
-            "duration_sec": self.recording_chunk_duration_sec(),
+            "duration_sec": self.recording_output_duration_sec(),
         }
+
+    def should_adapt_native_recording_to_chunk_contract(self):
+        if self.get_meeting_type() != MeetingTypes.ZOOM:
+            return False
+        if self.is_using_rtms() or self.bot_in_db.use_zoom_web_adapter() or self.bot_in_db.uses_r2_chunk_recording():
+            return False
+        if not self.bot_in_db.recording_complete_callback_url() or not self.bot_in_db.recording_complete_signing_secret():
+            return False
+        if not self.bot_in_db.audio_raw_path():
+            return False
+        if self.bot_in_db.recording_type() == RecordingTypes.AUDIO_AND_VIDEO:
+            return bool(self.bot_in_db.video_chunk_prefix())
+        if self.bot_in_db.recording_type() == RecordingTypes.AUDIO_ONLY:
+            return bool(self.bot_in_db.audio_chunk_prefix())
+        return False
+
+    def get_native_recording_contract_chunk_metadata(self):
+        recording_format = self.bot_in_db.recording_format()
+        if recording_format == RecordingFormats.MP3:
+            return {
+                "chunk_prefix": self.bot_in_db.audio_chunk_prefix(),
+                "chunk_ext": "mp3",
+                "chunk_mime_type": "audio/mpeg",
+            }
+        if recording_format == RecordingFormats.WEBM:
+            return {
+                "chunk_prefix": self.bot_in_db.video_chunk_prefix(),
+                "chunk_ext": "webm",
+                "chunk_mime_type": "video/webm",
+            }
+        return {
+            "chunk_prefix": self.bot_in_db.video_chunk_prefix(),
+            "chunk_ext": "mp4",
+            "chunk_mime_type": "video/mp4",
+        }
+
+    def deliver_native_recording_file_as_chunk_contract(self, file_path: str):
+        session_id = self.recording_session_id()
+        if not session_id:
+            raise RuntimeError("Could not determine recording session id from audio_raw_path")
+
+        callback_url = self.bot_in_db.recording_complete_callback_url()
+        callback_secret = self.bot_in_db.recording_complete_signing_secret()
+        if not callback_url or not callback_secret:
+            raise RuntimeError("Recording completion callback settings are missing")
+
+        chunk_metadata = self.get_native_recording_contract_chunk_metadata()
+        chunk_prefix = chunk_metadata["chunk_prefix"]
+        if not chunk_prefix:
+            raise RuntimeError("Recording chunk prefix is missing for native recording contract adapter")
+
+        uploader = RecordingChunkUploader(
+            chunk_prefix=chunk_prefix,
+            chunk_ext=chunk_metadata["chunk_ext"],
+            chunk_mime_type=chunk_metadata["chunk_mime_type"],
+            raw_path=self.bot_in_db.audio_raw_path(),
+            chunk_interval_ms=None,
+            worker_count=1,
+        )
+        try:
+            upload_result = uploader.upload_single_chunk_file(file_path)
+        finally:
+            uploader.shutdown(wait_for_uploads=False)
+
+        uploaded_chunk_paths = upload_result["chunk_paths"]
+        manifest_path = upload_result["manifest_path"]
+        self.recording_file_saved(manifest_path)
+
+        duration_sec = self.recording_output_duration_sec()
+        stream_payload = {
+            "chunk_paths": uploaded_chunk_paths,
+            "chunk_count": len(uploaded_chunk_paths),
+            "chunk_ext": chunk_metadata["chunk_ext"],
+            "chunk_mime_type": chunk_metadata["chunk_mime_type"],
+            "chunk_interval_ms": None,
+            "duration_sec": duration_sec,
+            "raw_path": self.bot_in_db.audio_raw_path(),
+        }
+
+        payload = {
+            "idempotency_key": str(uuid.uuid4()),
+            "trigger": "recording.complete",
+            "bot_id": self.bot_in_db.object_id,
+            "provider": self.recording_complete_provider(),
+            "data": {
+                "session_id": session_id,
+                "audio": stream_payload,
+            },
+        }
+        if self.bot_in_db.recording_type() == RecordingTypes.AUDIO_AND_VIDEO:
+            payload["data"]["video"] = {**stream_payload}
+
+        logger.info(
+            "Delivering native recording.complete callback via single-chunk adapter for bot=%s session=%s has_video=%s chunk_path=%s callback_url=%s",
+            self.bot_in_db.object_id,
+            session_id,
+            self.bot_in_db.recording_type() == RecordingTypes.AUDIO_AND_VIDEO,
+            uploaded_chunk_paths[0] if uploaded_chunk_paths else None,
+            callback_url,
+        )
+        make_signed_callback_request(
+            url=callback_url,
+            payload=payload,
+            signing_secret=callback_secret,
+        )
+
+    def mark_recording_completion_failed(self, exc: Exception):
+        self.recording_chunk_recorder_failure = {
+            "kind": (self.recording_chunk_recorder_failure or {}).get("kind"),
+            "state": (self.recording_chunk_recorder_failure or {}).get("state"),
+            "reason": (self.recording_chunk_recorder_failure or {}).get("reason"),
+            "payload": copy.deepcopy((self.recording_chunk_recorder_failure or {}).get("payload") or {}),
+            "error": str(exc),
+        }
+        self.run_failure_exception = exc
+        logger.exception("Recording completion failed for bot=%s: %s", self.bot_in_db.object_id, exc)
+        try:
+            self.create_bot_event(
+                event_type=BotEventTypes.FATAL_ERROR,
+                event_sub_type=BotEventSubTypes.FATAL_ERROR_ATTENDEE_INTERNAL_ERROR,
+                event_metadata={
+                    "error": str(exc),
+                    "failure_kind": "recording_complete_callback",
+                    "has_recording_complete_handoff": self.has_recording_complete_handoff(),
+                },
+            )
+        except Exception as inner_exc:
+            logger.warning("Failed to create fatal error event for recording completion failure: %s", inner_exc)
+        if self.main_loop and self.main_loop.is_running():
+            self.main_loop.quit()
 
     def deliver_recording_complete_callback(self):
         if not self.has_recording_complete_handoff():
@@ -824,7 +1081,7 @@ class BotController:
                 "chunk_ext": "webm",
                 "chunk_mime_type": "video/webm",
                 "chunk_interval_ms": self.bot_in_db.recording_chunk_interval_ms(),
-                "duration_sec": self.recording_chunk_duration_sec(),
+                "duration_sec": self.recording_output_duration_sec(),
                 "raw_path": raw_path,
             }
             audio_upload_result = {
@@ -837,7 +1094,7 @@ class BotController:
                 "chunk_ext": self.recording_audio_chunk_ext,
                 "chunk_mime_type": self.recording_audio_chunk_mime_type,
                 "chunk_interval_ms": self.bot_in_db.recording_chunk_interval_ms(),
-                "duration_sec": self.recording_chunk_duration_sec(),
+                "duration_sec": self.recording_output_duration_sec(),
                 "raw_path": self.bot_in_db.audio_raw_path(),
             }
         if video_upload_result is not None and self.recording_resize_events:
@@ -939,6 +1196,14 @@ class BotController:
             logger.info("Cleanup already called, exiting")
             return
         self.cleanup_called = True
+        logger.info(
+            "Bot cleanup starting bot=%s runtime_mode=%s has_recording_complete_handoff=%s recording_chunks_started_at=%s recording_chunk_duration_sec=%s",
+            self.bot_in_db.object_id,
+            self.runtime_mode,
+            self.has_recording_complete_handoff(),
+            self.recording_chunks_started_at,
+            self.recording_chunk_duration_sec(),
+        )
 
         normal_quitting_process_worked = False
         import threading
@@ -985,18 +1250,66 @@ class BotController:
             logger.info("Telling websocket client manager to cleanup...")
             self.websocket_client_manager.cleanup()
 
+        recording_complete_failed = False
+        recording_file_location = self.get_recording_file_location()
+        has_local_recording_file = bool(
+            recording_file_location and os.path.exists(recording_file_location) and os.path.getsize(recording_file_location) > 0
+        )
+        if has_local_recording_file:
+            try:
+                self.upload_recording_to_external_media_storage_if_enabled()
+                if self.should_adapt_native_recording_to_chunk_contract():
+                    logger.info(
+                        "Adapting native recording file to chunk contract bot=%s file=%s",
+                        self.bot_in_db.object_id,
+                        recording_file_location,
+                    )
+                    self.deliver_native_recording_file_as_chunk_contract(recording_file_location)
+                else:
+                    logger.info("Telling file uploader to upload recording file...")
+                    file_uploader = self.get_file_uploader()
+                    file_uploader.upload_file(recording_file_location)
+                    file_uploader.wait_for_upload()
+                    logger.info("File uploader finished uploading file")
+                    self.recording_file_saved(file_uploader.filename)
+            except Exception as e:
+                recording_complete_failed = True
+                self.mark_recording_completion_failed(e)
+            finally:
+                if recording_file_location and os.path.exists(recording_file_location):
+                    try:
+                        os.remove(recording_file_location)
+                        logger.info("Deleted local recording file %s", recording_file_location)
+                    except OSError:
+                        logger.exception("Failed to delete local recording file %s", recording_file_location)
+
         if self.has_recording_complete_handoff():
-            logger.info("Flushing browser recording chunks and delivering completion callback...")
-            self.deliver_recording_complete_callback()
+            logger.info(
+                "Flushing browser recording chunks and delivering completion callback bot=%s duration_sec=%s",
+                self.bot_in_db.object_id,
+                self.recording_output_duration_sec(),
+            )
+            try:
+                self.deliver_recording_complete_callback()
+            except Exception as e:
+                recording_complete_failed = True
+                self.mark_recording_completion_failed(e)
 
         if self.recording_chunk_uploader:
-            self.recording_chunk_uploader.shutdown()
+            try:
+                self.recording_chunk_uploader.shutdown(wait_for_uploads=not recording_complete_failed)
+            except Exception as e:
+                recording_complete_failed = True
+                self.mark_recording_completion_failed(e)
 
         if self.audio_chunk_uploader:
             self.audio_chunk_uploader.shutdown()
 
         if self.bot_in_db.state == BotStates.POST_PROCESSING:
             BotEventManager.create_event(bot=self.bot_in_db, event_type=BotEventTypes.POST_PROCESSING_COMPLETED)
+
+        if recording_complete_failed and self.run_failure_exception is None:
+            self.run_failure_exception = RuntimeError("Recording completion failed")
 
         normal_quitting_process_worked = True
 
@@ -1054,6 +1367,9 @@ class BotController:
         self.cleanup_called = False
         self.run_called = False
         self.recording_chunks_started_at = None
+        self.recording_chunk_recorder_states = {}
+        self.recording_chunk_recorder_failure = None
+        self.run_failure_exception = None
         self.recording_chunk_uploader = None
         self.recording_resize_events = None
 
@@ -1064,6 +1380,7 @@ class BotController:
         self.automatic_leave_configuration = AutomaticLeaveConfiguration(**self.bot_in_db.automatic_leave_settings())
 
         self.pipeline_configuration = self.get_pipeline_configuration()
+        self.validate_runtime_recording_strategy()
 
     def create_bot_event(self, event_type, event_sub_type=None, event_metadata=None):
         return BotEventManager.create_event(
@@ -1412,6 +1729,9 @@ class BotController:
             # Clean up Redis subscription
             self.pubsub.unsubscribe(self.pubsub_channel)
             self.pubsub.close()
+
+        if self.run_failure_exception is not None:
+            raise self.run_failure_exception
 
     def take_action_based_on_bot_in_db(self):
         if self.bot_in_db.state == BotStates.JOINING:
@@ -2562,13 +2882,25 @@ class BotController:
 
             # The internal pipeline needs to start or resume recording.
             self.start_or_resume_recording_for_pipeline_objects_raise_on_failure()
-            if self.has_recording_complete_handoff() and self.recording_chunks_started_at is None:
-                self.recording_chunks_started_at = time.time()
-                self.recording_resize_events = None
 
             BotEventManager.create_event(
                 bot=self.bot_in_db,
                 event_type=BotEventTypes.BOT_RECORDING_PERMISSION_GRANTED,
+            )
+            return
+
+        if message.get("message") == BotAdapter.Messages.RECORDING_CHUNK_RECORDER_STATE:
+            logger.info(
+                "Received message that recording chunk recorder state changed kind=%s state=%s reason=%s",
+                message.get("kind"),
+                message.get("state"),
+                message.get("reason"),
+            )
+            self.handle_recording_chunk_recorder_state_from_adapter(
+                kind=message.get("kind"),
+                state=message.get("state"),
+                reason=message.get("reason"),
+                payload=message.get("payload"),
             )
             return
 

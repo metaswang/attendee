@@ -221,6 +221,18 @@ class StyleManager {
         }, 240000);
 
         this.meetingAudioStream = destination.stream;
+        window.ws?.emitDiagnosticEvent?.('MeetingAudioStreamReady', {
+            audio_track_count: destination.stream.getAudioTracks().length,
+            source_track_count: this.audioTracks.length,
+            audio_tracks: destination.stream.getAudioTracks().map((track) => ({
+                id: track.id,
+                kind: track.kind,
+                enabled: track.enabled,
+                muted: track.muted,
+                ready_state: track.readyState,
+                label: track.label || null,
+            })),
+        });
     }
     
     getMeetingAudioStream() {
@@ -679,6 +691,24 @@ class VirtualStreamToPhysicalStreamMappingManager {
 
         this.physicalClientStreamIdToVirtualStreamIdMapping = {}
         this.virtualStreamIdToPhysicalClientStreamIdMapping = {}
+        this.lastLoggedVideoSelectionSnapshot = null;
+    }
+
+    getCurrentUserId() {
+        return window.callManager?.getCurrentUserId?.();
+    }
+
+    logVideoSelectionDecision(payload) {
+        const snapshot = JSON.stringify(payload);
+        if (snapshot === this.lastLoggedVideoSelectionSnapshot) {
+            return;
+        }
+        this.lastLoggedVideoSelectionSnapshot = snapshot;
+        realConsole?.log('video stream selection decision', snapshot);
+        window.ws?.sendJson({
+            type: 'VideoSelectionDecision',
+            decision: payload,
+        });
     }
 
     getVirtualVideoStreamIdToSend() {
@@ -690,9 +720,10 @@ class VirtualStreamToPhysicalStreamMappingManager {
         //realConsole?.log('Object.values(this.virtualStreams)', Object.values(this.virtualStreams));
         //realConsole?.log("STARTFILTER");
         const virtualSteamsThatHavePhysicalStreams = []
+        const currentUserId = this.getCurrentUserId();
         for (const virtualStream of this.virtualStreams.values()) {
             const hasCorrespondingPhysicalStream = this.virtualStreamIdToPhysicalClientStreamIdMapping[virtualStream.sourceId];
-            const isNotVirtualStreamForBot = !this.physicalClientStreamIdToVirtualStreamIdMapping[virtualStream.sourceId];
+            const isCurrentUserStream = !!currentUserId && virtualStream.participant?.id === currentUserId;
 
             //realConsole?.log('zzzphysicalClientStreamIds', physicalClientStreamIds);
             //realConsole?.log('zzzvirtualStream.sourceId.toString()', virtualStream.sourceId.toString());
@@ -704,7 +735,7 @@ class VirtualStreamToPhysicalStreamMappingManager {
             //realConsole?.log('zzzcond1', cond1, 'cond2', cond2, 'cond3', cond3);
 
 
-            if ((virtualStream.isScreenShare || virtualStream.isWebcam) && isNotVirtualStreamForBot && hasCorrespondingPhysicalStream)
+            if ((virtualStream.isScreenShare || virtualStream.isWebcam) && !isCurrentUserStream && hasCorrespondingPhysicalStream)
             {
                 virtualSteamsThatHavePhysicalStreams.push(virtualStream);
             }
@@ -712,32 +743,69 @@ class VirtualStreamToPhysicalStreamMappingManager {
         //realConsole?.log("ENDFILTER");
         //realConsole?.log('zzzvirtualSteamsThatHavePhysicalStreams', virtualSteamsThatHavePhysicalStreams);
         //realConsole?.log('this.physicalClientStreamIdToVirtualStreamIdMapping', this.physicalClientStreamIdToVirtualStreamIdMapping);
-        if (virtualSteamsThatHavePhysicalStreams.length == 0)
+        if (virtualSteamsThatHavePhysicalStreams.length == 0) {
+            this.logVideoSelectionDecision({
+                stage: 'virtual',
+                reason: 'no_virtual_stream_with_physical_mapping',
+                current_user_id: currentUserId || null,
+                total_virtual_streams: this.virtualStreams.size,
+                mapped_virtual_stream_count: Object.keys(this.virtualStreamIdToPhysicalClientStreamIdMapping).length,
+            });
             return null;
+        }
 
         const firstActiveScreenShareStream = virtualSteamsThatHavePhysicalStreams.find(virtualStream => virtualStream.isScreenShare && virtualStream.isActive);
         //realConsole?.log('zzzfirstActiveScreenShareStream', firstActiveScreenShareStream);
-        if (firstActiveScreenShareStream)
+        if (firstActiveScreenShareStream) {
+            this.logVideoSelectionDecision({
+                stage: 'virtual',
+                reason: 'active_screenshare',
+                selected_virtual_stream_id: firstActiveScreenShareStream.sourceId,
+                participant_id: firstActiveScreenShareStream.participant?.id || null,
+                current_user_id: currentUserId || null,
+            });
             return firstActiveScreenShareStream.sourceId;
+        }
 
         const dominantSpeaker = dominantSpeakerManager.getDominantSpeaker();
         //realConsole?.log('zzzdominantSpeaker', dominantSpeaker);
         if (dominantSpeaker)
         {
             const dominantSpeakerVideoStream = virtualSteamsThatHavePhysicalStreams.find(virtualStream => virtualStream.participant.id === dominantSpeaker.id && virtualStream.isWebcam && virtualStream.isActive);
-            if (dominantSpeakerVideoStream)
+            if (dominantSpeakerVideoStream) {
+                this.logVideoSelectionDecision({
+                    stage: 'virtual',
+                    reason: 'dominant_speaker_webcam',
+                    selected_virtual_stream_id: dominantSpeakerVideoStream.sourceId,
+                    participant_id: dominantSpeakerVideoStream.participant?.id || null,
+                    dominant_speaker_id: dominantSpeaker.id,
+                    current_user_id: currentUserId || null,
+                });
                 return dominantSpeakerVideoStream.sourceId;
+            }
         }
 
-        return virtualSteamsThatHavePhysicalStreams[0]?.sourceId;
+        const fallbackVirtualStream = virtualSteamsThatHavePhysicalStreams[0] || null;
+        this.logVideoSelectionDecision({
+            stage: 'virtual',
+            reason: 'first_mapped_video_stream',
+            selected_virtual_stream_id: fallbackVirtualStream?.sourceId || null,
+            participant_id: fallbackVirtualStream?.participant?.id || null,
+            current_user_id: currentUserId || null,
+        });
+        return fallbackVirtualStream?.sourceId;
     }
 
     getVideoStreamIdToSend() {
         
         const virtualVideoStreamIdToSend = this.getVirtualVideoStreamIdToSend();
-        if (!virtualVideoStreamIdToSend)
-        {
-            return this.physicalStreamsByServerStreamId.keys().find(physicalServerStreamId => physicalServerStreamId.includes('Video'));
+        if (!virtualVideoStreamIdToSend) {
+            this.logVideoSelectionDecision({
+                stage: 'physical',
+                reason: 'missing_virtual_video_stream_id',
+                selected_server_stream_id: null,
+            });
+            return null;
         }
         //realConsole?.log('virtualVideoStreamIdToSend', virtualVideoStreamIdToSend);
         //realConsole?.log('this.physicalClientStreamIdToVirtualStreamIdMapping', this.physicalClientStreamIdToVirtualStreamIdMapping);
@@ -749,12 +817,36 @@ class VirtualStreamToPhysicalStreamMappingManager {
             
         //realConsole?.log('physicalClientStreamId', physicalClientStreamId);
         //realConsole?.log('this.physicalStreamsByClientStreamId', this.physicalStreamsByClientStreamId);
+        if (!physicalClientStreamId) {
+            this.logVideoSelectionDecision({
+                stage: 'physical',
+                reason: 'missing_physical_client_stream_id',
+                selected_virtual_stream_id: virtualVideoStreamIdToSend,
+                selected_server_stream_id: null,
+            });
+            return null;
+        }
 
         const physicalStream = this.physicalStreamsByClientStreamId.get(physicalClientStreamId);
-        if (!physicalStream)
+        if (!physicalStream) {
+            this.logVideoSelectionDecision({
+                stage: 'physical',
+                reason: 'missing_physical_stream_entry',
+                selected_virtual_stream_id: virtualVideoStreamIdToSend,
+                selected_physical_client_stream_id: physicalClientStreamId,
+                selected_server_stream_id: null,
+            });
             return null;
+        }
 
         //realConsole?.log('physicalStream', physicalStream);
+        this.logVideoSelectionDecision({
+            stage: 'physical',
+            reason: 'resolved_server_stream_id',
+            selected_virtual_stream_id: virtualVideoStreamIdToSend,
+            selected_physical_client_stream_id: physicalClientStreamId,
+            selected_server_stream_id: physicalStream.serverStreamId,
+        });
             
         return physicalStream.serverStreamId;
     }
@@ -1344,8 +1436,13 @@ class WebSocketClient {
         this.videoChunkLastFrameDimensionsKey = null;
         this.videoChunkStallLogState = null;
         this.videoChunkLastLoggedTrackInfo = null;
+        this.videoChunkMissingSourceReason = null;
         this.videoProbeInterval = null;
         this.videoTrackProbePromises = new Map();
+        this.encodedAudioChunkCount = 0;
+        this.encodedVideoChunkCount = 0;
+        this.audioChunkRequestCount = 0;
+        this.audioChunkZeroSizeCount = 0;
         /*
         We no longer need this because we're not using MediaStreamTrackProcessor's
         this.lastVideoFrameTime = performance.now();
@@ -1391,6 +1488,9 @@ class WebSocketClient {
     */
   
     async enableMediaSending() {
+        this.emitDiagnosticEvent('MediaSendingState', {
+            state: 'enabling',
+        });
         this.mediaSendingEnabled = true;
         window.receiverManager.startPollingReceivers();
         window.styleManager.start();
@@ -1402,19 +1502,42 @@ class WebSocketClient {
         if (window.initialData.sendEncodedAudioChunks) {
             this.startAudioChunkRecording();
         }
+        this.emitDiagnosticEvent('MediaSendingState', {
+            state: 'enabled',
+            send_encoded_video_chunks: !!window.initialData.sendEncodedVideoChunks,
+            send_encoded_audio_chunks: !!window.initialData.sendEncodedAudioChunks,
+        });
         // No longer need this because we're not using MediaStreamTrackProcessor's
         //this.startBlackFrameTimer();
     }
 
     async disableMediaSending() {
-        await this.stopVideoChunkRecording();
-        await this.stopAudioChunkRecording();
-        this.stopVideoProbeLoop();
-        window.styleManager.stop();
-        //window.fullCaptureManager.stop();
-        // Give the media recorder a bit of time to send the final data
-        await new Promise(resolve => setTimeout(resolve, 2000));
-        this.mediaSendingEnabled = false;
+        this.emitDiagnosticEvent('MediaSendingState', {
+            state: 'disabling',
+            encoded_video_chunk_count: this.encodedVideoChunkCount,
+            encoded_audio_chunk_count: this.encodedAudioChunkCount,
+        });
+        try {
+            await this.stopVideoChunkRecording();
+            await this.stopAudioChunkRecording();
+            this.stopVideoProbeLoop();
+            window.styleManager.stop();
+            //window.fullCaptureManager.stop();
+            // Give the media recorder a bit of time to send the final data
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            this.mediaSendingEnabled = false;
+            this.emitDiagnosticEvent('MediaSendingState', {
+                state: 'disabled',
+                encoded_video_chunk_count: this.encodedVideoChunkCount,
+                encoded_audio_chunk_count: this.encodedAudioChunkCount,
+            });
+        } catch (error) {
+            this.emitDiagnosticEvent('MediaSendingState', {
+                state: 'disable_failed',
+                error: error?.message || String(error),
+            });
+            throw error;
+        }
 
         // No longer need this because we're not using MediaStreamTrackProcessor's
         //this.stopBlackFrameTimer();
@@ -1463,6 +1586,14 @@ class WebSocketClient {
             console.error('Error sending WebSocket message:', error);
             console.error('Message data:', data);
         }
+    }
+
+    emitDiagnosticEvent(type, payload = {}) {
+        this.sendJson({
+            type,
+            at_ms: Date.now(),
+            ...payload,
+        });
     }
 
     startVideoProbeLoop() {
@@ -1739,6 +1870,15 @@ class WebSocketClient {
             const headerView = new DataView(headerBuffer);
             headerView.setInt32(0, WebSocketClient.MESSAGE_TYPES.ENCODED_AUDIO_CHUNK, true);
             this.ws.send(new Blob([headerBuffer, encodedAudioData]));
+            this.encodedAudioChunkCount += 1;
+            if (this.encodedAudioChunkCount <= 3 || this.encodedAudioChunkCount % 10 === 0) {
+                this.emitDiagnosticEvent('EncodedMediaChunk', {
+                    kind: 'audio',
+                    chunk_count: this.encodedAudioChunkCount,
+                    byte_length: encodedAudioData?.size || null,
+                    mime_type: encodedAudioData?.type || null,
+                });
+            }
         } catch (error) {
             console.error('Error sending WebSocket audio chunk:', error);
         }
@@ -1764,6 +1904,19 @@ class WebSocketClient {
             const headerView = new DataView(headerBuffer);
             headerView.setInt32(0, WebSocketClient.MESSAGE_TYPES.ENCODED_MP4_CHUNK, true);
             this.ws.send(new Blob([headerBuffer, encodedMP4Data]));
+            this.encodedVideoChunkCount += 1;
+            if (this.encodedVideoChunkCount <= 3 || this.encodedVideoChunkCount % 10 === 0) {
+                this.emitDiagnosticEvent('EncodedMediaChunk', {
+                    kind: 'video',
+                    chunk_count: this.encodedVideoChunkCount,
+                    byte_length: encodedMP4Data?.size || null,
+                    mime_type: encodedMP4Data?.type || null,
+                    source_type: this.videoChunkDomSourceElement ? 'dom_element' : 'track_processor',
+                    track_id: this.videoChunkSourceTrackId,
+                    stream_id: this.videoChunkSourceStreamId,
+                    dom_source_key: this.videoChunkDomSourceKey,
+                });
+            }
         } catch (error) {
             console.error('Error sending WebSocket video chunk:', error);
         }
@@ -1841,6 +1994,15 @@ class WebSocketClient {
                     height: height,
                 }),
             );
+            this.emitDiagnosticEvent('RecordingVideoFrameHealth', {
+                state: 'first_healthy_frame',
+                source_type: this.videoChunkDomSourceElement ? 'dom_element' : 'track_processor',
+                track_id: this.videoChunkSourceTrackId,
+                stream_id: this.videoChunkSourceStreamId,
+                dom_source_key: this.videoChunkDomSourceKey,
+                width: width,
+                height: height,
+            });
         } else if (this.videoChunkLastFrameDimensionsKey !== dimensionsKey) {
             console.log(
                 'Video chunk source frame dimensions changed',
@@ -1853,6 +2015,15 @@ class WebSocketClient {
                     height: height,
                 }),
             );
+            this.emitDiagnosticEvent('RecordingVideoFrameHealth', {
+                state: 'dimensions_changed',
+                source_type: this.videoChunkDomSourceElement ? 'dom_element' : 'track_processor',
+                track_id: this.videoChunkSourceTrackId,
+                stream_id: this.videoChunkSourceStreamId,
+                dom_source_key: this.videoChunkDomSourceKey,
+                width: width,
+                height: height,
+            });
         }
         this.videoChunkLastFrameDimensionsKey = dimensionsKey;
         if (this.videoChunkStallLogState !== 'healthy') {
@@ -1867,6 +2038,15 @@ class WebSocketClient {
                     height: height,
                 }),
             );
+            this.emitDiagnosticEvent('RecordingVideoFrameHealth', {
+                state: 'healthy',
+                source_type: this.videoChunkDomSourceElement ? 'dom_element' : 'track_processor',
+                track_id: this.videoChunkSourceTrackId,
+                stream_id: this.videoChunkSourceStreamId,
+                dom_source_key: this.videoChunkDomSourceKey,
+                width: width,
+                height: height,
+            });
             this.videoChunkStallLogState = 'healthy';
         }
     }
@@ -1902,6 +2082,14 @@ class WebSocketClient {
                 settings: this.videoChunkSourceTrackSettings,
             }),
         );
+        this.emitDiagnosticEvent('RecordingVideoSourceSelected', {
+            source_type: 'track_processor',
+            track_id: this.videoChunkSourceTrackId,
+            stream_id: this.videoChunkSourceStreamId,
+            kind: sourceTrack.kind,
+            ready_state: sourceTrack.readyState,
+            settings: this.videoChunkSourceTrackSettings,
+        });
 
         let processor;
         try {
@@ -1979,6 +2167,10 @@ class WebSocketClient {
             if (this.videoChunkLastLoggedTrackInfo !== 'missing_dom_element') {
                 console.warn('Video chunk recording has no renderable central media element');
                 this.videoChunkLastLoggedTrackInfo = 'missing_dom_element';
+                this.videoChunkMissingSourceReason = 'missing_dom_element';
+                this.emitDiagnosticEvent('RecordingVideoSourceUnavailable', {
+                    reason: 'missing_dom_element',
+                });
             }
             this.cleanupVideoChunkDomSourceElement();
             return false;
@@ -2010,6 +2202,14 @@ class WebSocketClient {
                 id: nextElement.id || null,
             }),
         );
+        this.videoChunkMissingSourceReason = null;
+        this.emitDiagnosticEvent('RecordingVideoSourceSelected', {
+            source_type: 'dom_element',
+            dom_source_key: this.videoChunkDomSourceKey,
+            tag_name: nextElement.tagName,
+            class_name: nextElement.className || null,
+            id: nextElement.id || null,
+        });
         return true;
     }
 
@@ -2023,6 +2223,10 @@ class WebSocketClient {
             if (this.videoChunkLastLoggedTrackInfo !== 'missing_track') {
                 console.warn('Video chunk recording has no live source track');
                 this.videoChunkLastLoggedTrackInfo = 'missing_track';
+                this.videoChunkMissingSourceReason = 'missing_track';
+                this.emitDiagnosticEvent('RecordingVideoSourceUnavailable', {
+                    reason: 'missing_track',
+                });
             }
             this.cleanupVideoChunkSource();
             return;
@@ -2030,6 +2234,7 @@ class WebSocketClient {
         if (this.videoChunkSourceTrackId === nextTrackEntry.track.id) {
             return;
         }
+        this.videoChunkMissingSourceReason = null;
         this.videoChunkLastLoggedTrackInfo = nextTrackEntry.track.id;
         this.startVideoChunkSourcePump(nextTrackEntry).catch((error) => {
             console.error('Video chunk source pump start failed', error);
@@ -2101,6 +2306,15 @@ class WebSocketClient {
                         track_settings: this.videoChunkSourceTrackSettings,
                     }),
                 );
+                this.emitDiagnosticEvent('RecordingVideoFrameHealth', {
+                    state: 'stalled',
+                    track_id: this.videoChunkSourceTrackId,
+                    stream_id: this.videoChunkSourceStreamId,
+                    last_healthy_frame_age_ms: Number.isFinite(lastHealthyFrameAgeMs) ? Math.round(lastHealthyFrameAgeMs) : null,
+                    track_settings: this.videoChunkSourceTrackSettings,
+                    source_type: this.videoChunkDomSourceElement ? 'dom_element' : 'track_processor',
+                    missing_source_reason: this.videoChunkMissingSourceReason,
+                });
                 this.videoChunkStallLogState = 'stalled';
             }
             ctx.fillStyle = 'black';
@@ -2150,6 +2364,18 @@ class WebSocketClient {
                 },
             }),
         );
+        this.emitDiagnosticEvent('RecordingChunkLifecycle', {
+            event: 'video_recording_started',
+            mime_type: selectedMimeType || 'browser-default',
+            source_type: this.videoChunkDomSourceElement ? 'dom_element' : 'track_processor',
+            track_id: this.videoChunkSourceTrackId,
+            stream_id: this.videoChunkSourceStreamId,
+            dom_source_key: this.videoChunkDomSourceKey,
+            canvas: {
+                width: this.videoChunkCanvas?.width || null,
+                height: this.videoChunkCanvas?.height || null,
+            },
+        });
         this.videoChunkRecorder = selectedMimeType
             ? new MediaRecorder(recorderStream, { mimeType: selectedMimeType })
             : new MediaRecorder(recorderStream);
@@ -2209,41 +2435,222 @@ class WebSocketClient {
                 saw_first_frame: this.videoChunkFirstFrameLoggedAt != null,
             }),
         );
+        this.emitDiagnosticEvent('RecordingChunkLifecycle', {
+            event: 'video_recording_stopped',
+            source_type: this.videoChunkDomSourceElement ? 'dom_element' : 'track_processor',
+            track_id: this.videoChunkSourceTrackId,
+            stream_id: this.videoChunkSourceStreamId,
+            dom_source_key: this.videoChunkDomSourceKey,
+            last_healthy_frame_age_ms: this.videoChunkLastHealthyFrameAt == null
+                ? null
+                : Math.round(performance.now() - this.videoChunkLastHealthyFrameAt),
+            saw_first_frame: this.videoChunkFirstFrameLoggedAt != null,
+            encoded_video_chunk_count: this.encodedVideoChunkCount,
+        });
         this.cleanupVideoChunkSource();
     }
 
     startAudioChunkRecording() {
+        this.emitDiagnosticEvent('AudioRecordingState', {
+            event: 'start_audio_chunk_recording_enter',
+            has_existing_recorder: !!this.audioChunkRecorder,
+            existing_recorder_state: this.audioChunkRecorder?.state || null,
+        });
         if (this.audioChunkRecorder && this.audioChunkRecorder.state !== 'inactive') {
             return;
         }
         const audioStream = window.styleManager?.getMeetingAudioStream?.();
         if (!audioStream || audioStream.getAudioTracks().length === 0) {
             console.warn('No meeting audio stream available for audio chunk recording');
+            this.emitDiagnosticEvent('AudioRecordingState', {
+                event: 'missing_audio_stream',
+                has_audio_stream: !!audioStream,
+                track_count: audioStream?.getAudioTracks?.().length || 0,
+            });
             return;
+        }
+        const audioTracks = audioStream.getAudioTracks();
+        this.emitDiagnosticEvent('AudioRecordingState', {
+            event: 'got_audio_stream',
+            stream_active: audioStream.active,
+            track_count: audioTracks.length,
+            tracks: audioTracks.map((track) => ({
+                id: track.id,
+                enabled: track.enabled,
+                muted: track.muted,
+                ready_state: track.readyState,
+                label: track.label || null,
+            })),
+        });
+        for (const track of audioTracks) {
+            track.addEventListener('mute', () => {
+                this.emitDiagnosticEvent('AudioRecordingState', {
+                    event: 'track_muted',
+                    track_id: track.id,
+                    ready_state: track.readyState,
+                    enabled: track.enabled,
+                    muted: track.muted,
+                });
+            });
+            track.addEventListener('unmute', () => {
+                this.emitDiagnosticEvent('AudioRecordingState', {
+                    event: 'track_unmuted',
+                    track_id: track.id,
+                    ready_state: track.readyState,
+                    enabled: track.enabled,
+                    muted: track.muted,
+                });
+            });
+            track.addEventListener('ended', () => {
+                this.emitDiagnosticEvent('AudioRecordingState', {
+                    event: 'track_ended',
+                    track_id: track.id,
+                    ready_state: track.readyState,
+                    enabled: track.enabled,
+                    muted: track.muted,
+                });
+            });
         }
         const preferredMimeTypes = ['audio/webm;codecs=opus', 'audio/webm'];
         const selectedMimeType = preferredMimeTypes.find((mime) => window.MediaRecorder && MediaRecorder.isTypeSupported(mime));
-        this.audioChunkRecorder = selectedMimeType ? new MediaRecorder(audioStream, { mimeType: selectedMimeType }) : new MediaRecorder(audioStream);
-        const audioChunkMimeType = this.audioChunkRecorder.mimeType || selectedMimeType || 'audio/webm';
-        this.ws.sendJson({
-            type: 'RecordingChunkFormat',
-            kind: 'audio',
-            mimeType: audioChunkMimeType,
-            extension: audioChunkMimeType.includes('mp4') ? 'm4a' : 'webm',
+        this.emitDiagnosticEvent('AudioRecordingState', {
+            event: 'media_recorder_capability',
+            media_recorder_available: !!window.MediaRecorder,
+            preferred_mime_types: preferredMimeTypes,
+            supported_mime_types: preferredMimeTypes.filter((mime) => window.MediaRecorder && MediaRecorder.isTypeSupported(mime)),
+            selected_mime_type: selectedMimeType || null,
         });
+        try {
+            this.audioChunkRecorder = selectedMimeType ? new MediaRecorder(audioStream, { mimeType: selectedMimeType }) : new MediaRecorder(audioStream);
+        } catch (error) {
+            this.emitDiagnosticEvent('AudioRecordingState', {
+                event: 'media_recorder_constructor_failed',
+                selected_mime_type: selectedMimeType || null,
+                message: error?.message || String(error),
+            });
+            throw error;
+        }
+        this.emitDiagnosticEvent('AudioRecordingState', {
+            event: 'media_recorder_constructed',
+            selected_mime_type: selectedMimeType || null,
+            recorder_state: this.audioChunkRecorder?.state || null,
+            recorder_mime_type: this.audioChunkRecorder?.mimeType || null,
+        });
+        this.emitDiagnosticEvent('AudioRecordingState', {
+            event: 'resolving_audio_chunk_mime_type',
+            recorder_mime_type: this.audioChunkRecorder?.mimeType || null,
+            selected_mime_type: selectedMimeType || null,
+        });
+        const audioChunkMimeType = this.audioChunkRecorder.mimeType || selectedMimeType || 'audio/webm';
+        this.emitDiagnosticEvent('AudioRecordingState', {
+            event: 'resolved_audio_chunk_mime_type',
+            audio_chunk_mime_type: audioChunkMimeType,
+            recorder_mime_type: this.audioChunkRecorder?.mimeType || null,
+        });
+        try {
+            this.sendJson({
+                type: 'RecordingChunkFormat',
+                kind: 'audio',
+                mimeType: audioChunkMimeType,
+                extension: audioChunkMimeType.includes('mp4') ? 'm4a' : 'webm',
+            });
+        } catch (error) {
+            this.emitDiagnosticEvent('AudioRecordingState', {
+                event: 'recording_chunk_format_send_failed',
+                audio_chunk_mime_type: audioChunkMimeType,
+                message: error?.message || String(error),
+            });
+            throw error;
+        }
+        this.emitDiagnosticEvent('AudioRecordingState', {
+            event: 'recording_chunk_format_sent',
+            audio_chunk_mime_type: audioChunkMimeType,
+        });
+        this.emitDiagnosticEvent('RecordingChunkLifecycle', {
+            event: 'audio_recording_started',
+            mime_type: audioChunkMimeType,
+            track_count: audioTracks.length,
+        });
+        this.emitDiagnosticEvent('AudioRecordingState', {
+            event: 'media_recorder_created',
+            mime_type: audioChunkMimeType,
+            recorder_state: this.audioChunkRecorder.state,
+            track_count: audioTracks.length,
+            tracks: audioTracks.map((track) => ({
+                id: track.id,
+                enabled: track.enabled,
+                muted: track.muted,
+                ready_state: track.readyState,
+                label: track.label || null,
+            })),
+        });
+        this.audioChunkRecorder.onstart = () => {
+            this.emitDiagnosticEvent('AudioRecordingState', {
+                event: 'media_recorder_started',
+                recorder_state: this.audioChunkRecorder?.state || null,
+            });
+        };
+        this.audioChunkRecorder.onstop = () => {
+            this.emitDiagnosticEvent('AudioRecordingState', {
+                event: 'media_recorder_stopped',
+                recorder_state: this.audioChunkRecorder?.state || null,
+                encoded_audio_chunk_count: this.encodedAudioChunkCount,
+                zero_size_chunk_count: this.audioChunkZeroSizeCount,
+                request_count: this.audioChunkRequestCount,
+            });
+        };
+        this.audioChunkRecorder.onerror = (event) => {
+            this.emitDiagnosticEvent('AudioRecordingState', {
+                event: 'media_recorder_error',
+                message: event?.error?.message || event?.message || String(event),
+            });
+        };
         this.audioChunkRecorder.ondataavailable = (event) => {
+            this.emitDiagnosticEvent('AudioRecordingState', {
+                event: 'dataavailable_fired',
+                byte_length: event?.data?.size || 0,
+                mime_type: event?.data?.type || null,
+                recorder_state: this.audioChunkRecorder?.state || null,
+            });
             if (event.data && event.data.size > 0) {
                 this.sendEncodedAudioChunk(event.data);
+                return;
             }
+            this.audioChunkZeroSizeCount += 1;
+            this.emitDiagnosticEvent('AudioRecordingState', {
+                event: 'zero_size_chunk',
+                zero_size_chunk_count: this.audioChunkZeroSizeCount,
+                mime_type: event?.data?.type || null,
+                recorder_state: this.audioChunkRecorder?.state || null,
+            });
         };
+        this.emitDiagnosticEvent('AudioRecordingState', {
+            event: 'media_recorder_start_called',
+            timeslice_ms: null,
+            recorder_state: this.audioChunkRecorder.state,
+        });
         this.audioChunkRecorder.start();
         this.audioChunkFlushInterval = setInterval(() => {
             try {
                 if (this.audioChunkRecorder?.state === 'recording') {
+                    this.audioChunkRequestCount += 1;
+                    if (this.audioChunkRequestCount <= 3 || this.audioChunkRequestCount % 10 === 0) {
+                        this.emitDiagnosticEvent('AudioRecordingState', {
+                            event: 'request_data',
+                            request_count: this.audioChunkRequestCount,
+                            recorder_state: this.audioChunkRecorder?.state || null,
+                            encoded_audio_chunk_count: this.encodedAudioChunkCount,
+                        });
+                    }
                     this.audioChunkRecorder.requestData();
                 }
             } catch (error) {
                 console.warn('Audio chunk recorder requestData failed', error);
+                this.emitDiagnosticEvent('AudioRecordingState', {
+                    event: 'request_data_failed',
+                    request_count: this.audioChunkRequestCount,
+                    message: error?.message || String(error),
+                });
             }
         }, window.initialData.recordingChunkIntervalMs || 5000);
     }
@@ -2260,13 +2667,28 @@ class WebSocketClient {
             const recorder = this.audioChunkRecorder;
             recorder.addEventListener('stop', () => resolve(), { once: true });
             try {
+                this.audioChunkRequestCount += 1;
+                this.emitDiagnosticEvent('AudioRecordingState', {
+                    event: 'final_request_data',
+                    request_count: this.audioChunkRequestCount,
+                    recorder_state: recorder?.state || null,
+                });
                 recorder.requestData();
             } catch (error) {
                 console.warn('Final audio chunk requestData failed', error);
+                this.emitDiagnosticEvent('AudioRecordingState', {
+                    event: 'final_request_data_failed',
+                    request_count: this.audioChunkRequestCount,
+                    message: error?.message || String(error),
+                });
             }
             recorder.stop();
         });
         this.audioChunkRecorder = null;
+        this.emitDiagnosticEvent('RecordingChunkLifecycle', {
+            event: 'audio_recording_stopped',
+            encoded_audio_chunk_count: this.encodedAudioChunkCount,
+        });
     }
 
     sendMixedAudio(timestamp, audioData) {
@@ -2599,19 +3021,35 @@ function handleConversationEnd(eventDataObject) {
     }
 
     realConsole?.log('handleConversationEnd, sending meeting ended message');
+    window.ws?.emitDiagnosticEvent?.('MeetingEndLifecycle', {
+        event: 'conversation_end_received',
+        sub_code: subCode ?? null,
+    });
     try {
         const disableResult = window.ws?.disableMediaSending?.();
         if (disableResult && typeof disableResult.catch === 'function') {
             disableResult.catch((error) => {
                 realConsole?.warn('handleConversationEnd failed to disable media sending', error);
+                window.ws?.emitDiagnosticEvent?.('MeetingEndLifecycle', {
+                    event: 'disable_media_sending_failed',
+                    error: error?.message || String(error),
+                });
             });
         }
     } catch (error) {
         realConsole?.warn('handleConversationEnd failed to disable media sending', error);
+        window.ws?.emitDiagnosticEvent?.('MeetingEndLifecycle', {
+            event: 'disable_media_sending_failed',
+            error: error?.message || String(error),
+        });
     }
     window.ws?.sendJson({
         type: 'MeetingStatusChange',
         change: 'meeting_ended'
+    });
+    window.ws?.emitDiagnosticEvent?.('MeetingEndLifecycle', {
+        event: 'meeting_status_change_sent',
+        change: 'meeting_ended',
     });
 }
 

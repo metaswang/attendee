@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Iterable, Optional
 
@@ -59,12 +59,172 @@ class RuntimeCredentialCollection:
 
 
 @dataclass
+class RuntimeZoomOAuthAppSnapshot:
+    object_id: str
+    client_id: str
+    credentials: dict[str, Any]
+    zoom_oauth_connections: "RuntimeZoomOAuthConnectionCollection" = field(default_factory=lambda: RuntimeZoomOAuthConnectionCollection([]))
+    zoom_meeting_to_zoom_oauth_connection_mappings: "RuntimeZoomMeetingToZoomOAuthConnectionMappingCollection" = field(
+        default_factory=lambda: RuntimeZoomMeetingToZoomOAuthConnectionMappingCollection([])
+    )
+
+    def get_credentials(self) -> dict[str, Any]:
+        return self.credentials
+
+    @property
+    def client_secret(self) -> str | None:
+        return self.credentials.get("client_secret")
+
+    @property
+    def webhook_secret(self) -> str | None:
+        return self.credentials.get("webhook_secret")
+
+
+class RuntimeZoomOAuthAppCollection:
+    def __init__(self, zoom_oauth_apps: Iterable[RuntimeZoomOAuthAppSnapshot | dict[str, Any]]):
+        self._zoom_oauth_apps = [
+            zoom_oauth_app
+            if isinstance(zoom_oauth_app, RuntimeZoomOAuthAppSnapshot)
+            else RuntimeZoomOAuthAppSnapshot(
+                object_id=zoom_oauth_app["object_id"],
+                client_id=zoom_oauth_app["client_id"],
+                credentials=zoom_oauth_app.get("credentials") or {},
+                zoom_oauth_connections=RuntimeZoomOAuthConnectionCollection(zoom_oauth_app.get("zoom_oauth_connections") or []),
+                zoom_meeting_to_zoom_oauth_connection_mappings=RuntimeZoomMeetingToZoomOAuthConnectionMappingCollection(
+                    zoom_oauth_app.get("zoom_meeting_to_zoom_oauth_connection_mappings") or []
+                ),
+            )
+            for zoom_oauth_app in zoom_oauth_apps
+        ]
+
+    def filter(self, **kwargs):
+        items = self._zoom_oauth_apps
+        for key, value in kwargs.items():
+            if key == "object_id":
+                items = [zoom_oauth_app for zoom_oauth_app in items if zoom_oauth_app.object_id == value]
+            elif key == "client_id":
+                items = [zoom_oauth_app for zoom_oauth_app in items if zoom_oauth_app.client_id == value]
+        return RuntimeZoomOAuthAppCollection(items)
+
+    def first(self):
+        return self._zoom_oauth_apps[0] if self._zoom_oauth_apps else None
+
+    def exists(self):
+        return bool(self._zoom_oauth_apps)
+
+    def all(self):
+        return list(self._zoom_oauth_apps)
+
+    def __iter__(self):
+        return iter(self._zoom_oauth_apps)
+
+
+@dataclass
 class RuntimeProjectSnapshot:
     id: int
     object_id: str
     name: str
     organization: RuntimeOrganizationSnapshot
     credentials: RuntimeCredentialCollection
+    zoom_oauth_apps: RuntimeZoomOAuthAppCollection
+
+
+@dataclass
+class RuntimeZoomOAuthConnectionSnapshot:
+    object_id: str
+    user_id: str
+    account_id: str
+    client_id: str | None = None
+    client_secret: str | None = None
+    is_local_recording_token_supported: bool = True
+    is_onbehalf_token_supported: bool = False
+    credentials: dict[str, Any] | None = None
+
+    def get_credentials(self) -> dict[str, Any]:
+        return self.credentials or {}
+
+    def set_credentials(self, credentials: dict[str, Any]) -> None:
+        self.credentials = credentials or {}
+
+
+class RuntimeZoomOAuthConnectionCollection:
+    def __init__(self, zoom_oauth_connections: Iterable[RuntimeZoomOAuthConnectionSnapshot | dict[str, Any]]):
+        self._zoom_oauth_connections = [
+            zoom_oauth_connection
+            if isinstance(zoom_oauth_connection, RuntimeZoomOAuthConnectionSnapshot)
+            else RuntimeZoomOAuthConnectionSnapshot(
+                object_id=zoom_oauth_connection["object_id"],
+                user_id=zoom_oauth_connection["user_id"],
+                account_id=zoom_oauth_connection["account_id"],
+                client_id=zoom_oauth_connection.get("client_id"),
+                client_secret=zoom_oauth_connection.get("client_secret"),
+                is_local_recording_token_supported=zoom_oauth_connection.get("is_local_recording_token_supported", True),
+                is_onbehalf_token_supported=zoom_oauth_connection.get("is_onbehalf_token_supported", False),
+                credentials=zoom_oauth_connection.get("credentials") or {},
+            )
+            for zoom_oauth_connection in zoom_oauth_connections
+        ]
+
+    def filter(self, **kwargs):
+        items = self._zoom_oauth_connections
+        for key, value in kwargs.items():
+            if key == "object_id":
+                items = [zoom_oauth_connection for zoom_oauth_connection in items if zoom_oauth_connection.object_id == value]
+            elif key == "user_id":
+                items = [zoom_oauth_connection for zoom_oauth_connection in items if zoom_oauth_connection.user_id == value]
+        return RuntimeZoomOAuthConnectionCollection(items)
+
+    def first(self):
+        return self._zoom_oauth_connections[0] if self._zoom_oauth_connections else None
+
+    def exists(self):
+        return bool(self._zoom_oauth_connections)
+
+    def all(self):
+        return list(self._zoom_oauth_connections)
+
+    def __iter__(self):
+        return iter(self._zoom_oauth_connections)
+
+
+@dataclass
+class RuntimeZoomMeetingToZoomOAuthConnectionMappingSnapshot:
+    meeting_id: str
+    zoom_oauth_connection_object_id: str
+
+
+class RuntimeZoomMeetingToZoomOAuthConnectionMappingCollection:
+    def __init__(self, mappings: Iterable[RuntimeZoomMeetingToZoomOAuthConnectionMappingSnapshot | dict[str, Any]]):
+        self._mappings = [
+            mapping
+            if isinstance(mapping, RuntimeZoomMeetingToZoomOAuthConnectionMappingSnapshot)
+            else RuntimeZoomMeetingToZoomOAuthConnectionMappingSnapshot(
+                meeting_id=str(mapping["meeting_id"]),
+                zoom_oauth_connection_object_id=mapping["zoom_oauth_connection_object_id"],
+            )
+            for mapping in mappings
+        ]
+
+    def filter(self, **kwargs):
+        items = self._mappings
+        for key, value in kwargs.items():
+            if key == "meeting_id":
+                items = [mapping for mapping in items if str(mapping.meeting_id) == str(value)]
+            elif key == "zoom_oauth_connection_object_id":
+                items = [mapping for mapping in items if mapping.zoom_oauth_connection_object_id == value]
+        return RuntimeZoomMeetingToZoomOAuthConnectionMappingCollection(items)
+
+    def first(self):
+        return self._mappings[0] if self._mappings else None
+
+    def exists(self):
+        return bool(self._mappings)
+
+    def all(self):
+        return list(self._mappings)
+
+    def __iter__(self):
+        return iter(self._mappings)
 
 
 @dataclass
@@ -316,6 +476,7 @@ class RuntimeBotSnapshot:
                 is_async_transcription_enabled=organization_payload.get("is_async_transcription_enabled", True),
             ),
             credentials=RuntimeCredentialCollection(project_payload.get("credentials") or []),
+            zoom_oauth_apps=RuntimeZoomOAuthAppCollection(project_payload.get("zoom_oauth_apps") or []),
         )
 
         self.recordings = RuntimeRecordingCollection(payload.get("recordings") or ([payload["recording"]] if payload.get("recording") else []))

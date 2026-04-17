@@ -4,6 +4,7 @@ import logging
 import os
 import json
 
+from django.db import transaction
 from django.utils import timezone
 
 from bots.runtime_providers.host_runtime import runtime_command_payload, runtime_container_name, runtime_queue_key
@@ -87,8 +88,14 @@ class VPSDockerRuntimeProvider:
         lease.last_error = None
         try:
             lease.save()
-            update_slot(allocation.host_name, allocation.slot_index or 0, lease.id, bot.id, extra={"lease_status": lease.status})
-            self._queue_launch(bot, lease, allocation.host_name, allocation.slot_index or 0)
+            def publish_runtime_launch() -> None:
+                update_slot(allocation.host_name, allocation.slot_index or 0, lease.id, bot.id, extra={"lease_status": lease.status})
+                self._queue_launch(bot, lease, allocation.host_name, allocation.slot_index or 0)
+
+            if transaction.get_connection().in_atomic_block:
+                transaction.on_commit(publish_runtime_launch)
+            else:
+                publish_runtime_launch()
         except Exception as exc:
             release_vps_slot(lease)
             lease.mark_failed(str(exc))

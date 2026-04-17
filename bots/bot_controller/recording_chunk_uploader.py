@@ -1,6 +1,7 @@
 import datetime
 import json
 import logging
+import os
 import threading
 from queue import Queue
 
@@ -122,6 +123,30 @@ class RecordingChunkUploader:
         self.queue.put((chunk_path, data))
         return chunk_path
 
+    def upload_single_chunk_file(self, file_path: str):
+        if self._upload_result is not None:
+            return self._upload_result
+
+        if not file_path or not os.path.exists(file_path):
+            raise RuntimeError(f"Recording file does not exist: {file_path!r}")
+
+        with open(file_path, "rb") as file_handle:
+            data = file_handle.read()
+
+        if not data:
+            raise RuntimeError(f"Recording file is empty: {file_path!r}")
+
+        chunk_path = self._next_chunk_path()
+        self._upload_chunk(chunk_path, data)
+        with self._lock:
+            self.uploaded_chunk_paths = [chunk_path]
+        manifest_path = self._upload_manifest([chunk_path])
+        self._upload_result = {
+            "chunk_paths": [chunk_path],
+            "manifest_path": manifest_path,
+        }
+        return self._upload_result
+
     def _upload_chunk(self, chunk_path: str, data: bytes):
         if self._azure_service_client is not None:
             blob_client = self._azure_service_client.get_blob_client(container=self._azure_container, blob=chunk_path)
@@ -206,8 +231,9 @@ class RecordingChunkUploader:
         }
         return self._upload_result
 
-    def shutdown(self):
-        self.wait_for_uploads()
+    def shutdown(self, *, wait_for_uploads: bool = True):
+        if wait_for_uploads:
+            self.wait_for_uploads()
         for _ in self._workers:
             self.queue.put(None)
         for worker in self._workers:

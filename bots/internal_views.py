@@ -14,6 +14,7 @@ from pathlib import Path
 from textwrap import shorten
 
 import requests
+from django.conf import settings as django_settings
 from django.http import FileResponse, HttpResponseNotAllowed, JsonResponse
 from django.utils.decorators import method_decorator
 from django.views import View
@@ -55,12 +56,283 @@ from bots.models import (
 from bots.bots_api_utils import build_site_url
 from bots.runtime_providers import get_runtime_provider
 from bots.meeting_url_utils import meeting_type_from_url
+from bots.meetbot_diarization import (
+    build_meetbot_speaker_directory,
+    resolve_meetbot_identity_key,
+)
 from bots.webhook_payloads import chat_message_webhook_payload, participant_event_webhook_payload, utterance_webhook_payload
 from bots.webhook_utils import trigger_webhook
 from bots.webhook_utils import sign_payload, verify_signature
 
 logger = logging.getLogger(__name__)
 REPO_ROOT = Path(__file__).resolve().parents[1]
+RECORDING_COMPLETE_UPSTREAM_TIMEOUT_SECONDS = 20
+
+
+def _build_meetbot_global_diarization(
+    bot,
+    session_id: str,
+    *,
+    recording_duration_ms: int | None = None,
+) -> dict | None:
+    """
+    Build a global_diarization dict (compatible with repo3's schema) from the
+    persisted participant speech start/stop events for this bot.
+
+    The generated timestamps are relative to recording.first_buffer_timestamp_ms
+    so downstream global_map consumers see the same time basis as transcript
+    chunks.
+    """
+    from .models import Recording
+
+    try:
+        recording = Recording.objects.filter(bot=bot, is_default_recording=True).first()
+        if recording is None:
+            recording = bot.recordings.order_by("-created_at").first()
+        if recording is None:
+            logger.warning(
+                "No recording found when building meetbot global diarization bot=%s session=%s",
+                getattr(bot, "object_id", None),
+                session_id,
+            )
+            return None
+
+        first_buffer_timestamp_ms = getattr(recording, "first_buffer_timestamp_ms", None)
+        if first_buffer_timestamp_ms is None:
+            logger.warning(
+                "Missing first_buffer_timestamp_ms when building meetbot global diarization "
+                "bot=%s session=%s recording=%s",
+                getattr(bot, "object_id", None),
+                session_id,
+                getattr(recording, "object_id", None),
+            )
+            return None
+
+        normalized_duration_ms = None
+        if recording_duration_ms is not None:
+            try:
+                normalized_duration_ms = max(0, int(recording_duration_ms))
+            except (TypeError, ValueError):
+                normalized_duration_ms = None
+        recording_start_ms = int(first_buffer_timestamp_ms)
+        recording_end_ms = (
+            recording_start_ms + normalized_duration_ms if normalized_duration_ms is not None else None
+        )
+
+        logger.info(
+            "Building meetbot global diarization from participant events "
+            "bot=%s session=%s recording=%s first_buffer_timestamp_ms=%s recording_duration_ms=%s",
+            getattr(bot, "object_id", None),
+            session_id,
+            getattr(recording, "object_id", None),
+            recording_start_ms,
+            normalized_duration_ms,
+        )
+
+        speech_events_qs = (
+            ParticipantEvent.objects.filter(
+                participant__bot=bot,
+                participant__is_the_bot=False,
+                event_type__in=[ParticipantEventTypes.SPEECH_START, ParticipantEventTypes.SPEECH_STOP],
+                timestamp_ms__gte=recording_start_ms,
+            )
+            .select_related("participant")
+            .order_by("participant__uuid", "timestamp_ms", "id")
+        )
+        if recording_end_ms is not None:
+            speech_events_qs = speech_events_qs.filter(timestamp_ms__lte=recording_end_ms)
+
+        speech_events = list(speech_events_qs)
+        if not speech_events:
+            logger.warning(
+                "No participant speech events found when building meetbot global diarization "
+                "bot=%s session=%s recording=%s",
+                getattr(bot, "object_id", None),
+                session_id,
+                getattr(recording, "object_id", None),
+            )
+            return None
+
+        speaker_directory, directory_stats = build_meetbot_speaker_directory(
+            [
+                {
+                    "participant_uuid": getattr(event.participant, "uuid", None),
+                    "participant_user_uuid": getattr(event.participant, "user_uuid", None),
+                    "participant_name": getattr(event.participant, "full_name", None),
+                    "timestamp_ms": getattr(event, "timestamp_ms", None),
+                }
+                for event in speech_events
+            ]
+        )
+
+        speaker_events: dict[str, list[ParticipantEvent]] = {}
+        for event in speech_events:
+            speaker_id = resolve_meetbot_identity_key(
+                getattr(event.participant, "user_uuid", None),
+                getattr(event.participant, "uuid", None),
+            )
+            if not speaker_id:
+                continue
+            speaker_events.setdefault(speaker_id, []).append(event)
+
+        segments = []
+        skipped_negative_intervals = 0
+        duplicate_start_events = 0
+        dangling_start_events = 0
+        for speaker_id, speaker_event_list in speaker_events.items():
+            speaker_meta = speaker_directory.get(speaker_id)
+            if not isinstance(speaker_meta, dict):
+                continue
+            speaker = str(speaker_meta.get("speaker") or "").strip()
+            if not speaker:
+                continue
+            current_start_ms = None
+            for event in speaker_event_list:
+                relative_ms = int(event.timestamp_ms) - recording_start_ms
+                event_type = int(event.event_type)
+                if event_type == ParticipantEventTypes.SPEECH_START:
+                    if current_start_ms is None:
+                        current_start_ms = max(0, relative_ms)
+                    else:
+                        duplicate_start_events += 1
+                elif event_type == ParticipantEventTypes.SPEECH_STOP:
+                    if current_start_ms is None:
+                        continue
+                    end_ms = relative_ms
+                    if normalized_duration_ms is not None:
+                        end_ms = min(end_ms, normalized_duration_ms)
+                    if end_ms <= current_start_ms:
+                        skipped_negative_intervals += 1
+                    else:
+                        segments.append(
+                            {
+                                "start_ms": int(current_start_ms),
+                                "end_ms": int(end_ms),
+                                "speaker": speaker,
+                            }
+                        )
+                    current_start_ms = None
+            if current_start_ms is not None:
+                dangling_start_events += 1
+                if normalized_duration_ms is not None and normalized_duration_ms > current_start_ms:
+                    segments.append(
+                        {
+                            "start_ms": int(current_start_ms),
+                            "end_ms": int(normalized_duration_ms),
+                            "speaker": speaker,
+                        }
+                    )
+
+        segments.sort(key=lambda item: (int(item["start_ms"]), int(item["end_ms"]), str(item["speaker"])))
+        if not segments:
+            logger.warning(
+                "No meetbot speaker segments could be built from participant events "
+                "bot=%s session=%s recording=%s speech_event_count=%s",
+                getattr(bot, "object_id", None),
+                session_id,
+                getattr(recording, "object_id", None),
+                len(speech_events),
+            )
+            return None
+
+        user_id = str(bot.project.object_id)
+        speakers = [
+            {
+                "speaker": str(meta["speaker"]),
+                "speaker_id": str(meta["speaker_id"]),
+                "participant_name": meta.get("participant_name"),
+                "participant_user_uuid": meta.get("participant_user_uuid"),
+                "participant_uuid": meta.get("participant_uuid"),
+                "label_source": str(meta.get("label_source") or "participant_name"),
+            }
+            for _, meta in sorted(speaker_directory.items(), key=lambda kv: (int(kv[1].get("first_seen_ms") or 0), kv[0]))
+        ]
+        logger.info(
+            "Built meetbot global diarization from participant events "
+            "bot=%s session=%s recording=%s speech_event_count=%s segment_count=%s speaker_count=%s "
+            "duplicate_start_events=%s dangling_start_events=%s skipped_negative_intervals=%s "
+            "fallback_speaker_labels=%s speaker_name_collisions=%s",
+            getattr(bot, "object_id", None),
+            session_id,
+            getattr(recording, "object_id", None),
+            len(speech_events),
+            len(segments),
+            len({s['speaker'] for s in segments}),
+            duplicate_start_events,
+            dangling_start_events,
+            skipped_negative_intervals,
+            directory_stats["fallback_speaker_labels"],
+            directory_stats["speaker_name_collisions"],
+        )
+        return {
+            "session_id": session_id,
+            "user_id": user_id,
+            "segments": segments,
+            "speakers": speakers,
+            "speaker_count": len({s["speaker"] for s in segments}),
+            "backend": "meetbot_participant_events",
+        }
+    except Exception:
+        logger.exception(
+            "Failed to build meetbot global diarization for bot=%s session=%s",
+            getattr(bot, "object_id", None),
+            session_id,
+        )
+        return None
+
+
+def _upload_meetbot_global_diarization(
+    global_diarization: dict,
+    user_id: str,
+    session_id: str,
+) -> str | None:
+    """
+    Upload the meetbot-derived global_diarization JSON to R2 (audio bucket).
+    Returns the R2 object key on success, None on failure.
+    Key: customer_audio/{user_id}/{session_id}/diarization/global_diarization.json
+    """
+    object_key = f"customer_audio/{user_id}/{session_id}/diarization/global_diarization.json"
+    payload_bytes = json.dumps(global_diarization, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    try:
+        if getattr(django_settings, "STORAGE_PROTOCOL", "s3") == "azure":
+            from azure.storage.blob import BlobServiceClient, ContentSettings
+
+            options = django_settings.RECORDING_STORAGE_BACKEND.get("OPTIONS", {})
+            if options.get("connection_string"):
+                service_client = BlobServiceClient.from_connection_string(options["connection_string"])
+            else:
+                account_url = f"https://{options.get('account_name')}.blob.core.windows.net"
+                service_client = BlobServiceClient(account_url=account_url, credential=options.get("account_key"))
+            container = getattr(django_settings, "AZURE_AUDIO_CHUNK_STORAGE_CONTAINER_NAME", "")
+            blob_client = service_client.get_blob_client(container=container, blob=object_key)
+            blob_client.upload_blob(
+                payload_bytes,
+                overwrite=True,
+                content_settings=ContentSettings(content_type="application/json"),
+            )
+        else:
+            import boto3
+
+            options = django_settings.RECORDING_STORAGE_BACKEND.get("OPTIONS", {})
+            s3_client = boto3.client(
+                "s3",
+                endpoint_url=options.get("endpoint_url"),
+                aws_access_key_id=options.get("access_key"),
+                aws_secret_access_key=options.get("secret_key"),
+            )
+            bucket = getattr(django_settings, "AWS_AUDIO_CHUNK_STORAGE_BUCKET_NAME", "")
+            s3_client.put_object(
+                Bucket=bucket,
+                Key=object_key,
+                Body=payload_bytes,
+                ContentType="application/json",
+            )
+        return object_key
+    except Exception:
+        logger.exception(
+            "Failed to upload meetbot global diarization key=%s", object_key
+        )
+        return None
 SOURCE_ARCHIVE_EXCLUDED_DIR_NAMES = {
     ".git",
     ".hg",
@@ -168,8 +440,13 @@ def _serialize_bot_runtime_snapshot(bot: Bot, lease: BotRuntimeLease) -> dict:
     recording_settings = bot_settings.get("recording_settings") or {}
     callback_settings = bot_settings.get("callback_settings") or {}
     callback_settings_changed = False
+    is_runtime_hosted_bot = lease.provider in {
+        BotRuntimeProviderTypes.GCP_COMPUTE_INSTANCE,
+        BotRuntimeProviderTypes.VPS_DOCKER,
+    }
+    meeting_type = meeting_type_from_url(bot.meeting_url)
 
-    if lease.provider in {BotRuntimeProviderTypes.GCP_COMPUTE_INSTANCE, BotRuntimeProviderTypes.VPS_DOCKER} and meeting_type_from_url(bot.meeting_url) in {MeetingTypes.GOOGLE_MEET, MeetingTypes.TEAMS}:
+    if is_runtime_hosted_bot and meeting_type in {MeetingTypes.GOOGLE_MEET, MeetingTypes.TEAMS}:
         session_id = str((bot.metadata or {}).get("session_id") or "").strip() or bot.object_id
         recording_format = recording_settings.get("format") or RecordingFormats.MP3
         recording_settings["transport"] = "r2_chunks"
@@ -182,6 +459,8 @@ def _serialize_bot_runtime_snapshot(bot: Bot, lease: BotRuntimeLease) -> dict:
             recording_settings.setdefault("video_chunk_prefix", f"video/{bot.project.object_id}/{session_id}/chunks")
             recording_settings.pop("audio_chunk_prefix", None)
         recording_settings.setdefault("chunk_interval_ms", 5000)
+
+    if is_runtime_hosted_bot and callback_settings.get("recording_complete"):
         recording_complete = copy.deepcopy(callback_settings.get("recording_complete") or {})
         recording_complete["url"] = _runtime_recording_complete_callback_url(lease)
         upstream_signing_secret = recording_complete.get("signing_secret")
@@ -228,6 +507,34 @@ def _serialize_bot_runtime_snapshot(bot: Bot, lease: BotRuntimeLease) -> dict:
         }
         for credential in bot.project.credentials.all().order_by("created_at")
     ]
+    project_zoom_oauth_apps = [
+        {
+            "object_id": zoom_oauth_app.object_id,
+            "client_id": zoom_oauth_app.client_id,
+            "credentials": zoom_oauth_app.get_credentials() or {},
+            "zoom_oauth_connections": [
+                {
+                    "object_id": zoom_oauth_connection.object_id,
+                    "user_id": zoom_oauth_connection.user_id,
+                    "account_id": zoom_oauth_connection.account_id,
+                    "client_id": zoom_oauth_connection.zoom_oauth_app.client_id,
+                    "client_secret": zoom_oauth_connection.zoom_oauth_app.client_secret,
+                    "is_local_recording_token_supported": zoom_oauth_connection.is_local_recording_token_supported,
+                    "is_onbehalf_token_supported": zoom_oauth_connection.is_onbehalf_token_supported,
+                    "credentials": zoom_oauth_connection.get_credentials() or {},
+                }
+                for zoom_oauth_connection in zoom_oauth_app.zoom_oauth_connections.all().order_by("created_at")
+            ],
+            "zoom_meeting_to_zoom_oauth_connection_mappings": [
+                {
+                    "meeting_id": str(mapping.meeting_id),
+                    "zoom_oauth_connection_object_id": mapping.zoom_oauth_connection.object_id,
+                }
+                for mapping in zoom_oauth_app.zoom_meeting_to_zoom_oauth_connection_mappings.all().order_by("created_at")
+            ],
+        }
+        for zoom_oauth_app in bot.project.zoom_oauth_apps.all().order_by("created_at")
+    ]
     return {
         "lease": {
             "id": lease.id,
@@ -270,6 +577,7 @@ def _serialize_bot_runtime_snapshot(bot: Bot, lease: BotRuntimeLease) -> dict:
                 "is_async_transcription_enabled": bot.project.organization.is_async_transcription_enabled,
             },
             "credentials": project_credentials,
+            "zoom_oauth_apps": project_zoom_oauth_apps,
         },
         "recordings": recordings,
         "last_bot_event": None
@@ -533,6 +841,68 @@ class BotRuntimeLeaseRecordingCompleteView(View):
             (((payload.get("data") or {}).get("audio") or {}).get("raw_path")),
         )
 
+        # Enrich the payload with meetbot speaker time ranges so downstream transcription
+        # can skip model diarization and use the per-participant recording data directly.
+        _data = dict(payload.get("data") or {})
+        _audio = dict(_data.get("audio") or {})
+        _session_id = str(_data.get("session_id") or "").strip()
+        _user_id = str(lease.bot.project.object_id)
+        if _session_id and _user_id and not (_audio.get("global_diarization_path") or _data.get("global_diarization_path")):
+            logger.info(
+                "Meetbot runtime callback missing global_diarization_path; attempting build bot=%s session=%s user=%s",
+                lease.bot.object_id,
+                _session_id,
+                _user_id,
+            )
+            _audio_duration_sec = _audio.get("duration_sec")
+            _recording_duration_ms = None
+            if _audio_duration_sec is not None:
+                try:
+                    _recording_duration_ms = max(0, int(round(float(_audio_duration_sec) * 1000.0)))
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "Invalid audio duration for meetbot global diarization build "
+                        "bot=%s session=%s raw_duration=%r",
+                        lease.bot.object_id,
+                        _session_id,
+                        _audio_duration_sec,
+                    )
+            _global_diar = _build_meetbot_global_diarization(
+                lease.bot,
+                _session_id,
+                recording_duration_ms=_recording_duration_ms,
+            )
+            if _global_diar:
+                _global_diar_path = _upload_meetbot_global_diarization(_global_diar, _user_id, _session_id)
+                if _global_diar_path:
+                    payload = dict(payload)
+                    payload["data"] = _data
+                    payload["data"]["audio"] = _audio
+                    payload["data"]["audio"]["global_diarization_path"] = _global_diar_path
+                    logger.info(
+                        "Attached meetbot global diarization to recording complete callback "
+                        "lease=%s bot=%s session=%s path=%s segment_count=%s",
+                        lease.id,
+                        lease.bot.object_id,
+                        _session_id,
+                        _global_diar_path,
+                        len(_global_diar.get("segments") or []),
+                    )
+                else:
+                    logger.warning(
+                        "Failed to upload meetbot global diarization bot=%s session=%s user=%s",
+                        lease.bot.object_id,
+                        _session_id,
+                        _user_id,
+                    )
+            else:
+                logger.warning(
+                    "Meetbot global diarization build returned empty bot=%s session=%s user=%s",
+                    lease.bot.object_id,
+                    _session_id,
+                    _user_id,
+                )
+
         callback_url = lease.bot.recording_complete_callback_url()
         callback_signing_secret = lease.bot.recording_complete_upstream_signing_secret()
         if not callback_url or not callback_signing_secret:
@@ -557,7 +927,7 @@ class BotRuntimeLeaseRecordingCompleteView(View):
                     "X-Webhook-Timestamp": upstream_timestamp,
                     "X-Webhook-Signature": upstream_signature,
                 },
-                timeout=20,
+                timeout=RECORDING_COMPLETE_UPSTREAM_TIMEOUT_SECONDS,
             )
         except requests.RequestException as exc:
             logger.exception(
@@ -963,7 +1333,6 @@ class BotRuntimeLeaseAudioChunksView(View):
         return JsonResponse(
             {
                 "audio_chunk_id": audio_chunk.id,
-                "audio_chunk_object_id": audio_chunk.object_id,
                 "utterance_id": utterance.id,
             },
             status=201,

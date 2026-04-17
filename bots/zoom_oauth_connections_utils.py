@@ -8,6 +8,7 @@ from django.utils import timezone
 
 from bots.meeting_url_utils import parse_zoom_join_url
 from bots.models import Bot, WebhookTriggerTypes, ZoomMeetingToZoomOAuthConnectionMapping, ZoomOAuthConnection, ZoomOAuthConnectionStates
+from bots.runtime_snapshot import RuntimeZoomOAuthAppSnapshot
 from bots.webhook_payloads import zoom_oauth_connection_webhook_payload
 from bots.webhook_utils import trigger_webhook
 
@@ -51,6 +52,54 @@ def _verify_zoom_webhook_signature(body: str, timestamp: str, signature: str, se
     hmac_hash = hmac.new(secret.encode("utf-8"), f"v0:{timestamp}:{body}".encode("utf-8"), hashlib.sha256).hexdigest()
     expected_signature = f"v0={hmac_hash}"
     return expected_signature == signature
+
+
+def _get_zoom_oauth_app_object_id(zoom_oauth_app) -> str | None:
+    object_id = getattr(zoom_oauth_app, "object_id", None)
+    object_id = str(object_id).strip() if object_id is not None else ""
+    return object_id or None
+
+
+def _is_runtime_zoom_oauth_app_snapshot(zoom_oauth_app) -> bool:
+    return isinstance(zoom_oauth_app, RuntimeZoomOAuthAppSnapshot)
+
+
+def _get_runtime_zoom_oauth_connection_by_user_id(zoom_oauth_app, user_id: str):
+    connections = getattr(zoom_oauth_app, "zoom_oauth_connections", None)
+    if connections is None:
+        return None
+    if hasattr(connections, "filter"):
+        return connections.filter(user_id=user_id).first()
+    for connection in connections or []:
+        if getattr(connection, "user_id", None) == user_id:
+            return connection
+    return None
+
+
+def _get_runtime_zoom_oauth_connection_for_meeting_id(zoom_oauth_app, meeting_id: str):
+    mappings = getattr(zoom_oauth_app, "zoom_meeting_to_zoom_oauth_connection_mappings", None)
+    if mappings is None:
+        return None
+    if hasattr(mappings, "filter"):
+        mapping = mappings.filter(meeting_id=str(meeting_id)).first()
+    else:
+        mapping = None
+        for item in mappings or []:
+            if str(getattr(item, "meeting_id", "")) == str(meeting_id):
+                mapping = item
+                break
+    if not mapping:
+        return None
+    connection_object_id = getattr(mapping, "zoom_oauth_connection_object_id", None)
+    if connection_object_id:
+        connections = getattr(zoom_oauth_app, "zoom_oauth_connections", None)
+        if connections is not None and hasattr(connections, "filter"):
+            return connections.filter(object_id=connection_object_id).first()
+        if connections is not None:
+            for connection in connections or []:
+                if getattr(connection, "object_id", None) == connection_object_id:
+                    return connection
+    return getattr(mapping, "zoom_oauth_connection", None)
 
 
 def compute_zoom_webhook_validation_response(plain_token: str, secret_token: str) -> dict:
@@ -97,8 +146,9 @@ def _get_access_token(zoom_oauth_connection) -> str:
         raise ZoomAPIAuthenticationError("No credentials found for zoom oauth connection")
 
     refresh_token = credentials.get("refresh_token")
-    client_id = zoom_oauth_connection.zoom_oauth_app.client_id
-    client_secret = zoom_oauth_connection.zoom_oauth_app.client_secret
+    zoom_oauth_app = getattr(zoom_oauth_connection, "zoom_oauth_app", None)
+    client_id = getattr(zoom_oauth_app, "client_id", None) or getattr(zoom_oauth_connection, "client_id", None)
+    client_secret = getattr(zoom_oauth_app, "client_secret", None) or getattr(zoom_oauth_connection, "client_secret", None)
     if not refresh_token or not client_id or not client_secret:
         raise ZoomAPIAuthenticationError("Missing refresh_token or client_secret")
 
@@ -252,15 +302,49 @@ def get_local_recording_token_via_zoom_oauth_app(bot: Bot) -> str | None:
     if not zoom_oauth_app:
         return None
 
+    zoom_oauth_app_object_id = _get_zoom_oauth_app_object_id(zoom_oauth_app)
+    if not zoom_oauth_app_object_id:
+        logger.info("Zoom oauth app missing object_id for meeting url %s", meeting_url)
+        return None
+
     meeting_id, password = parse_zoom_join_url(meeting_url)
     if not meeting_id:
         logger.info(f"No meeting id found in join url {meeting_url}")
         return None
 
-    mapping_for_meeting_id = ZoomMeetingToZoomOAuthConnectionMapping.objects.filter(zoom_oauth_app=zoom_oauth_app, meeting_id=str(meeting_id)).first()
+    if _is_runtime_zoom_oauth_app_snapshot(zoom_oauth_app):
+        runtime_zoom_oauth_connection = _get_runtime_zoom_oauth_connection_for_meeting_id(zoom_oauth_app, str(meeting_id))
+        if runtime_zoom_oauth_connection is not None:
+            if not getattr(runtime_zoom_oauth_connection, "is_local_recording_token_supported", True):
+                logger.info(
+                    "Runtime zoom oauth connection %s does not support local recording tokens, skipping",
+                    getattr(runtime_zoom_oauth_connection, "object_id", None),
+                )
+                return None
+            try:
+                access_token = _get_access_token(runtime_zoom_oauth_connection)
+                return _get_local_recording_token(meeting_id, access_token)
+            except Exception as e:
+                logger.exception(f"Failed to get local recording token via runtime zoom oauth app for {meeting_url}: {e}")
+                return None
+        logger.info(
+            "No runtime zoom oauth mapping found for meeting id %s in zoom oauth app %s",
+            meeting_id,
+            zoom_oauth_app_object_id,
+        )
+        return None
+
+    mapping_for_meeting_id = ZoomMeetingToZoomOAuthConnectionMapping.objects.filter(
+        zoom_oauth_app__object_id=zoom_oauth_app_object_id,
+        meeting_id=str(meeting_id),
+    ).first()
 
     if not mapping_for_meeting_id:
-        logger.info(f"No mapping found for meeting id {meeting_id} in zoom oauth app {zoom_oauth_app.id}")
+        logger.info(
+            "No mapping found for meeting id %s in zoom oauth app %s",
+            meeting_id,
+            zoom_oauth_app_object_id,
+        )
         return None
 
     zoom_oauth_connection = mapping_for_meeting_id.zoom_oauth_connection
@@ -294,7 +378,44 @@ def get_onbehalf_token_via_zoom_oauth_app(bot: Bot) -> str | None:
     if not zoom_oauth_app:
         return None
 
-    zoom_oauth_connection = ZoomOAuthConnection.objects.filter(zoom_oauth_app=zoom_oauth_app, user_id=user_id_for_onbehalf_token).first()
+    zoom_oauth_app_object_id = _get_zoom_oauth_app_object_id(zoom_oauth_app)
+    if not zoom_oauth_app_object_id:
+        logger.info("Zoom oauth app missing object_id for onbehalf token lookup user_id=%s", user_id_for_onbehalf_token)
+        return None
+
+    if _is_runtime_zoom_oauth_app_snapshot(zoom_oauth_app):
+        runtime_zoom_oauth_connection = _get_runtime_zoom_oauth_connection_by_user_id(zoom_oauth_app, user_id_for_onbehalf_token)
+        if runtime_zoom_oauth_connection is not None:
+            if not getattr(runtime_zoom_oauth_connection, "is_onbehalf_token_supported", False):
+                logger.info(
+                    "Runtime zoom oauth connection %s does not support onbehalf tokens, skipping",
+                    getattr(runtime_zoom_oauth_connection, "object_id", None),
+                )
+                return None
+
+            meeting_url = bot.meeting_url
+            meeting_id, password = parse_zoom_join_url(meeting_url)
+            if not meeting_id:
+                logger.info(f"No meeting id found in join url {meeting_url}")
+                return None
+
+            try:
+                access_token = _get_access_token(runtime_zoom_oauth_connection)
+                return _get_onbehalf_token(meeting_id, access_token)
+            except Exception as e:
+                logger.exception(f"Failed to get onbehalf token via runtime zoom oauth app with user id {user_id_for_onbehalf_token}: {e}")
+                return None
+        logger.info(
+            "No runtime zoom oauth connection found for user id %s in zoom oauth app %s",
+            user_id_for_onbehalf_token,
+            zoom_oauth_app_object_id,
+        )
+        return None
+
+    zoom_oauth_connection = ZoomOAuthConnection.objects.filter(
+        zoom_oauth_app__object_id=zoom_oauth_app_object_id,
+        user_id=user_id_for_onbehalf_token,
+    ).first()
     if not zoom_oauth_connection:
         return None
 

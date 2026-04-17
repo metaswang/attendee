@@ -5,6 +5,7 @@ import uuid
 import time
 from pathlib import Path
 
+from django.db import transaction
 from django.urls import reverse
 from django.utils import timezone
 
@@ -669,39 +670,45 @@ class GCPComputeInstanceProvider:
         )
         try:
             lease.save()
-            redis_client().setex(
-                lease_key(lease.id),
-                24 * 60 * 60,
-                json.dumps(
-                    {
-                        "bot_id": bot.id,
-                        "bot_object_id": bot.object_id,
-                        "lease_id": lease.id,
-                        "provider": BotRuntimeProviderTypes.GCP_COMPUTE_INSTANCE,
-                        "host_name": host_name,
-                        "slot_index": slot_index,
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ),
-            )
-            redis_client().setex(
-                bot_key(bot.id),
-                24 * 60 * 60,
-                json.dumps(
-                    {
-                        "bot_id": bot.id,
-                        "lease_id": lease.id,
-                        "provider": BotRuntimeProviderTypes.GCP_COMPUTE_INSTANCE,
-                        "host_name": host_name,
-                        "slot_index": slot_index,
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ),
-            )
-            redis_client().rpush(runtime_queue_key(host_name), json.dumps(payload, sort_keys=True, separators=(",", ":")))
-            self._update_host_record(host_name, last_active_at=timezone.now().isoformat(), state="provisioning")
+            def publish_runtime_launch() -> None:
+                redis_client().setex(
+                    lease_key(lease.id),
+                    24 * 60 * 60,
+                    json.dumps(
+                        {
+                            "bot_id": bot.id,
+                            "bot_object_id": bot.object_id,
+                            "lease_id": lease.id,
+                            "provider": BotRuntimeProviderTypes.GCP_COMPUTE_INSTANCE,
+                            "host_name": host_name,
+                            "slot_index": slot_index,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                )
+                redis_client().setex(
+                    bot_key(bot.id),
+                    24 * 60 * 60,
+                    json.dumps(
+                        {
+                            "bot_id": bot.id,
+                            "lease_id": lease.id,
+                            "provider": BotRuntimeProviderTypes.GCP_COMPUTE_INSTANCE,
+                            "host_name": host_name,
+                            "slot_index": slot_index,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                )
+                redis_client().rpush(runtime_queue_key(host_name), json.dumps(payload, sort_keys=True, separators=(",", ":")))
+                self._update_host_record(host_name, last_active_at=timezone.now().isoformat(), state="provisioning")
+
+            if transaction.get_connection().in_atomic_block:
+                transaction.on_commit(publish_runtime_launch)
+            else:
+                publish_runtime_launch()
         except Exception as exc:
             redis_client().delete(f"meetbot:scheduler:slots:gcp:{host_name}:{slot_index}")
             redis_client().delete(lease_key(lease.id))

@@ -1735,9 +1735,16 @@ class CreateBotSerializer(BotValidationMixin, serializers.Serializer):
         if transport == "r2_chunks":
             meeting_type = meeting_type_from_url(data.get("meeting_url", ""))
             zoom_settings = data.get("zoom_settings") or {}
+            if meeting_type == MeetingTypes.ZOOM and zoom_settings.get("sdk", "native") == "web":
+                raise serializers.ValidationError(
+                    {
+                        "recording_settings": {
+                            "transport": "transport='r2_chunks' is not supported for Zoom when using the web SDK. Use zoom_settings.sdk='native' or Zoom RTMS instead."
+                        }
+                    }
+                )
             is_supported_web_adapter = (
                 meeting_type in [MeetingTypes.GOOGLE_MEET, MeetingTypes.TEAMS]
-                or (meeting_type == MeetingTypes.ZOOM and zoom_settings.get("sdk", "native") == "web")
             )
             if not is_supported_web_adapter:
                 raise serializers.ValidationError({"recording_settings": {"transport": "transport='r2_chunks' is only supported for web meeting adapters"}})

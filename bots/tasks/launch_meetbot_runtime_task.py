@@ -61,6 +61,26 @@ def launch_meetbot_runtime(self, bot_id: int):
     except Exception as exc:
         try:
             bot = Bot.objects.get(id=bot_id)
+            stale_lease = getattr(bot, "runtime_lease", None)
+            if (
+                stale_lease is not None
+                and stale_lease.status == BotRuntimeLeaseStatuses.PROVISIONING
+                and bot.first_heartbeat_timestamp is None
+            ):
+                try:
+                    get_runtime_provider(stale_lease.provider).delete_lease(stale_lease)
+                    logger.info(
+                        "Deleted stale provisioning lease %s for bot %s (%s) after launch failure",
+                        stale_lease.id,
+                        bot_id,
+                        bot.object_id,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed deleting stale provisioning lease %s for bot %s after launch failure",
+                        stale_lease.id,
+                        bot_id,
+                    )
             write_pending_bot(bot, str(exc))
         except Exception:
             logger.exception("Failed to queue pending bot %s after launch error", bot_id)

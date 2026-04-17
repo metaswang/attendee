@@ -2328,7 +2328,7 @@ class Recording(models.Model):
     completed_at = models.DateTimeField(null=True, blank=True)
     first_buffer_timestamp_ms = models.BigIntegerField(null=True, blank=True)
 
-    file = models.FileField(storage=RecordingStorage())
+    file = models.FileField(storage=RecordingStorage(), max_length=500)
 
     def __str__(self):
         return f"Recording for {self.bot.object_id}"

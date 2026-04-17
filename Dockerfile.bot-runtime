@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 FROM --platform=linux/amd64 ubuntu:22.04 AS build-base
 
 SHELL ["/bin/bash", "-c"]
@@ -12,8 +13,27 @@ WORKDIR $cwd
 
 ARG DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
+# Keep apt archives across builds via BuildKit cache mounts so re-runs are fast
+# even when upstream layers are invalidated.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    set -eux; \
+    rm -f /etc/apt/apt.conf.d/docker-clean; \
+    retry_apt() { \
+        local attempt=1 max_attempts=5; \
+        while true; do \
+            if "$@"; then \
+                return 0; \
+            fi; \
+            if [ "$attempt" -ge "$max_attempts" ]; then \
+                return 1; \
+            fi; \
+            sleep "$((attempt * 10))"; \
+            attempt=$((attempt + 1)); \
+        done; \
+    }; \
+    retry_apt apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o APT::Update::Error-Mode=any; \
+    retry_apt apt-get install -y --no-install-recommends \
     alsa \
     alsa-oss \
     alsa-utils \
@@ -103,23 +123,32 @@ RUN apt-get update \
     xfonts-scalable \
     gir1.2-gst-plugins-base-1.0 \
     gir1.2-gstreamer-1.0 \
-    --fix-missing \
-    && rm -rf /var/lib/apt/lists/*
+    --fix-missing
 
-RUN curl -fL --retry 5 --retry-all-errors --connect-timeout 15 \
-    -o chrome-linux64.zip \
-    https://storage.googleapis.com/chrome-for-testing-public/134.0.6998.88/linux64/chrome-linux64.zip \
-    && unzip chrome-linux64.zip \
-    && mv chrome-linux64 /opt/chrome-linux64 \
-    && ln -sf /opt/chrome-linux64/chrome /usr/local/bin/google-chrome \
-    && ln -sf /opt/chrome-linux64/chrome /usr/local/bin/google-chrome-stable \
-    && rm -f chrome-linux64.zip
-
-RUN wget -q https://storage.googleapis.com/chrome-for-testing-public/134.0.6998.88/linux64/chromedriver-linux64.zip \
-    && unzip chromedriver-linux64.zip \
-    && mv chromedriver-linux64/chromedriver /usr/local/bin/chromedriver \
-    && chmod +x /usr/local/bin/chromedriver \
-    && rm -rf chromedriver-linux64 chromedriver-linux64.zip
+# Pin Chrome/driver via ARG so the download layer only rebuilds when the
+# version actually changes.
+ARG CHROME_VERSION=134.0.6998.88
+RUN --mount=type=cache,target=/tmp/chrome-cache,sharing=locked \
+    set -eux; \
+    cd /tmp/chrome-cache; \
+    if [ ! -f "chrome-linux64-${CHROME_VERSION}.zip" ]; then \
+      curl -fL --retry 5 --retry-all-errors --connect-timeout 15 \
+        -o "chrome-linux64-${CHROME_VERSION}.zip" \
+        "https://storage.googleapis.com/chrome-for-testing-public/${CHROME_VERSION}/linux64/chrome-linux64.zip"; \
+    fi; \
+    if [ ! -f "chromedriver-linux64-${CHROME_VERSION}.zip" ]; then \
+      curl -fL --retry 5 --retry-all-errors --connect-timeout 15 \
+        -o "chromedriver-linux64-${CHROME_VERSION}.zip" \
+        "https://storage.googleapis.com/chrome-for-testing-public/${CHROME_VERSION}/linux64/chromedriver-linux64.zip"; \
+    fi; \
+    unzip -q "chrome-linux64-${CHROME_VERSION}.zip" -d /tmp; \
+    mv /tmp/chrome-linux64 /opt/chrome-linux64; \
+    ln -sf /opt/chrome-linux64/chrome /usr/local/bin/google-chrome; \
+    ln -sf /opt/chrome-linux64/chrome /usr/local/bin/google-chrome-stable; \
+    unzip -q "chromedriver-linux64-${CHROME_VERSION}.zip" -d /tmp; \
+    mv /tmp/chromedriver-linux64/chromedriver /usr/local/bin/chromedriver; \
+    chmod +x /usr/local/bin/chromedriver; \
+    rm -rf /tmp/chromedriver-linux64
 
 RUN update-ca-certificates \
     && ln -sf /usr/bin/python3.11 /usr/bin/python
@@ -129,8 +158,15 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
 
 FROM build-base AS deps
 
+# Copy ONLY dependency manifests first so that pure source edits in later
+# COPY steps do not invalidate the expensive `uv sync` layer.
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --python /usr/bin/python3.11 --no-dev --no-install-project --no-install-package zoom-meeting-sdk \
+
+# BuildKit cache mount keeps uv's wheel cache between builds; combined with
+# the manifest-only COPY above this means typical pure-code changes re-use
+# the fully synced venv with zero network I/O.
+RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
+    uv sync --frozen --python /usr/bin/python3.11 --no-dev --no-install-project --no-install-package zoom-meeting-sdk \
     && uv pip install --python /opt/venv/bin/python --no-cache-dir --only-binary zoom-meeting-sdk "zoom-meeting-sdk==0.0.27" \
     && uv pip uninstall --python /opt/venv/bin/python av || true \
     && uv pip install --python /opt/venv/bin/python --no-cache-dir --no-binary av "av==12.0.0"
@@ -151,8 +187,25 @@ WORKDIR $cwd
 
 ARG DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    set -eux; \
+    rm -f /etc/apt/apt.conf.d/docker-clean; \
+    retry_apt() { \
+        local attempt=1 max_attempts=5; \
+        while true; do \
+            if "$@"; then \
+                return 0; \
+            fi; \
+            if [ "$attempt" -ge "$max_attempts" ]; then \
+                return 1; \
+            fi; \
+            sleep "$((attempt * 10))"; \
+            attempt=$((attempt + 1)); \
+        done; \
+    }; \
+    retry_apt apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o APT::Update::Error-Mode=any; \
+    retry_apt apt-get install -y --no-install-recommends \
     alsa \
     alsa-oss \
     alsa-utils \
@@ -218,7 +271,7 @@ RUN apt-get update \
     xfonts-scalable \
     gir1.2-gst-plugins-base-1.0 \
     gir1.2-gstreamer-1.0 \
-    && rm -rf /var/lib/apt/lists/*
+    ;
 
 COPY --from=build-base /opt/chrome-linux64 /opt/chrome-linux64
 COPY --from=build-base /usr/local/bin/chromedriver /usr/local/bin/chromedriver
@@ -232,8 +285,15 @@ RUN ln -sf /usr/bin/python3.11 /usr/bin/python \
     && mkdir -p /etc/opt/chrome/policies/managed \
     && ln -s /tmp/attendee-chrome-policies.json /etc/opt/chrome/policies/managed/attendee-chrome-policies.json
 
+# Copy entrypoint BEFORE the full source so editing Python code does not
+# invalidate this small, cheap layer.
 COPY --chown=app:app entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod 0755 /usr/local/bin/entrypoint.sh
+
+# Source is bind-mounted over /attendee at runtime (see
+# scripts/digitalocean/attendee-bot-runner.sh), so this COPY is only used as
+# fallback / for image-only introspection. Keep it last to maximise cache
+# reuse; rely on .dockerignore to exclude build junk.
 COPY --chown=app:app . .
 RUN mkdir -p "$cwd/staticfiles" && chown -R app:app "$cwd/staticfiles"
 
