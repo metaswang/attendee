@@ -74,6 +74,17 @@ fi
 
 systemctl enable --now docker
 
+# Optional Docker Hub login. Enabled when DOCKER_USERNAME + DOCKER_TOKEN are
+# set in the environment. Using --password-stdin avoids leaking the token via
+# the process table. Paired with DOCKER_LOGOUT_AFTER at the end of the script
+# so credentials are stripped before the golden image is snapshotted.
+DOCKER_REGISTRY="${DOCKER_REGISTRY:-docker.io}"
+if [[ -n "${DOCKER_USERNAME:-}" && -n "${DOCKER_TOKEN:-}" ]]; then
+  echo "docker login ${DOCKER_REGISTRY} as ${DOCKER_USERNAME}"
+  printf '%s' "$DOCKER_TOKEN" \
+    | docker login "$DOCKER_REGISTRY" -u "$DOCKER_USERNAME" --password-stdin
+fi
+
 # Place source (support scripts, and optionally the Dockerfile for BUILD
 # mode) into $ATTENDEE_REPO_DIR. Accept either a git URL or a local path.
 if [[ -d "$ATTENDEE_REPO_URL" ]]; then
