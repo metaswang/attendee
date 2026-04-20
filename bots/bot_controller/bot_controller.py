@@ -1613,12 +1613,16 @@ class BotController:
                 chunk_interval_ms=self.bot_in_db.recording_chunk_interval_ms(),
             )
         elif self.bot_in_db.uses_muxed_screen_recording_chunks():
-            self.recording_audio_chunk_mime_type = "video/webm"
-            self.recording_audio_chunk_ext = "webm"
+            if self.bot_in_db.recording_format() == RecordingFormats.MP4:
+                self.recording_audio_chunk_mime_type = "video/mp4"
+                self.recording_audio_chunk_ext = "mp4"
+            else:
+                self.recording_audio_chunk_mime_type = "video/webm"
+                self.recording_audio_chunk_ext = "webm"
             self.recording_chunk_uploader = RecordingChunkUploader(
                 chunk_prefix=self.bot_in_db.video_chunk_prefix(),
-                chunk_ext="webm",
-                chunk_mime_type="video/webm",
+                chunk_ext=self.recording_audio_chunk_ext,
+                chunk_mime_type=self.recording_audio_chunk_mime_type,
                 raw_path=self.bot_in_db.audio_raw_path(),
                 chunk_interval_ms=self.bot_in_db.recording_chunk_interval_ms(),
             )

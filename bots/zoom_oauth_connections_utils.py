@@ -102,6 +102,32 @@ def _get_runtime_zoom_oauth_connection_for_meeting_id(zoom_oauth_app, meeting_id
     return getattr(mapping, "zoom_oauth_connection", None)
 
 
+def _get_cached_onbehalf_token(bot: Bot, *, meeting_id: str) -> str | None:
+    cache = getattr(bot, "_zoom_onbehalf_token_cache", None)
+    if not isinstance(cache, dict):
+        return None
+    return cache.get(str(meeting_id))
+
+
+def _set_cached_onbehalf_token(bot: Bot, *, meeting_id: str, token: str) -> str:
+    cache = getattr(bot, "_zoom_onbehalf_token_cache", None)
+    if not isinstance(cache, dict):
+        cache = {}
+        setattr(bot, "_zoom_onbehalf_token_cache", cache)
+    cache[str(meeting_id)] = token
+    return token
+
+
+def _log_onbehalf_token_unavailable(*, connection_object_id: str | None, user_id: str, reason: str, meeting_url: str | None):
+    logger.warning(
+        "Zoom onbehalf token unavailable connection_id=%s user_id=%s reason=%s meeting_url_hash=%s",
+        connection_object_id,
+        user_id,
+        reason,
+        hashlib.sha256(str(meeting_url or "").encode("utf-8")).hexdigest()[:12] if meeting_url else None,
+    )
+
+
 def compute_zoom_webhook_validation_response(plain_token: str, secret_token: str) -> dict:
     """
     Compute the response for a Zoom webhook validation request.
@@ -383,25 +409,34 @@ def get_onbehalf_token_via_zoom_oauth_app(bot: Bot) -> str | None:
         logger.info("Zoom oauth app missing object_id for onbehalf token lookup user_id=%s", user_id_for_onbehalf_token)
         return None
 
+    meeting_url = bot.meeting_url
+    meeting_id, password = parse_zoom_join_url(meeting_url)
+    if not meeting_id:
+        logger.info(f"No meeting id found in join url {meeting_url}")
+        return None
+    cached_token = _get_cached_onbehalf_token(bot, meeting_id=meeting_id)
+    if cached_token:
+        return cached_token
+
     if _is_runtime_zoom_oauth_app_snapshot(zoom_oauth_app):
         runtime_zoom_oauth_connection = _get_runtime_zoom_oauth_connection_by_user_id(zoom_oauth_app, user_id_for_onbehalf_token)
         if runtime_zoom_oauth_connection is not None:
             if not getattr(runtime_zoom_oauth_connection, "is_onbehalf_token_supported", False):
-                logger.info(
-                    "Runtime zoom oauth connection %s does not support onbehalf tokens, skipping",
-                    getattr(runtime_zoom_oauth_connection, "object_id", None),
+                _log_onbehalf_token_unavailable(
+                    connection_object_id=getattr(runtime_zoom_oauth_connection, "object_id", None),
+                    user_id=user_id_for_onbehalf_token,
+                    reason="onbehalf_not_supported",
+                    meeting_url=meeting_url,
                 )
-                return None
-
-            meeting_url = bot.meeting_url
-            meeting_id, password = parse_zoom_join_url(meeting_url)
-            if not meeting_id:
-                logger.info(f"No meeting id found in join url {meeting_url}")
                 return None
 
             try:
                 access_token = _get_access_token(runtime_zoom_oauth_connection)
-                return _get_onbehalf_token(meeting_id, access_token)
+                return _set_cached_onbehalf_token(
+                    bot,
+                    meeting_id=meeting_id,
+                    token=_get_onbehalf_token(meeting_id, access_token),
+                )
             except Exception as e:
                 logger.exception(f"Failed to get onbehalf token via runtime zoom oauth app with user id {user_id_for_onbehalf_token}: {e}")
                 return None
@@ -420,20 +455,18 @@ def get_onbehalf_token_via_zoom_oauth_app(bot: Bot) -> str | None:
         return None
 
     if not zoom_oauth_connection.is_onbehalf_token_supported:
-        logger.info(f"Zoom oauth connection {zoom_oauth_connection.object_id} does not support onbehalf tokens, skipping")
-        return None
-
-    meeting_url = bot.meeting_url
-
-    meeting_id, password = parse_zoom_join_url(meeting_url)
-    if not meeting_id:
-        logger.info(f"No meeting id found in join url {meeting_url}")
+        _log_onbehalf_token_unavailable(
+            connection_object_id=zoom_oauth_connection.object_id,
+            user_id=user_id_for_onbehalf_token,
+            reason="onbehalf_not_supported",
+            meeting_url=meeting_url,
+        )
         return None
 
     try:
         access_token = _get_access_token(zoom_oauth_connection)
         onbehalf_token = _get_onbehalf_token(meeting_id, access_token)
-        return onbehalf_token
+        return _set_cached_onbehalf_token(bot, meeting_id=meeting_id, token=onbehalf_token)
 
     except ZoomAPIAuthenticationError as e:
         _handle_zoom_api_authentication_error(zoom_oauth_connection, e)

@@ -9,9 +9,11 @@ from django.test import TestCase
 from django.test.utils import override_settings
 
 from accounts.models import Organization
+from bots.app_session_api_utils import create_app_session
+from bots.app_session_serializers import CreateAppSessionSerializer
 from bots.bot_controller.bot_controller import BotController
 from bots.bots_api_utils import BotCreationSource, create_bot
-from bots.models import Bot, MeetingTypes, Project, RecordingFormats
+from bots.models import Bot, MeetingTypes, Project, RecordingFormats, SessionTypes
 from bots.bot_controller.recording_chunk_uploader import RecordingChunkUploader
 from bots.bot_controller.bot_controller import R2_AUDIO_CHUNK_EXT, R2_AUDIO_CHUNK_MIME_TYPE
 from bots.serializers import CreateBotSerializer
@@ -211,6 +213,69 @@ class RecordingChunkSettingsTests(TestCase):
         self.assertFalse(serializer.is_valid())
         self.assertIn("recording_settings", serializer.errors)
         self.assertIn("not supported for Zoom when using the web SDK", str(serializer.errors))
+
+    def test_create_app_session_serializer_accepts_list_server_urls(self):
+        serializer = CreateAppSessionSerializer(
+            data={
+                "zoom_rtms": {
+                    "meeting_uuid": "meeting-uuid",
+                    "rtms_stream_id": "stream-123",
+                    "server_urls": ["wss://example.com/rtms"],
+                },
+                "recording_settings": {
+                    "format": RecordingFormats.MP3,
+                    "transport": "r2_chunks",
+                    "audio_chunk_prefix": "customer_audio/user-1/session-1/chunks",
+                    "audio_raw_path": "customer_audio/user-1/session-1/original.m4a",
+                },
+                "callback_settings": {
+                    "recording_complete": {
+                        "url": "https://api.example.com/v2/meeting/app/bot/recording/complete",
+                        "signing_secret": "top-secret",
+                    }
+                },
+            }
+        )
+
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+
+    def test_create_app_session_persists_callback_settings(self):
+        app_session, error = create_app_session(
+            {
+                "zoom_rtms": {
+                    "meeting_uuid": "meeting-uuid",
+                    "rtms_stream_id": "stream-123",
+                    "server_urls": "wss://example.com/rtms",
+                },
+                "recording_settings": {
+                    "format": RecordingFormats.MP3,
+                    "transport": "r2_chunks",
+                    "audio_chunk_prefix": "customer_audio/user-1/session-1/chunks",
+                    "audio_raw_path": "customer_audio/user-1/session-1/original.m4a",
+                },
+                "callback_settings": {
+                    "recording_complete": {
+                        "url": "https://api.example.com/v2/meeting/app/bot/recording/complete",
+                        "signing_secret": "top-secret",
+                    }
+                },
+                "metadata": {"session_id": "session-1"},
+            },
+            source=BotCreationSource.API,
+            project=self.project,
+        )
+
+        self.assertIsNone(error)
+        assert app_session is not None
+        self.assertEqual(app_session.session_type, SessionTypes.APP_SESSION)
+        self.assertEqual(
+            app_session.settings["callback_settings"]["recording_complete"]["url"],
+            "https://api.example.com/v2/meeting/app/bot/recording/complete",
+        )
+        self.assertEqual(
+            app_session.settings["callback_settings"]["recording_complete"]["signing_secret"],
+            "top-secret",
+        )
 
     def test_bot_controller_rejects_zoom_web_r2_chunks_at_runtime(self):
         bot = Bot.objects.create(

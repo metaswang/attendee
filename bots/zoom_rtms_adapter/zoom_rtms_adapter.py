@@ -138,6 +138,10 @@ def extract_join_info(join_payload: dict):
     if isinstance(server_urls, dict):
         # If Zoom ever returns a dict of URLs, pick reasonable default.
         signaling_url = server_urls.get("signaling") or server_urls.get("all") or next(iter(server_urls.values()), None)
+    elif isinstance(server_urls, list):
+        signaling_url = server_urls[0] if server_urls else None
+        if isinstance(signaling_url, dict):
+            signaling_url = signaling_url.get("signaling") or signaling_url.get("all") or next(iter(signaling_url.values()), None)
     else:
         signaling_url = server_urls
 
@@ -617,6 +621,8 @@ class RTMSClient:
             },
             "text": text,
             "caption_id": caption_id,
+            "timestamp": content.get("timestamp"),
+            "end_timestamp": content.get("end_timestamp") or content.get("endTimestamp"),
         }
         self.adapter.post_rtms_event(event)
 
@@ -888,6 +894,8 @@ class ZoomRTMSAdapter(BotAdapter):
                 "captionId": caption_id,
                 "text": json_data.get("text"),
                 "isFinal": True,
+                "timestamp": json_data.get("timestamp"),
+                "endTimestamp": json_data.get("end_timestamp"),
             }
 
             self.upsert_caption_callback(itemConverted)

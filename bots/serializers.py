@@ -2359,7 +2359,7 @@ class CreateZoomOAuthConnectionSerializer(serializers.Serializer):
     authorization_code = serializers.CharField(help_text="The authorization code received from Zoom during the OAuth flow")
     redirect_uri = serializers.CharField(help_text="The redirect URI used to obtain the authorization code")
     is_local_recording_token_supported = serializers.BooleanField(help_text="Whether the Zoom OAuth Connection supports generating local recording tokens", required=False, default=True)
-    is_onbehalf_token_supported = serializers.BooleanField(help_text="Whether the Zoom OAuth Connection supports generating onbehalf tokens", required=False, default=False)
+    is_onbehalf_token_supported = serializers.BooleanField(help_text="Whether the Zoom OAuth Connection supports generating onbehalf tokens", required=False, default=True)
 
     metadata = serializers.JSONField(help_text="JSON object containing metadata to associate with the Zoom OAuth Connection", required=False, default=None)
 

@@ -137,7 +137,7 @@ class RuntimeZoomOAuthConnectionSnapshot:
     client_id: str | None = None
     client_secret: str | None = None
     is_local_recording_token_supported: bool = True
-    is_onbehalf_token_supported: bool = False
+    is_onbehalf_token_supported: bool = True
     credentials: dict[str, Any] | None = None
 
     def get_credentials(self) -> dict[str, Any]:
@@ -159,7 +159,7 @@ class RuntimeZoomOAuthConnectionCollection:
                 client_id=zoom_oauth_connection.get("client_id"),
                 client_secret=zoom_oauth_connection.get("client_secret"),
                 is_local_recording_token_supported=zoom_oauth_connection.get("is_local_recording_token_supported", True),
-                is_onbehalf_token_supported=zoom_oauth_connection.get("is_onbehalf_token_supported", False),
+                is_onbehalf_token_supported=zoom_oauth_connection.get("is_onbehalf_token_supported", True),
                 credentials=zoom_oauth_connection.get("credentials") or {},
             )
             for zoom_oauth_connection in zoom_oauth_connections

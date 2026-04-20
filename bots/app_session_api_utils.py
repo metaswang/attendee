@@ -38,6 +38,7 @@ def create_app_session(data: dict, source: BotCreationSource, project: Project) 
     recording_settings = serializer.validated_data["recording_settings"]
     debug_settings = serializer.validated_data["debug_settings"]
     external_media_storage_settings = serializer.validated_data["external_media_storage_settings"]
+    callback_settings = serializer.validated_data["callback_settings"]
 
     metadata = serializer.validated_data["metadata"]
     websocket_settings = serializer.validated_data["websocket_settings"]
@@ -61,6 +62,7 @@ def create_app_session(data: dict, source: BotCreationSource, project: Project) 
         "debug_settings": debug_settings,
         "websocket_settings": websocket_settings,
         "external_media_storage_settings": external_media_storage_settings,
+        "callback_settings": callback_settings,
         "zoom_rtms": zoom_rtms,
     }
 

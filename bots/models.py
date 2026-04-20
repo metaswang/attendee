@@ -224,7 +224,7 @@ class ZoomOAuthConnection(models.Model):
     )
 
     is_local_recording_token_supported = models.BooleanField(default=True)
-    is_onbehalf_token_supported = models.BooleanField(default=False)
+    is_onbehalf_token_supported = models.BooleanField(default=True)
 
     def set_credentials(self, credentials_dict):
         """Encrypt and save credentials"""

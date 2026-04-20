@@ -25,9 +25,12 @@ from drf_spectacular.utils import (
                 "description": "The RTMS stream ID for the Zoom meeting",
             },
             "server_urls": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "List of server URLs for the RTMS connection",
+                "oneOf": [
+                    {"type": "string"},
+                    {"type": "array", "items": {"type": "string"}},
+                    {"type": "object"},
+                ],
+                "description": "Server URL payload for the RTMS connection",
             },
         },
         "required": ["meeting_uuid", "rtms_stream_id", "server_urls"],
@@ -51,7 +54,13 @@ class CreateAppSessionSerializer(CreateBotSerializer):
         "properties": {
             "meeting_uuid": {"type": "string"},
             "rtms_stream_id": {"type": "string"},
-            "server_urls": {"type": "string"},
+            "server_urls": {
+                "oneOf": [
+                    {"type": "string"},
+                    {"type": "array", "items": {"type": "string"}},
+                    {"type": "object"},
+                ]
+            },
             "operator_id": {"type": "string"},
         },
         "required": ["meeting_uuid", "rtms_stream_id", "server_urls"],
