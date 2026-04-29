@@ -39,7 +39,11 @@ else:
     SESSION_COOKIE_SECURE = False
     CSRF_COOKIE_SECURE = False
 
-if os.getenv("DISABLE_EMAIL", "false") != "true":
+# When DISABLE_EMAIL=true: no real SMTP; full message text is logged (see attendee.mail_backends).
+if os.getenv("DISABLE_EMAIL", "false") == "true":
+    EMAIL_BACKEND = "attendee.mail_backends.ConsoleLogEmailBackend"
+    DEFAULT_FROM_EMAIL = os.getenv("DEFAULT_FROM_EMAIL", "noreply@mail.attendee.dev")
+else:
     EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
     EMAIL_HOST = os.getenv("EMAIL_HOST", "smtp.mailgun.org")
     EMAIL_HOST_USER = os.getenv("EMAIL_HOST_USER")
@@ -79,6 +83,11 @@ LOGGING = {
         "django": {
             "handlers": ["console"],
             "level": os.getenv("ATTENDEE_LOG_LEVEL", "INFO"),
+            "propagate": False,
+        },
+        "attendee.email": {
+            "handlers": ["console"],
+            "level": "INFO",
             "propagate": False,
         },
         "xmlschema": {"level": "WARNING", "handlers": ["console"], "propagate": False},

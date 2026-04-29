@@ -1,25 +1,25 @@
-from cryptography.fernet import Fernet
-from django.core.management.utils import get_random_secret_key
-
-
-def generate_encryption_key():
-    return Fernet.generate_key().decode("utf-8")
-
-
-def generate_django_secret_key():
-    return get_random_secret_key()
+import os
+from pathlib import Path
 
 
 def main():
-    credentials_key = generate_encryption_key()
-    django_key = generate_django_secret_key()
-
-    print(f"CREDENTIALS_ENCRYPTION_KEY={credentials_key}")
-    print(f"DJANGO_SECRET_KEY={django_key}")
-    print("AWS_RECORDING_STORAGE_BUCKET_NAME=")
-    print("AWS_ACCESS_KEY_ID=")
-    print("AWS_SECRET_ACCESS_KEY=")
-    print("AWS_DEFAULT_REGION=us-east-1")
+    output_path = Path(".env.generated")
+    output_path.write_text(
+        "\n".join(
+            [
+                "CREDENTIALS_ENCRYPTION_KEY=",
+                "DJANGO_SECRET_KEY=",
+                "AWS_RECORDING_STORAGE_BUCKET_NAME=",
+                "AWS_ACCESS_KEY_ID=",
+                "AWS_SECRET_ACCESS_KEY=",
+                "AWS_DEFAULT_REGION=us-east-1",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    os.chmod(output_path, 0o600)
+    print(f"Wrote generated environment variables to {output_path}")
 
 
 if __name__ == "__main__":

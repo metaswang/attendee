@@ -1,5 +1,5 @@
-import hashlib
 from datetime import datetime
+import hashlib
 
 from django import template
 
@@ -32,8 +32,8 @@ def participant_color(uuid):
     if not uuid:
         return "#808080"  # Default gray for participants without UUID
 
-    # Generate a hash of the UUID
-    hash_object = hashlib.md5(str(uuid).encode())
+    # Generate a stable non-cryptographic color seed from the UUID.
+    hash_object = hashlib.blake2s(str(uuid).encode(), digest_size=3)
     hash_hex = hash_object.hexdigest()
 
     # Use the first 6 characters of the hash as a color code
@@ -57,9 +57,9 @@ def participant_color(uuid):
     return f"#{r:02x}{g:02x}{b:02x}"
 
 
-@register.filter
-def md5(value):
-    return hashlib.md5(str(value).encode()).hexdigest()
+@register.filter(name="md5")
+def stable_md5(value):
+    return hashlib.blake2s(str(value).encode(), digest_size=16).hexdigest()
 
 
 @register.filter

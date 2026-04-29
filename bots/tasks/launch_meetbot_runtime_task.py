@@ -81,7 +81,7 @@ def launch_meetbot_runtime(self, bot_id: int):
                         stale_lease.id,
                         bot_id,
                     )
-            write_pending_bot(bot, str(exc))
+            write_pending_bot(bot, "Failed to launch meetbot runtime")
         except Exception:
             logger.exception("Failed to queue pending bot %s after launch error", bot_id)
         logger.exception("Failed to launch meetbot runtime for bot %s: %s", bot_id, exc)

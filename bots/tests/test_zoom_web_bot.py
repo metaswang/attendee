@@ -265,6 +265,50 @@ class TestZoomWebBot(TransactionTestCase):
         controller.recording_chunk_uploader.shutdown.assert_called_once_with(wait_for_uploads=False)
         controller.create_bot_event.assert_called()
 
+    def test_clear_zoom_token_references_removes_runtime_secret_refs(self):
+        controller = BotController.__new__(BotController)
+        bot_snapshot = MagicMock()
+        bot_snapshot.object_id = "bot_test"
+        bot_snapshot._zoom_onbehalf_token_cache = {"123456789": "onbehalf-token"}
+
+        zoom_oauth_connection = MagicMock()
+        zoom_oauth_connection.client_secret = "runtime-client-secret"
+        zoom_oauth_connection.credentials = {"refresh_token": "runtime-refresh-token"}
+        zoom_oauth_app = MagicMock()
+        zoom_oauth_app.credentials = {"client_secret": "runtime-app-secret", "webhook_secret": "runtime-webhook-secret"}
+        zoom_oauth_app.zoom_oauth_connections.all.return_value = [zoom_oauth_connection]
+        bot_snapshot.project.zoom_oauth_apps.all.return_value = [zoom_oauth_app]
+
+        controller.bot_in_db = bot_snapshot
+        controller.adapter = MagicMock()
+        controller.adapter.zoom_tokens = {"app_privilege_token": "local-recording-token", "onbehalf_token": "onbehalf-token"}
+        controller.runtime_bootstrap = {
+            "project": {
+                "zoom_oauth_apps": [
+                    {
+                        "credentials": {"client_secret": "bootstrap-app-secret"},
+                        "zoom_oauth_connections": [
+                            {
+                                "client_secret": "bootstrap-client-secret",
+                                "credentials": {"refresh_token": "bootstrap-refresh-token"},
+                            }
+                        ],
+                    }
+                ]
+            }
+        }
+
+        controller.clear_zoom_token_references()
+
+        self.assertEqual(bot_snapshot._zoom_onbehalf_token_cache, {})
+        self.assertEqual(controller.adapter.zoom_tokens, {})
+        self.assertEqual(controller.runtime_bootstrap["project"]["zoom_oauth_apps"][0]["credentials"], {})
+        self.assertIsNone(controller.runtime_bootstrap["project"]["zoom_oauth_apps"][0]["zoom_oauth_connections"][0]["client_secret"])
+        self.assertEqual(controller.runtime_bootstrap["project"]["zoom_oauth_apps"][0]["zoom_oauth_connections"][0]["credentials"], {})
+        self.assertEqual(zoom_oauth_app.credentials, {})
+        self.assertIsNone(zoom_oauth_connection.client_secret)
+        self.assertEqual(zoom_oauth_connection.credentials, {})
+
     @patch("bots.zoom_oauth_connections_utils.requests.post")
     @patch("bots.web_bot_adapter.web_bot_adapter.Display")
     @patch("bots.web_bot_adapter.web_bot_adapter.webdriver.Chrome")

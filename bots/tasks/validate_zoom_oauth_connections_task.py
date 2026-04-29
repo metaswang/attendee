@@ -20,7 +20,7 @@ from bots.zoom_oauth_connections_utils import zoom_oauth_connection_webhook_payl
 )
 def validate_zoom_oauth_connections(self, zoom_oauth_app_id):
     """Celery task to sync zoom meetings with a zoom oauth connection."""
-    logger.info(f"Validating zoom oauth connections for zoom oauth app {zoom_oauth_app_id}")
+    logger.info("Validating zoom oauth connections")
     zoom_oauth_app = ZoomOAuthApp.objects.get(id=zoom_oauth_app_id)
 
     # Get all zoom oauth connections which are in state disconnected
@@ -52,6 +52,6 @@ def validate_zoom_oauth_connections(self, zoom_oauth_app_id):
                 zoom_oauth_connection=zoom_oauth_connection,
                 payload=zoom_oauth_connection_webhook_payload(zoom_oauth_connection),
             )
-        except Exception as e:
-            logger.exception(f"Zoom OAuth connection validation failed with {type(e).__name__} for {zoom_oauth_connection.id}: {e}")
+        except Exception:
+            logger.exception("Zoom OAuth connection validation failed")
             continue

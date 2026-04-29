@@ -690,10 +690,10 @@ class BotRuntimeLeaseCompletionView(View):
                 provider_instance_id or lease.provider_instance_id,
             )
             provider.delete_lease(lease)
-        except Exception as exc:
+        except Exception:
             logger.exception("Failed to delete runtime lease %s for bot %s", lease.id, lease.bot.object_id)
-            lease.mark_failed(str(exc))
-            return JsonResponse({"error": "Failed to delete runtime instance", "details": str(exc)}, status=502)
+            lease.mark_failed("Failed to delete runtime instance")
+            return JsonResponse({"error": "Failed to delete runtime instance"}, status=502)
 
         exit_code = payload.get("exit_code")
         final_state = payload.get("final_state")
@@ -929,20 +929,14 @@ class BotRuntimeLeaseRecordingCompleteView(View):
                 },
                 timeout=RECORDING_COMPLETE_UPSTREAM_TIMEOUT_SECONDS,
             )
-        except requests.RequestException as exc:
+        except requests.RequestException:
             logger.exception(
                 "Failed to forward runtime recording complete callback for lease=%s bot=%s url=%s",
                 lease.id,
                 lease.bot.object_id,
                 callback_url,
             )
-            return JsonResponse(
-                {
-                    "error": "Failed to forward recording complete callback",
-                    "details": str(exc),
-                },
-                status=502,
-            )
+            return JsonResponse({"error": "Failed to forward recording complete callback"}, status=502)
 
         if not 200 <= response.status_code < 300:
             logger.error(
@@ -1104,9 +1098,9 @@ class BotRuntimeLeaseBotEventsView(View):
                 event_sub_type=event_sub_type,
                 event_metadata=event_metadata,
             )
-        except Exception as exc:
+        except Exception:
             logger.exception("Failed to create bot event for lease %s", lease.id)
-            return JsonResponse({"error": str(exc)}, status=400)
+            return JsonResponse({"error": "Failed to create bot event"}, status=400)
 
         return JsonResponse(
             {
@@ -1141,8 +1135,8 @@ class BotRuntimeLeaseParticipantEventsView(View):
             participant = _get_participant_for_runtime_payload(lease.bot, payload)
             event_type = int(payload["event_type"])
             timestamp_ms = int(payload["timestamp_ms"])
-        except (KeyError, TypeError, ValueError) as exc:
-            return JsonResponse({"error": f"Invalid participant event payload: {exc}"}, status=400)
+        except (KeyError, TypeError, ValueError):
+            return JsonResponse({"error": "Invalid participant event payload"}, status=400)
 
         if event_type == ParticipantEventTypes.UPDATE:
             event_data = payload.get("event_data") or {}
@@ -1217,8 +1211,8 @@ class BotRuntimeLeaseChatMessagesView(View):
                     "additional_data": payload.get("additional_data", {}),
                 },
             )
-        except (KeyError, TypeError, ValueError) as exc:
-            return JsonResponse({"error": f"Invalid chat message payload: {exc}"}, status=400)
+        except (KeyError, TypeError, ValueError):
+            return JsonResponse({"error": "Invalid chat message payload"}, status=400)
 
         trigger_webhook(
             webhook_trigger_type=WebhookTriggerTypes.CHAT_MESSAGES_UPDATE,
@@ -1265,8 +1259,8 @@ class BotRuntimeLeaseCaptionsView(View):
                     "sample_rate": None,
                 },
             )
-        except (KeyError, TypeError, ValueError) as exc:
-            return JsonResponse({"error": f"Invalid caption payload: {exc}"}, status=400)
+        except (KeyError, TypeError, ValueError):
+            return JsonResponse({"error": "Invalid caption payload"}, status=400)
 
         trigger_webhook(
             webhook_trigger_type=WebhookTriggerTypes.TRANSCRIPT_UPDATE,
@@ -1313,8 +1307,8 @@ class BotRuntimeLeaseAudioChunksView(View):
                 sample_rate=int(payload["sample_rate"]),
                 source=AudioChunk.Sources.PER_PARTICIPANT_AUDIO,
             )
-        except (KeyError, TypeError, ValueError) as exc:
-            return JsonResponse({"error": f"Invalid audio chunk payload: {exc}"}, status=400)
+        except (KeyError, TypeError, ValueError):
+            return JsonResponse({"error": "Invalid audio chunk payload"}, status=400)
 
         from bots.tasks.process_utterance_task import process_utterance
 
@@ -1361,8 +1355,8 @@ class BotRuntimeLeaseBotLogsView(View):
             level = int(payload["level"])
             entry_type = int(payload.get("entry_type", BotLogEntryTypes.UNCATEGORIZED))
             message = str(payload["message"])
-        except (KeyError, TypeError, ValueError) as exc:
-            return JsonResponse({"error": f"Invalid bot log payload: {exc}"}, status=400)
+        except (KeyError, TypeError, ValueError):
+            return JsonResponse({"error": "Invalid bot log payload"}, status=400)
 
         log = BotLogManager.create_bot_log_entry(
             bot=lease.bot,

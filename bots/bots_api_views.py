@@ -558,10 +558,9 @@ class OutputAudioView(APIView):
             try:
                 # Create or get existing MediaBlob
                 media_blob = MediaBlob.get_or_create_from_blob(project=request.auth.project, blob=audio_data, content_type=content_type)
-            except Exception as e:
-                error_message_first_line = str(e).split("\n")[0]
-                logging.error(f"Error creating audio blob: {error_message_first_line} (content_type={content_type}, bot_id={object_id})")
-                return Response({"error": f"Error creating the audio blob. Are you sure it's a valid {content_type} file?", "raw_error": error_message_first_line}, status=status.HTTP_400_BAD_REQUEST)
+            except Exception:
+                logging.exception("Error creating audio blob (content_type=%s, bot_id=%s)", content_type, object_id)
+                return Response({"error": f"Error creating the audio blob. Are you sure it's a valid {content_type} file?"}, status=status.HTTP_400_BAD_REQUEST)
 
             # Create BotMediaRequest
             BotMediaRequest.objects.create(
@@ -673,12 +672,9 @@ class DeleteDataView(APIView):
             return Response(BotSerializer(bot).data, status=status.HTTP_200_OK)
         except Bot.DoesNotExist:
             return Response({"error": "Bot not found"}, status=status.HTTP_404_NOT_FOUND)
-        except Exception as e:
-            logging.exception(f"Error deleting bot data: {str(e)}", extra={"bot_id": object_id})
-            return Response(
-                {"error": str(e)},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        except Exception:
+            logging.exception("Error deleting bot data", extra={"bot_id": object_id})
+            return Response({"error": "Error deleting bot data"}, status=status.HTTP_400_BAD_REQUEST)
 
 
 class BotLeaveView(APIView):

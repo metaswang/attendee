@@ -1,9 +1,6 @@
 import logging
 import os
 import time
-import base64
-import hashlib
-import hmac
 import json
 
 import redis
@@ -13,6 +10,7 @@ from django.conf import settings
 from django.utils import timezone
 
 from bots.models import SessionTypes, WebhookDeliveryAttempt, WebhookDeliveryAttemptStatus, WebhookTriggerTypes
+from bots.signature_utils import sign_message_with_hmac_sha256
 from bots.redis_utils import incr_and_expire_nx
 from bots.webhook_utils import sign_payload
 
@@ -46,8 +44,7 @@ MAX_WEBHOOK_DELIVERY_ATTEMPTS = int(os.getenv("MAX_WEBHOOK_DELIVERY_ATTEMPTS", 3
 
 def _sign_raw_body_with_timestamp(raw_body: bytes, timestamp: str, secret: str) -> str:
     message = timestamp.encode("utf-8") + b"." + raw_body
-    digest = hmac.new(secret.encode("utf-8"), message, hashlib.sha256).digest()
-    return base64.b64encode(digest).decode("utf-8")
+    return sign_message_with_hmac_sha256(message, secret)
 # This is how many times the task can be retried before giving up.
 # This is distinct from MAX_WEBHOOK_DELIVERY_ATTEMPTS because the task can also be retried for
 # reasons other than delivery failures (e.g., rate limiting enforced by Attendee via GLOBAL_WEBHOOK_DELIVERIES_PER_SECOND_RATE_LIMIT or unexpected exceptions).
@@ -75,11 +72,12 @@ def deliver_webhook(self, delivery_id):
     # If the subscription is no longer active, mark as failed and return
     if not subscription.is_active:
         delivery.status = WebhookDeliveryAttemptStatus.FAILURE
+        redacted_url = subscription.url.split("?", 1)[0] if subscription.url else None
         error_response = {
             "status_code": None,  # No HTTP status since request failed
             "error_type": "InactiveSubscription",
             "error_message": "Webhook subscription is no longer active",
-            "request_url": subscription.url,
+            "request_url": redacted_url,
         }
         delivery.add_to_response_body_list(error_response)
         delivery.save()
@@ -175,8 +173,8 @@ def deliver_webhook(self, delivery_id):
         error_response = {
             "status_code": None,  # No HTTP status since request failed
             "error_type": type(e).__name__,
-            "error_message": str(e),
-            "request_url": subscription.url,
+            "error_message": "Webhook delivery request failed",
+            "request_url": subscription.url.split("?", 1)[0] if subscription.url else None,
         }
         delivery.add_to_response_body_list(error_response)
 
@@ -185,7 +183,7 @@ def deliver_webhook(self, delivery_id):
     if delivery.status == WebhookDeliveryAttemptStatus.FAILURE:
         # Check if this was the last retry attempt
         if delivery.attempt_count >= MAX_WEBHOOK_DELIVERY_ATTEMPTS:
-            logger.error(f"Webhook delivery failed after {delivery.attempt_count} attempts. " + f"Webhook ID: {delivery.id}, URL: {subscription.url}, " + f"Event: {delivery.webhook_trigger_type}, Status: {delivery.status}")
+            logger.error("Webhook delivery failed after max attempts")
         else:
-            logger.info(f"Retrying webhook delivery {delivery.id} (attempt {delivery.attempt_count}/{MAX_WEBHOOK_DELIVERY_ATTEMPTS})")
+            logger.info("Retrying webhook delivery %s (attempt %s/%s)", delivery.id, delivery.attempt_count, MAX_WEBHOOK_DELIVERY_ATTEMPTS)
             raise Exception("Retry due to failure")

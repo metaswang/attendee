@@ -483,11 +483,11 @@ class BotValidationMixin:
     def validate_meeting_url(self, value):
         meeting_type, normalized_url = normalize_meeting_url(value)
         if meeting_type is None:
-            logger.error(f"Invalid meeting URL: {value}")
+            logger.error("Invalid meeting URL")
             raise serializers.ValidationError("Invalid meeting URL")
 
         if normalized_url != value:
-            logger.info(f"Normalized Meeting URL: {normalized_url} from {value}")
+            logger.info("Normalized Meeting URL")
         return normalized_url
 
     def validate_join_at(self, value):

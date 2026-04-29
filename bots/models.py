@@ -12,6 +12,7 @@ from cryptography.fernet import Fernet, InvalidToken
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.files.storage import Storage, storages
+from django.contrib.auth.hashers import make_password
 from django.db import models, transaction
 from django.db.models import Q
 from django.db.utils import IntegrityError
@@ -424,7 +425,7 @@ class ApiKey(models.Model):
             self.object_id = f"{self.OBJECT_ID_PREFIX}{random_string}"
         super().save(*args, **kwargs)
 
-    key_hash = models.CharField(max_length=64, unique=True)  # SHA-256 hash is 64 chars
+    key_hash = models.CharField(max_length=255, unique=True)
     disabled_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -433,8 +434,8 @@ class ApiKey(models.Model):
     def create(cls, project, name):
         # Generate a random API key (you might want to adjust the length)
         api_key = get_random_string(length=32)
-        # Create hash of the API key
-        key_hash = hashlib.sha256(api_key.encode()).hexdigest()
+        # Store a salted, slow hash of the API key
+        key_hash = make_password(api_key, hasher="default")
 
         instance = cls(project=project, name=name, key_hash=key_hash)
         instance.save()

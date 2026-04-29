@@ -1,5 +1,4 @@
-import hashlib
-
+from django.contrib.auth.hashers import check_password
 from rest_framework import authentication, exceptions
 
 from .models import ApiKey
@@ -20,10 +19,12 @@ class ApiKeyAuthentication(authentication.BaseAuthentication):
 
         api_key = auth_header[1]
 
-        try:
-            key_hash = hashlib.sha256(api_key.encode()).hexdigest()
-            api_key_obj = ApiKey.objects.select_related("project").get(key_hash=key_hash, disabled_at__isnull=True)
-        except ApiKey.DoesNotExist:
+        api_key_obj = None
+        for candidate in ApiKey.objects.select_related("project").filter(disabled_at__isnull=True):
+            if check_password(api_key, candidate.key_hash):
+                api_key_obj = candidate
+                break
+        if not api_key_obj:
             raise exceptions.AuthenticationFailed({"detail": "Invalid or disabled API key"})
 
         # Return (None, api_key_obj) instead of (user, auth)

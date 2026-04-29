@@ -1312,6 +1312,69 @@ class BotController:
             self.run_failure_exception = RuntimeError("Recording completion failed")
 
         normal_quitting_process_worked = True
+        self.clear_zoom_token_references()
+
+    def clear_zoom_token_references(self):
+        """Best-effort cleanup for short-lived Zoom secrets held in memory."""
+        try:
+            bot_token_cache = getattr(self.bot_in_db, "_zoom_onbehalf_token_cache", None)
+            if isinstance(bot_token_cache, dict):
+                bot_token_cache.clear()
+
+            adapter_zoom_tokens = getattr(getattr(self, "adapter", None), "zoom_tokens", None)
+            if isinstance(adapter_zoom_tokens, dict):
+                adapter_zoom_tokens.clear()
+
+            self._clear_runtime_bootstrap_zoom_credentials()
+            self._clear_runtime_bot_snapshot_zoom_credentials()
+        except Exception:
+            logger.exception("Failed to clear in-memory Zoom token references for bot=%s", getattr(self.bot_in_db, "object_id", None))
+
+    def _clear_runtime_bootstrap_zoom_credentials(self):
+        runtime_bootstrap = getattr(self, "runtime_bootstrap", None)
+        if not isinstance(runtime_bootstrap, dict):
+            return
+
+        project = runtime_bootstrap.get("project")
+        if not isinstance(project, dict):
+            return
+
+        for zoom_oauth_app in project.get("zoom_oauth_apps") or []:
+            if not isinstance(zoom_oauth_app, dict):
+                continue
+            credentials = zoom_oauth_app.get("credentials")
+            if isinstance(credentials, dict):
+                credentials.clear()
+            zoom_oauth_app["credentials"] = {}
+
+            for zoom_oauth_connection in zoom_oauth_app.get("zoom_oauth_connections") or []:
+                if not isinstance(zoom_oauth_connection, dict):
+                    continue
+                zoom_oauth_connection["client_secret"] = None
+                connection_credentials = zoom_oauth_connection.get("credentials")
+                if isinstance(connection_credentials, dict):
+                    connection_credentials.clear()
+                zoom_oauth_connection["credentials"] = {}
+
+    def _clear_runtime_bot_snapshot_zoom_credentials(self):
+        project = getattr(getattr(self, "bot_in_db", None), "project", None)
+        zoom_oauth_apps = getattr(project, "zoom_oauth_apps", None)
+        if zoom_oauth_apps is None or not hasattr(zoom_oauth_apps, "all"):
+            return
+
+        for zoom_oauth_app in zoom_oauth_apps.all():
+            credentials = getattr(zoom_oauth_app, "credentials", None)
+            if isinstance(credentials, dict):
+                credentials.clear()
+            connections = getattr(zoom_oauth_app, "zoom_oauth_connections", None)
+            if connections is None or not hasattr(connections, "all"):
+                continue
+            for zoom_oauth_connection in connections.all():
+                if hasattr(zoom_oauth_connection, "client_secret"):
+                    zoom_oauth_connection.client_secret = None
+                connection_credentials = getattr(zoom_oauth_connection, "credentials", None)
+                if isinstance(connection_credentials, dict):
+                    connection_credentials.clear()
 
     # We're going to wait until all utterances are transcribed or have failed. If there are still
     # in progress utterances, after 5 minutes, then we'll consider them failed and mark them as timed out.

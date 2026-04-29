@@ -14,7 +14,7 @@ from celery import shared_task
 def enqueue_sync_zoom_oauth_connection_task(zoom_oauth_connection: ZoomOAuthConnection):
     """Enqueue a sync zoom oauth connection task for a zoom oauth connection."""
     if not zoom_oauth_connection.is_local_recording_token_supported:
-        logger.info(f"Skipping sync zoom oauth connection task for {zoom_oauth_connection.id} because it does not support local recording tokens")
+        logger.info("Skipping sync zoom oauth connection task because it does not support local recording tokens")
         return
 
     with transaction.atomic():
@@ -32,7 +32,7 @@ def enqueue_sync_zoom_oauth_connection_task(zoom_oauth_connection: ZoomOAuthConn
 )
 def sync_zoom_oauth_connection(self, zoom_oauth_connection_id):
     """Celery task to sync zoom meetings with a zoom oauth connection."""
-    logger.info(f"Syncing zoom oauth connection {zoom_oauth_connection_id}")
+    logger.info("Syncing zoom oauth connection")
     zoom_oauth_connection = ZoomOAuthConnection.objects.get(id=zoom_oauth_connection_id)
 
     try:
@@ -42,7 +42,7 @@ def sync_zoom_oauth_connection(self, zoom_oauth_connection_id):
         access_token = _get_access_token(zoom_oauth_connection)
         zoom_meetings = _get_zoom_meetings(access_token)
 
-        logger.info(f"Fetched {len(zoom_meetings)} meetings from Zoom for zoom oauth connection {zoom_oauth_connection_id}")
+        logger.info("Fetched %s meetings from Zoom", len(zoom_meetings))
 
         zoom_personal_meeting_id = _get_zoom_personal_meeting_id(access_token)
         zoom_meeting_ids = [zoom_meeting["id"] for zoom_meeting in zoom_meetings] + [zoom_personal_meeting_id]
@@ -60,8 +60,8 @@ def sync_zoom_oauth_connection(self, zoom_oauth_connection_id):
     except ZoomAPIAuthenticationError as e:
         _handle_zoom_api_authentication_error(zoom_oauth_connection, e)
 
-    except Exception as e:
-        logger.exception(f"Zoom OAuth connection sync failed with {type(e).__name__} for {zoom_oauth_connection_id}: {e}")
+    except Exception:
+        logger.exception("Zoom OAuth connection sync failed")
         zoom_oauth_connection.last_attempted_sync_at = timezone.now()
         zoom_oauth_connection.save()
         raise

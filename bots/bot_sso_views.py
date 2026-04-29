@@ -1,4 +1,5 @@
 import logging
+import uuid
 
 from django.http import HttpResponse, HttpResponseBadRequest
 from django.utils.decorators import method_decorator
@@ -22,6 +23,12 @@ class GoogleMeetSetCookieView(View):
         session_id = request.GET.get("session_id")
         if not session_id:
             logger.warning("GoogleMeetSetCookieView could not set cookie: session_id is missing")
+            return HttpResponseBadRequest("Could not set cookie")
+
+        try:
+            session_id = str(uuid.UUID(session_id))
+        except (TypeError, ValueError):
+            logger.warning("GoogleMeetSetCookieView could not set cookie: session_id is invalid")
             return HttpResponseBadRequest("Could not set cookie")
 
         # Check in redis store to confirm that a key with the id "google_meet_sign_in_session:<session_id>" exists
@@ -77,8 +84,8 @@ class GoogleMeetSignInView(View):
                 cert=google_meet_bot_login.cert,
                 private_key=google_meet_bot_login.private_key,
             )
-        except Exception as e:
-            logger.exception(f"Failed to create SAMLResponse: {e}")
+        except Exception:
+            logger.exception("Failed to create SAMLResponse")
             return HttpResponseBadRequest("Failed to create SAMLResponse. Private Key or Cert may be invalid.")
 
         # 6) Return auto-posting HTML to the ACS

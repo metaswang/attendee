@@ -375,8 +375,8 @@ class CreateCredentialsView(LoginRequiredMixin, ProjectUrlContextMixin, View):
             # Render the appropriate partial based on credential type
             return get_partial_for_credential_type(credential.credential_type, request, context)
 
-        except Exception as e:
-            return HttpResponse(str(e), status=400)
+        except Exception:
+            return HttpResponse("Could not update credential", status=400)
 
 
 class DeleteCredentialsView(LoginRequiredMixin, ProjectUrlContextMixin, View):
@@ -402,9 +402,9 @@ class DeleteCredentialsView(LoginRequiredMixin, ProjectUrlContextMixin, View):
             # Render the appropriate partial based on credential type
             return get_partial_for_credential_type(credential_type, request, context)
 
-        except Exception as e:
+        except Exception:
             error_id = str(uuid.uuid4())
-            logger.error(f"Error deleting credentials (error_id={error_id}): {e}")
+            logger.exception("Error deleting credentials", extra={"error_id": error_id})
             return HttpResponse(f"Error deleting credentials. Error ID: {error_id}", status=400)
 
 
@@ -1007,8 +1007,8 @@ class EditUserView(AdminRequiredMixin, ProjectUrlContextMixin, View):
                 role_text = "administrator" if is_admin else "regular user"
                 return HttpResponse(f"User {user_to_edit.email} has been updated successfully. Role: {role_text}, Status: {status_text}.", status=200)
 
-        except Exception as e:
-            logger.error(f"Error updating user: {str(e)}")
+        except Exception:
+            logger.exception("Error updating user")
             return HttpResponse("An error occurred while updating the user", status=500)
 
 
@@ -1066,8 +1066,8 @@ class InviteUserView(AdminRequiredMixin, ProjectUrlContextMixin, View):
                 # Return success response
                 return HttpResponse("Invitation sent successfully", status=200)
 
-        except Exception as e:
-            logger.error(f"Error creating invited user: {str(e)}")
+        except Exception:
+            logger.exception("Error creating invited user")
             return HttpResponse("An error occurred while sending the invitation", status=500)
 
 
@@ -1182,15 +1182,15 @@ class CreateBotView(LoginRequiredMixin, ProjectUrlContextMixin, View):
 
             bot, error = create_bot(data=data, source=BotCreationSource.DASHBOARD, project=project)
             if error:
-                return HttpResponse(json.dumps(error), status=400)
+                return HttpResponse("Could not create bot", status=400)
 
             # If this is a scheduled bot, we don't want to launch it yet.
             if bot.state == BotStates.JOINING:
                 launch_joining_bot.delay(bot.id)
 
             return HttpResponse("ok", status=200)
-        except Exception as e:
-            return HttpResponse(str(e), status=400)
+        except Exception:
+            return HttpResponse("Could not create bot", status=400)
 
 
 class CreateProjectView(AdminRequiredMixin, View):
