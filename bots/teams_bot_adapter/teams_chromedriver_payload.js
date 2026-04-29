@@ -1174,7 +1174,10 @@ class ChatMessageManager {
 
     // The more sophisticated approach gets blocked by trusted html csp
     stripHtml(html) {
-        return html.replace(/<[^>]*>/g, '');
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(String(html), 'text/html');
+        doc.querySelectorAll('script, style').forEach((node) => node.remove());
+        return doc.body.textContent || '';
     }
 
     // Teams client sometimes sends duplicate updates, this filters them out.
