@@ -5,6 +5,7 @@ import uuid
 import time
 from pathlib import Path
 
+from django.db import transaction
 from django.urls import reverse
 from django.utils import timezone
 
@@ -29,6 +30,7 @@ class GCPComputeEngineError(RuntimeError):
 
 class GCPComputeInstanceProvider:
     HOST_METADATA_KEY = "meetbot:gcp:host"
+    REUSABLE_INSTANCE_STATUSES = {"PROVISIONING", "STAGING", "RUNNING"}
     ENV_PREFIX_EXCLUDES = (
         "BOT_CONTAINER_",
         "DO_BOT_",
@@ -389,17 +391,33 @@ class GCPComputeInstanceProvider:
                 return slot_index
         return None
 
-    def _host_instance_exists(self, host_name: str, zone: str | None) -> bool:
+    def _clear_host_slots(self, host_name: str, capacity: int) -> None:
+        for slot_index in range(capacity):
+            redis_client().delete(f"meetbot:scheduler:slots:gcp:{host_name}:{slot_index}")
+
+    def _get_host_instance(self, host_name: str, zone: str | None):
         if not zone:
-            return False
+            return None
         try:
-            self.instances_client.get(project=self.project_id, zone=zone, instance=host_name)
-            return True
+            return self.instances_client.get(project=self.project_id, zone=zone, instance=host_name)
         except Exception as exc:
             if NotFound and isinstance(exc, NotFound):
-                return False
+                return None
             logger.warning("Unable to verify GCP host %s in zone %s: %s", host_name, zone, exc)
-            return False
+            return None
+
+    def _instance_status(self, instance) -> str | None:
+        if instance is None:
+            return None
+        status = getattr(instance, "status", None)
+        if hasattr(status, "name"):
+            status = status.name
+        return str(status).upper() if status else None
+
+    def _host_is_reusable(self, host_name: str, zone: str | None) -> tuple[bool, str | None]:
+        instance = self._get_host_instance(host_name, zone)
+        status = self._instance_status(instance)
+        return status in self.REUSABLE_INSTANCE_STATUSES, status
 
     def _select_existing_host(self, region: str, bot, lease: BotRuntimeLease, *, machine_type: str, runtime_class_family: str, slot_capacity: int) -> tuple[str, dict, int] | None:
         client = redis_client()
@@ -415,9 +433,15 @@ class GCPComputeInstanceProvider:
                 continue
             if meta.get("state") not in {None, "provisioning", "active"}:
                 continue
-            if not self._host_instance_exists(host_name, meta.get("zone")):
+            reusable, instance_status = self._host_is_reusable(host_name, meta.get("zone"))
+            if instance_status is None:
                 logger.info("Skipping stale GCP host record %s in region %s", host_name, region)
                 client.hdel("meetbot:scheduler:gcp:instances", host_name)
+                self._clear_host_slots(host_name, int(meta.get("slot_capacity") or slot_capacity))
+                continue
+            if not reusable:
+                logger.info("Skipping non-reusable GCP host %s in region %s with status %s", host_name, region, instance_status)
+                self._update_host_record(host_name, state=str(instance_status).lower())
                 continue
             heartbeat_key = meta.get("heartbeat_key") or runtime_agent_heartbeat_key(host_name)
             next_state = "active" if client.exists(heartbeat_key) else meta.get("state", "provisioning")
@@ -425,11 +449,27 @@ class GCPComputeInstanceProvider:
                 "last_active_at": timezone.now().isoformat(),
                 "state": next_state,
                 "heartbeat_key": heartbeat_key,
+                "instance_status": instance_status,
             }
             if client.exists(heartbeat_key) and not meta.get("runtime_agent_heartbeat_seen_at"):
                 update_fields["runtime_agent_heartbeat_seen_at"] = timezone.now().isoformat()
             slot_index = self._acquire_host_slot(host_name, bot, lease, capacity=int(meta.get("slot_capacity") or slot_capacity))
             if slot_index is not None:
+                current_meta_raw = client.hget("meetbot:scheduler:gcp:instances", host_name)
+                current_meta = json.loads(current_meta_raw) if current_meta_raw else {}
+                reusable_after_reserve, confirmed_status = self._host_is_reusable(host_name, meta.get("zone"))
+                if current_meta.get("state") not in {None, "provisioning", "active"} or not reusable_after_reserve:
+                    logger.info(
+                        "Releasing reserved slot on GCP host %s because it became unavailable during allocation (state=%s, status=%s)",
+                        host_name,
+                        current_meta.get("state"),
+                        confirmed_status,
+                    )
+                    redis_client().delete(f"meetbot:scheduler:slots:gcp:{host_name}:{slot_index}")
+                    if confirmed_status:
+                        self._update_host_record(host_name, state=str(confirmed_status).lower(), instance_status=confirmed_status)
+                    continue
+                update_fields["instance_status"] = confirmed_status or instance_status
                 self._update_host_record(host_name, **update_fields)
                 return host_name, meta, slot_index
         return None
@@ -630,39 +670,45 @@ class GCPComputeInstanceProvider:
         )
         try:
             lease.save()
-            redis_client().setex(
-                lease_key(lease.id),
-                24 * 60 * 60,
-                json.dumps(
-                    {
-                        "bot_id": bot.id,
-                        "bot_object_id": bot.object_id,
-                        "lease_id": lease.id,
-                        "provider": BotRuntimeProviderTypes.GCP_COMPUTE_INSTANCE,
-                        "host_name": host_name,
-                        "slot_index": slot_index,
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ),
-            )
-            redis_client().setex(
-                bot_key(bot.id),
-                24 * 60 * 60,
-                json.dumps(
-                    {
-                        "bot_id": bot.id,
-                        "lease_id": lease.id,
-                        "provider": BotRuntimeProviderTypes.GCP_COMPUTE_INSTANCE,
-                        "host_name": host_name,
-                        "slot_index": slot_index,
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ),
-            )
-            redis_client().rpush(runtime_queue_key(host_name), json.dumps(payload, sort_keys=True, separators=(",", ":")))
-            self._update_host_record(host_name, last_active_at=timezone.now().isoformat(), state="provisioning")
+            def publish_runtime_launch() -> None:
+                redis_client().setex(
+                    lease_key(lease.id),
+                    24 * 60 * 60,
+                    json.dumps(
+                        {
+                            "bot_id": bot.id,
+                            "bot_object_id": bot.object_id,
+                            "lease_id": lease.id,
+                            "provider": BotRuntimeProviderTypes.GCP_COMPUTE_INSTANCE,
+                            "host_name": host_name,
+                            "slot_index": slot_index,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                )
+                redis_client().setex(
+                    bot_key(bot.id),
+                    24 * 60 * 60,
+                    json.dumps(
+                        {
+                            "bot_id": bot.id,
+                            "lease_id": lease.id,
+                            "provider": BotRuntimeProviderTypes.GCP_COMPUTE_INSTANCE,
+                            "host_name": host_name,
+                            "slot_index": slot_index,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                )
+                redis_client().rpush(runtime_queue_key(host_name), json.dumps(payload, sort_keys=True, separators=(",", ":")))
+                self._update_host_record(host_name, last_active_at=timezone.now().isoformat(), state="provisioning")
+
+            if transaction.get_connection().in_atomic_block:
+                transaction.on_commit(publish_runtime_launch)
+            else:
+                publish_runtime_launch()
         except Exception as exc:
             redis_client().delete(f"meetbot:scheduler:slots:gcp:{host_name}:{slot_index}")
             redis_client().delete(lease_key(lease.id))
@@ -802,6 +848,7 @@ class GCPComputeInstanceProvider:
         if not zone:
             return
         logger.info("Deleting idle GCP host %s in zone %s", host_name, zone)
+        self._update_host_record(host_name, state="deleting", delete_requested_at=timezone.now().isoformat())
         try:
             operation = self.instances_client.delete(project=self.project_id, zone=zone, instance=host_name)
             self._wait_for_operation(zone, operation.name)
@@ -814,5 +861,4 @@ class GCPComputeInstanceProvider:
         finally:
             redis_client().hdel("meetbot:scheduler:gcp:instances", host_name)
             capacity = int(instance.get("slot_capacity") or gcp_vm_slot_capacity())
-            for slot_index in range(capacity):
-                redis_client().delete(f"meetbot:scheduler:slots:gcp:{host_name}:{slot_index}")
+            self._clear_host_slots(host_name, capacity)

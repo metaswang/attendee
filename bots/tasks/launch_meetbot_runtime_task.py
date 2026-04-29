@@ -37,7 +37,7 @@ def launch_meetbot_runtime(self, bot_id: int):
             existing_lease = getattr(bot, "runtime_lease", None)
             if existing_lease and existing_lease.status in {BotRuntimeLeaseStatuses.PROVISIONING, BotRuntimeLeaseStatuses.ACTIVE}:
                 logger.info("Bot %s (%s) already has active/provisioning lease %s", bot_id, bot.object_id, existing_lease.id)
-                return existing_lease
+                return existing_lease.id
 
             acquired_lock = acquire_lease_lock(bot.id)
             if not acquired_lock:
@@ -55,13 +55,33 @@ def launch_meetbot_runtime(self, bot_id: int):
 
             if lease is None:
                 lease = get_runtime_provider("gcp_compute_instance").provision_bot(bot)
-            return lease
+            return lease.id
     except Retry:
         raise
     except Exception as exc:
         try:
             bot = Bot.objects.get(id=bot_id)
-            write_pending_bot(bot, str(exc))
+            stale_lease = getattr(bot, "runtime_lease", None)
+            if (
+                stale_lease is not None
+                and stale_lease.status == BotRuntimeLeaseStatuses.PROVISIONING
+                and bot.first_heartbeat_timestamp is None
+            ):
+                try:
+                    get_runtime_provider(stale_lease.provider).delete_lease(stale_lease)
+                    logger.info(
+                        "Deleted stale provisioning lease %s for bot %s (%s) after launch failure",
+                        stale_lease.id,
+                        bot_id,
+                        bot.object_id,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed deleting stale provisioning lease %s for bot %s after launch failure",
+                        stale_lease.id,
+                        bot_id,
+                    )
+            write_pending_bot(bot, "Failed to launch meetbot runtime")
         except Exception:
             logger.exception("Failed to queue pending bot %s after launch error", bot_id)
         logger.exception("Failed to launch meetbot runtime for bot %s: %s", bot_id, exc)

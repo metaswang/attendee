@@ -11,6 +11,12 @@ from .serializers import CreateZoomOAuthConnectionSerializer
 logger = logging.getLogger(__name__)
 
 
+def _zoom_oauth_error(error: str, *, error_code: str, **extra):
+    payload = {"error": error, "error_code": error_code}
+    payload.update(extra)
+    return payload
+
+
 def _get_user_info(access_token: str) -> dict:
     # Step 1 – who is the user?
     resp = requests.get("https://api.zoom.us/v2/users/me", headers={"Authorization": f"Bearer {access_token}"}, timeout=10)
@@ -76,7 +82,10 @@ def create_zoom_oauth_connection(data, project):
         )
     except Exception as e:
         logger.error(f"Error exchanging access code for tokens: {e}")
-        return None, {"error": "Error exchanging access code for tokens. Please check that the authorization code and redirect URI are correct."}
+        return None, _zoom_oauth_error(
+            "Error exchanging access code for tokens. Please check that the authorization code and redirect URI are correct.",
+            error_code="zoom_token_exchange_failed",
+        )
 
     # Validate that the tokens have the required scopes
     scopes_for_token = zoom_oauth_tokens.get("scope", "").split(" ")
@@ -92,7 +101,11 @@ def create_zoom_oauth_connection(data, project):
 
     missing_scopes = [scope for scope in minimum_scopes_for_token if scope not in scopes_for_token]
     if missing_scopes:
-        return None, {"error": f"The authorization is missing the following required scopes: {missing_scopes}."}
+        return None, _zoom_oauth_error(
+            f"The authorization is missing the following required scopes: {missing_scopes}.",
+            error_code="zoom_missing_scopes",
+            missing_scopes=missing_scopes,
+        )
 
     # Get the user info
     user_info = None
@@ -100,11 +113,14 @@ def create_zoom_oauth_connection(data, project):
         user_info = _get_user_info(zoom_oauth_tokens["access_token"])
     except Exception as e:
         logger.error(f"Error getting user info: {e}")
-        return None, {"error": "Error getting user info. Please check that the access token is valid."}
+        return None, _zoom_oauth_error(
+            "Error getting user info. Please check that the access token is valid.",
+            error_code="zoom_user_info_failed",
+        )
 
     # Validate that the user is active
     if user_info["status"] != "active":
-        return None, {"error": "The user is not active."}
+        return None, _zoom_oauth_error("The user is not active.", error_code="zoom_user_inactive")
 
     try:
         with transaction.atomic():

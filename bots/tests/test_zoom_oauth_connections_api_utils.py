@@ -29,7 +29,7 @@ class TestCreateZoomOAuthConnection(TestCase):
             "access_token": "test_access_token",
             "refresh_token": "test_refresh_token_789",
             "expires_in": 3600,
-            "scope": "user:read:user user:read:zak meeting:read:list_meetings meeting:read:local_recording_token",
+            "scope": "user:read:user user:read:zak meeting:read:list_meetings meeting:read:local_recording_token user:read:token",
         }
         mock_get_user_info.return_value = {
             "id": "test_user_id_123",
@@ -60,7 +60,7 @@ class TestCreateZoomOAuthConnection(TestCase):
         self.assertEqual(zoom_oauth_connection.state, ZoomOAuthConnectionStates.CONNECTED)
         self.assertEqual(zoom_oauth_connection.metadata, {"department": "engineering", "team": "backend"})
         self.assertTrue(zoom_oauth_connection.is_local_recording_token_supported)
-        self.assertFalse(zoom_oauth_connection.is_onbehalf_token_supported)
+        self.assertTrue(zoom_oauth_connection.is_onbehalf_token_supported)
 
         # Verify credentials are encrypted and stored
         credentials = zoom_oauth_connection.get_credentials()

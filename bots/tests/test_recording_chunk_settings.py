@@ -1,14 +1,19 @@
 import json
+import os
+import tempfile
 import uuid
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from django.test import TestCase
 from django.test.utils import override_settings
 
 from accounts.models import Organization
+from bots.app_session_api_utils import create_app_session
+from bots.app_session_serializers import CreateAppSessionSerializer
 from bots.bot_controller.bot_controller import BotController
 from bots.bots_api_utils import BotCreationSource, create_bot
-from bots.models import Bot, Project, RecordingFormats
+from bots.models import Bot, MeetingTypes, Project, RecordingFormats, SessionTypes
 from bots.bot_controller.recording_chunk_uploader import RecordingChunkUploader
 from bots.bot_controller.bot_controller import R2_AUDIO_CHUNK_EXT, R2_AUDIO_CHUNK_MIME_TYPE
 from bots.serializers import CreateBotSerializer
@@ -182,6 +187,117 @@ class RecordingChunkSettingsTests(TestCase):
         self.assertFalse(serializer.is_valid())
         self.assertIn("recording_settings", serializer.errors)
 
+    def test_create_bot_serializer_rejects_zoom_web_r2_chunks(self):
+        serializer = CreateBotSerializer(
+            data={
+                "meeting_url": "https://zoom.us/j/123456789",
+                "bot_name": "Chunk Bot",
+                "zoom_settings": {
+                    "sdk": "web",
+                },
+                "recording_settings": {
+                    "format": RecordingFormats.WEBM,
+                    "transport": "r2_chunks",
+                    "audio_raw_path": "customer_audio/user-1/session-1/original.m4a",
+                    "video_chunk_prefix": "video/user-1/session-1/chunks",
+                },
+                "callback_settings": {
+                    "recording_complete": {
+                        "url": "https://api.example.com/v2/meeting/app/bot/recording/complete",
+                        "signing_secret": "top-secret",
+                    }
+                },
+            }
+        )
+
+        self.assertFalse(serializer.is_valid())
+        self.assertIn("recording_settings", serializer.errors)
+        self.assertIn("not supported for Zoom when using the web SDK", str(serializer.errors))
+
+    def test_create_app_session_serializer_accepts_list_server_urls(self):
+        serializer = CreateAppSessionSerializer(
+            data={
+                "zoom_rtms": {
+                    "meeting_uuid": "meeting-uuid",
+                    "rtms_stream_id": "stream-123",
+                    "server_urls": ["wss://example.com/rtms"],
+                },
+                "recording_settings": {
+                    "format": RecordingFormats.MP3,
+                    "transport": "r2_chunks",
+                    "audio_chunk_prefix": "customer_audio/user-1/session-1/chunks",
+                    "audio_raw_path": "customer_audio/user-1/session-1/original.m4a",
+                },
+                "callback_settings": {
+                    "recording_complete": {
+                        "url": "https://api.example.com/v2/meeting/app/bot/recording/complete",
+                        "signing_secret": "top-secret",
+                    }
+                },
+            }
+        )
+
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+
+    def test_create_app_session_persists_callback_settings(self):
+        app_session, error = create_app_session(
+            {
+                "zoom_rtms": {
+                    "meeting_uuid": "meeting-uuid",
+                    "rtms_stream_id": "stream-123",
+                    "server_urls": "wss://example.com/rtms",
+                },
+                "recording_settings": {
+                    "format": RecordingFormats.MP3,
+                    "transport": "r2_chunks",
+                    "audio_chunk_prefix": "customer_audio/user-1/session-1/chunks",
+                    "audio_raw_path": "customer_audio/user-1/session-1/original.m4a",
+                },
+                "callback_settings": {
+                    "recording_complete": {
+                        "url": "https://api.example.com/v2/meeting/app/bot/recording/complete",
+                        "signing_secret": "top-secret",
+                    }
+                },
+                "metadata": {"session_id": "session-1"},
+            },
+            source=BotCreationSource.API,
+            project=self.project,
+        )
+
+        self.assertIsNone(error)
+        assert app_session is not None
+        self.assertEqual(app_session.session_type, SessionTypes.APP_SESSION)
+        self.assertEqual(
+            app_session.settings["callback_settings"]["recording_complete"]["url"],
+            "https://api.example.com/v2/meeting/app/bot/recording/complete",
+        )
+        self.assertEqual(
+            app_session.settings["callback_settings"]["recording_complete"]["signing_secret"],
+            "top-secret",
+        )
+
+    def test_bot_controller_rejects_zoom_web_r2_chunks_at_runtime(self):
+        bot = Bot.objects.create(
+            project=self.project,
+            name="Unsupported Zoom Web Chunk Bot",
+            meeting_url="https://zoom.us/j/123456789",
+            settings={
+                "zoom_settings": {
+                    "sdk": "web",
+                },
+                "recording_settings": {
+                    "format": RecordingFormats.WEBM,
+                    "transport": "r2_chunks",
+                    "audio_raw_path": "customer_audio/user-1/session-1/original.m4a",
+                    "video_chunk_prefix": "video/user-1/session-1/chunks",
+                },
+            },
+        )
+
+        with self.assertRaisesMessage(ValueError, "Zoom web adapter does not support transport='r2_chunks'"):
+            BotController(bot.id)
+
     def test_create_bot_serializer_rejects_local_file_transport(self):
         serializer = CreateBotSerializer(
             data={
@@ -294,6 +410,38 @@ class RecordingChunkSettingsTests(TestCase):
         chunk_call = mock_s3_client.put_object.call_args_list[0]
         self.assertEqual(chunk_call.kwargs["Bucket"], "voxella-video")
         self.assertEqual(result["manifest_path"], "video/user-1/session-1/manifest.json")
+
+    @patch("bots.bot_controller.recording_chunk_uploader.boto3.client")
+    @override_settings(AWS_RECORDING_STORAGE_BUCKET_NAME="voxella-video", AWS_AUDIO_CHUNK_STORAGE_BUCKET_NAME="vox")
+    def test_recording_chunk_uploader_upload_single_chunk_file_writes_manifest(self, mock_boto_client):
+        mock_s3_client = MagicMock()
+        mock_boto_client.return_value = mock_s3_client
+
+        uploader = RecordingChunkUploader(
+            chunk_prefix="video/user-1/session-1/chunks",
+            chunk_ext="mp4",
+            chunk_mime_type="video/mp4",
+            raw_path="customer_audio/user-1/session-1/original.m4a",
+            worker_count=1,
+        )
+
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as handle:
+            handle.write(b"fake-mp4")
+            temp_path = handle.name
+
+        try:
+            result = uploader.upload_single_chunk_file(temp_path)
+        finally:
+            os.unlink(temp_path)
+
+        self.assertEqual(result["chunk_paths"], ["video/user-1/session-1/chunks/chunk_0000.mp4"])
+        self.assertEqual(result["manifest_path"], "video/user-1/session-1/manifest.json")
+        self.assertEqual(mock_s3_client.put_object.call_count, 2)
+        manifest_call = mock_s3_client.put_object.call_args_list[-1]
+        manifest = json.loads(manifest_call.kwargs["Body"].decode("utf-8"))
+        self.assertEqual(manifest["chunk_paths"], ["video/user-1/session-1/chunks/chunk_0000.mp4"])
+        self.assertEqual(manifest["chunk_ext"], "mp4")
+        self.assertEqual(manifest["chunk_mime_type"], "video/mp4")
 
     @patch("bots.bot_controller.bot_controller.make_signed_callback_request")
     def test_audio_only_recording_callback_uses_generic_audio_webm_mime_type(self, mock_callback):
@@ -410,3 +558,82 @@ class RecordingChunkSettingsTests(TestCase):
             "video/user-1/session-1/chunks/chunk_0001.webm",
         ])
         self.assertEqual(payload["data"]["video"]["raw_path"], "customer_audio/user-1/session-1/original.m4a")
+
+    @patch("bots.bot_controller.bot_controller.make_signed_callback_request")
+    @patch("bots.bot_controller.bot_controller.RecordingChunkUploader")
+    def test_zoom_native_single_file_callback_uses_chunk_contract(self, mock_uploader_cls, mock_callback):
+        bot = Bot.objects.create(
+            project=self.project,
+            name="Native Zoom Bot",
+            meeting_url="https://zoom.us/j/123456789",
+            settings={
+                "recording_settings": {
+                    "format": RecordingFormats.MP4,
+                    "audio_raw_path": "customer_audio/user-1/session-1/original.m4a",
+                    "video_chunk_prefix": "video/user-1/session-1/chunks",
+                },
+                "callback_settings": {
+                    "recording_complete": {
+                        "url": "https://api.example.com/v2/meeting/app/bot/recording/complete",
+                        "signing_secret": "top-secret",
+                    }
+                },
+            },
+            metadata={"session_id": "session-1"},
+        )
+
+        mock_uploader = MagicMock()
+        mock_uploader.upload_single_chunk_file.return_value = {
+            "chunk_paths": ["video/user-1/session-1/chunks/chunk_0000.mp4"],
+            "manifest_path": "video/user-1/session-1/manifest.json",
+        }
+        mock_uploader_cls.return_value = mock_uploader
+
+        controller = BotController.__new__(BotController)
+        controller.bot_in_db = bot
+        controller.adapter = SimpleNamespace(joined_at=100.0)
+        controller.recording_chunks_started_at = None
+        controller.recording_file_saved = MagicMock()
+        controller.recording_complete_provider = MagicMock(return_value="zoom")
+
+        with patch("bots.bot_controller.bot_controller.time.time", return_value=107.0):
+            controller.deliver_native_recording_file_as_chunk_contract("/tmp/native-zoom.mp4")
+
+        controller.recording_file_saved.assert_called_once_with("video/user-1/session-1/manifest.json")
+        mock_uploader.upload_single_chunk_file.assert_called_once_with("/tmp/native-zoom.mp4")
+        mock_uploader.shutdown.assert_called_once_with(wait_for_uploads=False)
+
+        payload = mock_callback.call_args.kwargs["payload"]
+        self.assertEqual(payload["provider"], "zoom")
+        self.assertEqual(payload["data"]["audio"]["chunk_paths"], ["video/user-1/session-1/chunks/chunk_0000.mp4"])
+        self.assertEqual(payload["data"]["audio"]["chunk_mime_type"], "video/mp4")
+        self.assertEqual(payload["data"]["audio"]["raw_path"], "customer_audio/user-1/session-1/original.m4a")
+        self.assertEqual(payload["data"]["video"]["chunk_paths"], ["video/user-1/session-1/chunks/chunk_0000.mp4"])
+        self.assertEqual(payload["data"]["video"]["duration_sec"], 7)
+
+    def test_zoom_native_single_file_adapter_is_enabled_for_native_zoom_with_callback_and_chunk_path(self):
+        bot = Bot.objects.create(
+            project=self.project,
+            name="Native Zoom Bot",
+            meeting_url="https://zoom.us/j/123456789",
+            settings={
+                "recording_settings": {
+                    "format": RecordingFormats.MP4,
+                    "audio_raw_path": "customer_audio/user-1/session-1/original.m4a",
+                    "video_chunk_prefix": "video/user-1/session-1/chunks",
+                },
+                "callback_settings": {
+                    "recording_complete": {
+                        "url": "https://api.example.com/v2/meeting/app/bot/recording/complete",
+                        "signing_secret": "top-secret",
+                    }
+                },
+            },
+        )
+
+        controller = BotController.__new__(BotController)
+        controller.bot_in_db = bot
+        controller.is_using_rtms = MagicMock(return_value=False)
+        controller.get_meeting_type = MagicMock(return_value=MeetingTypes.ZOOM)
+
+        self.assertTrue(controller.should_adapt_native_recording_to_chunk_contract())

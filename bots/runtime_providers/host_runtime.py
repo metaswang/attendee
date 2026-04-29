@@ -127,6 +127,10 @@ def runtime_container_env(bot, lease: BotRuntimeLease, *, host_name: str, slot_i
     )
     if runtime_redis_url:
         env_vars["REDIS_URL"] = runtime_redis_url
+    # Preserve per-bot sizing so the runtime runner does not fall back to tiny slot defaults.
+    env_vars["BOT_MEMORY_LIMIT"] = str(bot.memory_limit())
+    env_vars["BOT_MEMORY_RESERVATION"] = str(bot.memory_request())
+    env_vars["BOT_CPUS"] = str(bot.cpu_request())
     return env_vars
 
 

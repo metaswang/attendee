@@ -269,6 +269,10 @@ new RTCInterceptor({
                 if (window.initialData.sendPerParticipantAudio) {
                     handleAudioTrack(event);
                 }
+                window.ws?.tryStartMediaSendingRecorders?.();
+            } else if (event.track.kind === 'video') {
+                window.styleManager?.addVideoTrack?.(event);
+                window.ws?.tryStartMediaSendingRecorders?.();
             }
         });
     },
@@ -328,6 +332,7 @@ class MixedAudioStreamManager {
         else {
             this.audioTracksToBeAdded.push(track);
         }
+        window.ws?.tryStartMediaSendingRecorders?.();
     }
 
     createStream() {
@@ -343,8 +348,7 @@ class MixedAudioStreamManager {
         // Create a source from the destination's stream so that it actually plays
         this.audioContext.createMediaStreamSource(this.destination.stream);
 
-        window.ws?.sendJson({
-            type: 'MeetingAudioStreamCreated',
+        window.ws?.emitDiagnosticEvent?.('MeetingAudioStreamCreated', {
             message: 'Meeting audio stream created',
         });
     }
@@ -352,6 +356,10 @@ class MixedAudioStreamManager {
     getMeetingAudioStream() {
         this.createStream();
         return this.meetingAudioStream;
+    }
+
+    hasConnectedMeetingAudioTracks() {
+        return this.seenTrackIds.size > 0;
     }
 }
 
@@ -378,6 +386,13 @@ class StyleManager {
         return window.mixedAudioStreamManager?.getMeetingAudioStream();
     }
 
+    hasMeetingAudioInputForRecording() {
+        if (!this.started) {
+            return false;
+        }
+        return !!window.mixedAudioStreamManager?.hasConnectedMeetingAudioTracks?.();
+    }
+
     addVideoTrack(trackEvent) {
         const track = trackEvent?.track;
         const streamId = trackEvent?.streams?.[0]?.id;
@@ -392,6 +407,11 @@ class StyleManager {
         track.addEventListener('ended', () => {
             this.videoTracks.delete(track.id);
         }, { once: true });
+        window.ws?.emitDiagnosticEvent?.('RecordingVideoSourceSelected', {
+            track_id: track.id,
+            stream_id: streamId,
+        });
+        window.ws?.tryStartMediaSendingRecorders?.();
     }
 
     getVideoTrackForRecording() {
@@ -400,6 +420,50 @@ class StyleManager {
             return null;
         }
         return liveTracks.sort((a, b) => b.firstSeenAt - a.firstSeenAt)[0].track;
+    }
+
+    getRenderableElementForRecording() {
+        if (!this.started) {
+            return null;
+        }
+
+        const recordingRoot = this.mainElement || document.querySelector('#video-pip-container');
+        if (!recordingRoot) {
+            return null;
+        }
+
+        const candidates = Array.from(recordingRoot.querySelectorAll('video, canvas')).filter((element) => {
+            if (!element.isConnected) {
+                return false;
+            }
+            const rect = element.getBoundingClientRect();
+            return rect.width >= 16 && rect.height >= 16;
+        });
+
+        if (!candidates.length) {
+            return null;
+        }
+
+        const rankedCandidates = candidates.map((element) => {
+            const isVideo = element.tagName === 'VIDEO';
+            const width = isVideo ? element.videoWidth : element.width;
+            const height = isVideo ? element.videoHeight : element.height;
+            const rect = element.getBoundingClientRect();
+            const isRenderable = isVideo
+                ? element.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && width > 0 && height > 0
+                : width > 0 && height > 0;
+            return {
+                element,
+                isRenderable,
+                area: rect.width * rect.height,
+            };
+        }).filter((item) => item.isRenderable);
+
+        if (!rankedCandidates.length) {
+            return null;
+        }
+
+        return rankedCandidates.sort((a, b) => b.area - a.area)[0].element;
     }
 
     async stop() {
@@ -513,19 +577,23 @@ class WebSocketClient {
         this.videoChunkCanvasCtx = null;
         this.videoChunkVideoElement = null;
         this.videoChunkAnimationFrame = null;
+        this.videoChunkDomSourceElement = null;
+        this.videoChunkDomSourceKey = null;
         this.videoChunkSourceTrackId = null;
         this.videoChunkSourceTrackClone = null;
+        this.videoChunkSourceUnavailableReason = null;
+        this.encodedVideoChunkCount = 0;
+        this.encodedVideoChunkZeroSizeCount = 0;
+        this.videoChunkRequestCount = 0;
+        this.encodedAudioChunkCount = 0;
+        this.audioChunkZeroSizeCount = 0;
+        this.audioChunkRequestCount = 0;
     }
 
     async enableMediaSending() {
         this.mediaSendingEnabled = true;
         await window.styleManager.start();
-        if (window.initialData.sendEncodedVideoChunks) {
-            await this.startVideoChunkRecording();
-        }
-        if (window.initialData.sendEncodedAudioChunks) {
-            await this.startAudioChunkRecording();
-        }
+        this.tryStartMediaSendingRecorders();
     }
 
     async disableMediaSending() {
@@ -581,6 +649,25 @@ class WebSocketClient {
         }
     }
 
+    emitDiagnosticEvent(type, payload = {}) {
+        this.sendJson({
+            type,
+            ...payload,
+        });
+    }
+
+    tryStartMediaSendingRecorders() {
+        if (!this.mediaSendingEnabled) {
+            return;
+        }
+        if (window.initialData.sendEncodedVideoChunks && (!this.videoChunkRecorder || this.videoChunkRecorder.state === 'inactive')) {
+            this.startVideoChunkRecording();
+        }
+        if (window.initialData.sendEncodedAudioChunks && (!this.audioChunkRecorder || this.audioChunkRecorder.state === 'inactive')) {
+            this.startAudioChunkRecording();
+        }
+    }
+
     sendClosedCaptionUpdate(item) {
         if (!this.mediaSendingEnabled)
             return;
@@ -617,6 +704,16 @@ class WebSocketClient {
         } catch (error) {
             console.error('Error sending WebSocket video chunk:', error);
         }
+    }
+
+    getMeetingAudioTrackForRecording() {
+        const meetingAudioStream = window.styleManager?.getMeetingAudioStream?.();
+        if (!meetingAudioStream) {
+            return null;
+        }
+
+        const audioTracks = meetingAudioStream.getAudioTracks?.() || [];
+        return audioTracks.find((track) => track.readyState === 'live') || audioTracks[0] || null;
     }
 
     getPreferredVideoChunkMimeType() {
@@ -667,19 +764,79 @@ class WebSocketClient {
         }
     }
 
+    cleanupVideoChunkDomSourceElement() {
+        this.videoChunkDomSourceElement = null;
+        this.videoChunkDomSourceKey = null;
+    }
+
+    emitVideoChunkSourceUnavailable(reason, payload = {}) {
+        if (this.videoChunkSourceUnavailableReason === reason) {
+            return;
+        }
+        this.videoChunkSourceUnavailableReason = reason;
+        window.ws?.emitDiagnosticEvent?.('RecordingVideoSourceUnavailable', {
+            reason,
+            ...payload,
+        });
+    }
+
+    syncVideoChunkDomSourceElement() {
+        this.ensureVideoChunkCanvas();
+        const nextElement = window.styleManager?.getRenderableElementForRecording?.();
+        if (!nextElement) {
+            this.cleanupVideoChunkDomSourceElement();
+            return false;
+        }
+
+        const nextKey = [
+            nextElement.tagName,
+            nextElement.id || '',
+            nextElement.className || '',
+            nextElement.currentSrc || '',
+            nextElement.srcObject?.id || '',
+        ].join('|');
+
+        if (this.videoChunkDomSourceElement === nextElement && this.videoChunkDomSourceKey === nextKey) {
+            this.videoChunkSourceUnavailableReason = null;
+            return true;
+        }
+
+        this.cleanupVideoChunkSourceTrack();
+        this.videoChunkDomSourceElement = nextElement;
+        this.videoChunkDomSourceKey = nextKey;
+        this.videoChunkSourceUnavailableReason = null;
+        window.ws?.emitDiagnosticEvent?.('RecordingVideoSourceSelected', {
+            source_type: 'dom_element',
+            tag_name: nextElement.tagName,
+            id: nextElement.id || null,
+            class_name: nextElement.className || null,
+        });
+        return true;
+    }
+
     syncVideoChunkSourceTrack() {
         this.ensureVideoChunkCanvas();
+        if (this.syncVideoChunkDomSourceElement()) {
+            return;
+        }
         const nextTrack = window.styleManager?.getVideoTrackForRecording?.();
         if (!nextTrack || nextTrack.readyState !== 'live') {
             this.cleanupVideoChunkSourceTrack();
+            this.emitVideoChunkSourceUnavailable('missing_track', {
+                has_track: !!nextTrack,
+                ready_state: nextTrack?.readyState || null,
+            });
             return;
         }
         if (this.videoChunkSourceTrackId === nextTrack.id) {
+            this.videoChunkSourceUnavailableReason = null;
             return;
         }
+        this.cleanupVideoChunkDomSourceElement();
         this.cleanupVideoChunkSourceTrack();
         this.videoChunkSourceTrackClone = nextTrack.clone();
         this.videoChunkSourceTrackId = nextTrack.id;
+        this.videoChunkSourceUnavailableReason = null;
         this.videoChunkVideoElement.srcObject = new MediaStream([this.videoChunkSourceTrackClone]);
         this.videoChunkVideoElement.play().catch((error) => {
             console.warn('Video chunk preview play failed', error);
@@ -697,6 +854,25 @@ class WebSocketClient {
         const video = this.videoChunkVideoElement;
         if (!ctx || !canvas) {
             return;
+        }
+
+        const domSource = this.videoChunkDomSourceElement;
+        if (domSource?.isConnected) {
+            const isVideo = domSource.tagName === 'VIDEO';
+            const sourceWidth = isVideo ? domSource.videoWidth : domSource.width;
+            const sourceHeight = isVideo ? domSource.videoHeight : domSource.height;
+            const isRenderable = isVideo
+                ? domSource.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && sourceWidth > 0 && sourceHeight > 0
+                : sourceWidth > 0 && sourceHeight > 0;
+            if (isRenderable) {
+                if (canvas.width !== sourceWidth || canvas.height !== sourceHeight) {
+                    canvas.width = sourceWidth;
+                    canvas.height = sourceHeight;
+                }
+                ctx.drawImage(domSource, 0, 0, canvas.width, canvas.height);
+                this.videoChunkAnimationFrame = requestAnimationFrame(this.drawVideoChunkFrame);
+                return;
+            }
         }
 
         if (video && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth && video.videoHeight) {
@@ -719,42 +895,133 @@ class WebSocketClient {
         }
         if (!window.MediaRecorder) {
             console.warn('MediaRecorder is not available for video chunk recording');
+            this.emitDiagnosticEvent('RecordingChunkRecorderState', {
+                kind: 'video',
+                state: 'failed',
+                reason: 'media_recorder_unavailable',
+            });
             return;
         }
 
         this.ensureVideoChunkCanvas();
         this.syncVideoChunkSourceTrack();
-        if (!this.videoChunkSourceTrackClone) {
-            console.warn('No meeting video track available for video chunk recording');
+        const audioTrack = this.getMeetingAudioTrackForRecording();
+        const hasMeetingAudioInput = window.styleManager?.hasMeetingAudioInputForRecording?.();
+        if ((!audioTrack || !hasMeetingAudioInput) && !window.initialData.sendEncodedAudioChunks) {
+            this.emitDiagnosticEvent('RecordingChunkRecorderState', {
+                kind: 'video',
+                state: 'failed',
+                reason: !audioTrack ? 'missing_audio_stream' : 'missing_audio_source',
+            });
             return;
         }
+        this.emitDiagnosticEvent('RecordingChunkRecorderState', {
+            kind: 'video',
+            state: 'starting',
+            has_audio_track: !!audioTrack,
+            has_audio_source: !!hasMeetingAudioInput,
+            has_dom_source: !!this.videoChunkDomSourceElement,
+            has_video_track: !!this.videoChunkSourceTrackClone,
+            video_track_id: this.videoChunkSourceTrackId || null,
+        });
 
         const recorderStream = this.videoChunkCanvas.captureStream(30);
-        const meetingAudioStream = window.styleManager?.getMeetingAudioStream?.();
-        const audioTrack = meetingAudioStream?.getAudioTracks?.()[0];
         if (audioTrack) {
             recorderStream.addTrack(audioTrack.clone());
         }
 
         const selectedMimeType = this.getPreferredVideoChunkMimeType();
-        this.videoChunkRecorder = selectedMimeType
-            ? new MediaRecorder(recorderStream, { mimeType: selectedMimeType })
-            : new MediaRecorder(recorderStream);
+        try {
+            this.videoChunkRecorder = selectedMimeType
+                ? new MediaRecorder(recorderStream, { mimeType: selectedMimeType })
+                : new MediaRecorder(recorderStream);
+        } catch (error) {
+            console.warn('Video chunk recorder construction failed', error);
+            this.emitDiagnosticEvent('RecordingChunkRecorderState', {
+                kind: 'video',
+                state: 'failed',
+                reason: 'media_recorder_constructor_failed',
+                message: error?.message || String(error),
+            });
+            return;
+        }
+        const videoChunkMimeType = this.videoChunkRecorder.mimeType || selectedMimeType || 'video/webm';
+        this.emitDiagnosticEvent('RecordingChunkFormat', {
+            kind: 'video',
+            mimeType: videoChunkMimeType,
+            extension: videoChunkMimeType.includes('mp4') ? 'mp4' : 'webm',
+        });
         this.videoChunkRecorder.ondataavailable = (event) => {
+            this.emitDiagnosticEvent('EncodedMediaChunk', {
+                kind: 'video',
+                byte_length: event?.data?.size || 0,
+                mime_type: event?.data?.type || selectedMimeType || this.videoChunkRecorder?.mimeType || null,
+            });
             if (event.data && event.data.size > 0) {
+                this.encodedVideoChunkCount += 1;
                 this.sendEncodedMP4Chunk(event.data);
+                return;
             }
+            this.encodedVideoChunkZeroSizeCount += 1;
+        };
+        this.videoChunkRecorder.onerror = (event) => {
+            this.emitDiagnosticEvent('RecordingChunkRecorderState', {
+                kind: 'video',
+                state: 'failed',
+                reason: 'media_recorder_error',
+                message: event?.error?.message || event?.message || String(event),
+            });
+        };
+        this.videoChunkRecorder.onstart = () => {
+            this.emitDiagnosticEvent('RecordingChunkRecorderState', {
+                kind: 'video',
+                state: 'started',
+                mime_type: this.videoChunkRecorder?.mimeType || selectedMimeType || 'video/webm',
+                has_audio_track: !!audioTrack,
+                has_audio_source: !!hasMeetingAudioInput,
+                has_dom_source: !!this.videoChunkDomSourceElement,
+                has_video_track: !!this.videoChunkSourceTrackClone,
+                video_track_id: this.videoChunkSourceTrackId || null,
+            });
+        };
+        this.videoChunkRecorder.onstop = () => {
+            this.emitDiagnosticEvent('RecordingChunkRecorderState', {
+                kind: 'video',
+                state: 'stopped',
+                encoded_video_chunk_count: this.encodedVideoChunkCount,
+                zero_size_chunk_count: this.encodedVideoChunkZeroSizeCount,
+                request_count: this.videoChunkRequestCount,
+            });
         };
         this.stopVideoChunkCanvasLoop();
         this.videoChunkAnimationFrame = requestAnimationFrame(this.drawVideoChunkFrame);
-        this.videoChunkRecorder.start();
+        try {
+            this.videoChunkRecorder.start();
+        } catch (error) {
+            console.warn('Video chunk recorder start failed', error);
+            this.emitDiagnosticEvent('RecordingChunkRecorderState', {
+                kind: 'video',
+                state: 'failed',
+                reason: 'media_recorder_start_failed',
+                message: error?.message || String(error),
+            });
+            this.videoChunkRecorder = null;
+            return;
+        }
         this.videoChunkFlushInterval = setInterval(() => {
             try {
                 if (this.videoChunkRecorder?.state === 'recording') {
+                    this.videoChunkRequestCount += 1;
                     this.videoChunkRecorder.requestData();
                 }
             } catch (error) {
                 console.warn('Video chunk recorder requestData failed', error);
+                this.emitDiagnosticEvent('RecordingChunkRecorderState', {
+                    kind: 'video',
+                    state: 'failed',
+                    reason: 'request_data_failed',
+                    message: error?.message || String(error),
+                });
             }
         }, window.initialData.recordingChunkIntervalMs || 5000);
     }
@@ -766,7 +1033,9 @@ class WebSocketClient {
         }
         if (!this.videoChunkRecorder || this.videoChunkRecorder.state === 'inactive') {
             this.stopVideoChunkCanvasLoop();
+            this.cleanupVideoChunkDomSourceElement();
             this.cleanupVideoChunkSourceTrack();
+            this.videoChunkSourceUnavailableReason = null;
             return;
         }
 
@@ -782,7 +1051,9 @@ class WebSocketClient {
         });
         this.videoChunkRecorder = null;
         this.stopVideoChunkCanvasLoop();
+        this.cleanupVideoChunkDomSourceElement();
         this.cleanupVideoChunkSourceTrack();
+        this.videoChunkSourceUnavailableReason = null;
     }
 
     async startAudioChunkRecording() {
@@ -792,31 +1063,91 @@ class WebSocketClient {
         const audioStream = window.styleManager?.getMeetingAudioStream?.();
         if (!audioStream || audioStream.getAudioTracks().length === 0) {
             console.warn('No meeting audio stream available for audio chunk recording');
+            this.emitDiagnosticEvent('RecordingChunkRecorderState', {
+                kind: 'audio',
+                state: 'failed',
+                reason: 'missing_audio_stream',
+            });
             return;
         }
         const preferredMimeTypes = ['audio/webm;codecs=opus', 'audio/webm'];
         const selectedMimeType = preferredMimeTypes.find((mime) => window.MediaRecorder && MediaRecorder.isTypeSupported(mime));
-        this.audioChunkRecorder = selectedMimeType ? new MediaRecorder(audioStream, { mimeType: selectedMimeType }) : new MediaRecorder(audioStream);
+        this.emitDiagnosticEvent('RecordingChunkRecorderState', {
+            kind: 'audio',
+            state: 'starting',
+            has_audio_stream: !!audioStream,
+            track_count: audioStream.getAudioTracks().length,
+        });
+        try {
+            this.audioChunkRecorder = selectedMimeType ? new MediaRecorder(audioStream, { mimeType: selectedMimeType }) : new MediaRecorder(audioStream);
+        } catch (error) {
+            console.warn('Audio chunk recorder construction failed', error);
+            this.emitDiagnosticEvent('RecordingChunkRecorderState', {
+                kind: 'audio',
+                state: 'failed',
+                reason: 'media_recorder_constructor_failed',
+                message: error?.message || String(error),
+            });
+            return;
+        }
         const audioChunkMimeType = this.audioChunkRecorder.mimeType || selectedMimeType || 'audio/webm';
-        this.ws.sendJson({
-            type: 'RecordingChunkFormat',
+        this.emitDiagnosticEvent('RecordingChunkFormat', {
             kind: 'audio',
             mimeType: audioChunkMimeType,
             extension: audioChunkMimeType.includes('mp4') ? 'm4a' : 'webm',
         });
+        this.audioChunkRecorder.onstart = () => {
+            this.emitDiagnosticEvent('RecordingChunkRecorderState', {
+                kind: 'audio',
+                state: 'started',
+                mime_type: this.audioChunkRecorder?.mimeType || selectedMimeType || 'audio/webm',
+                track_count: audioStream.getAudioTracks().length,
+            });
+        };
+        this.audioChunkRecorder.onstop = () => {
+            this.emitDiagnosticEvent('RecordingChunkRecorderState', {
+                kind: 'audio',
+                state: 'stopped',
+                encoded_audio_chunk_count: this.encodedAudioChunkCount,
+                zero_size_chunk_count: this.audioChunkZeroSizeCount,
+                request_count: this.audioChunkRequestCount,
+            });
+        };
+        this.audioChunkRecorder.onerror = (event) => {
+            this.emitDiagnosticEvent('RecordingChunkRecorderState', {
+                kind: 'audio',
+                state: 'failed',
+                reason: 'media_recorder_error',
+                message: event?.error?.message || event?.message || String(event),
+            });
+        };
         this.audioChunkRecorder.ondataavailable = (event) => {
+            this.emitDiagnosticEvent('EncodedMediaChunk', {
+                kind: 'audio',
+                byte_length: event?.data?.size || 0,
+                mime_type: event?.data?.type || selectedMimeType || this.audioChunkRecorder?.mimeType || null,
+            });
             if (event.data && event.data.size > 0) {
+                this.encodedAudioChunkCount += 1;
                 this.sendEncodedAudioChunk(event.data);
+                return;
             }
         };
         this.audioChunkRecorder.start();
         this.audioChunkFlushInterval = setInterval(() => {
             try {
                 if (this.audioChunkRecorder?.state === 'recording') {
+                    this.audioChunkRequestCount += 1;
                     this.audioChunkRecorder.requestData();
                 }
             } catch (error) {
                 console.warn('Audio chunk recorder requestData failed', error);
+                this.emitDiagnosticEvent('RecordingChunkRecorderState', {
+                    kind: 'audio',
+                    state: 'failed',
+                    reason: 'request_data_failed',
+                    message: error?.message || String(error),
+                });
             }
         }, window.initialData.recordingChunkIntervalMs || 5000);
     }
@@ -833,9 +1164,16 @@ class WebSocketClient {
             const recorder = this.audioChunkRecorder;
             recorder.addEventListener('stop', () => resolve(), { once: true });
             try {
+                this.audioChunkRequestCount += 1;
                 recorder.requestData();
             } catch (error) {
                 console.warn('Final audio chunk requestData failed', error);
+                this.emitDiagnosticEvent('RecordingChunkRecorderState', {
+                    kind: 'audio',
+                    state: 'failed',
+                    reason: 'final_request_data_failed',
+                    message: error?.message || String(error),
+                });
             }
             recorder.stop();
         });

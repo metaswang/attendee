@@ -1,7 +1,4 @@
 import logging
-import base64
-import hashlib
-import hmac
 import json
 import time
 from typing import Dict, Optional
@@ -9,6 +6,7 @@ from typing import Dict, Optional
 import requests
 
 from bots.models import WebhookSecret
+from bots.signature_utils import sign_message_with_hmac_sha256
 from bots.webhook_utils import sign_payload
 
 logger = logging.getLogger(__name__)
@@ -36,11 +34,8 @@ class CallbackHTTPError(CallbackError):
 
 
 def _sign_raw_body_with_timestamp(raw_body: bytes, timestamp: str, secret: bytes | str) -> str:
-    if isinstance(secret, str):
-        secret = secret.encode("utf-8")
     message = timestamp.encode("utf-8") + b"." + raw_body
-    digest = hmac.new(secret, message, hashlib.sha256).digest()
-    return base64.b64encode(digest).decode("utf-8")
+    return sign_message_with_hmac_sha256(message, secret)
 
 
 def make_signed_callback_request(url: str, payload: Dict, signing_secret: bytes | str, timeout_seconds: int = 30) -> Dict:

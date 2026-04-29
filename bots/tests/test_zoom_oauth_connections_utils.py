@@ -11,8 +11,20 @@ from bots.models import (
     ZoomOAuthConnection,
     ZoomOAuthConnectionStates,
 )
+from bots.runtime_snapshot import (
+    RuntimeCredentialCollection,
+    RuntimeOrganizationSnapshot,
+    RuntimeProjectSnapshot,
+    RuntimeZoomMeetingToZoomOAuthConnectionMappingCollection,
+    RuntimeZoomMeetingToZoomOAuthConnectionMappingSnapshot,
+    RuntimeZoomOAuthAppCollection,
+    RuntimeZoomOAuthConnectionCollection,
+    RuntimeZoomOAuthConnectionSnapshot,
+    RuntimeZoomOAuthAppSnapshot,
+)
 from bots.zoom_oauth_connections_utils import (
     ZoomAPIAuthenticationError,
+    _get_access_token,
     _handle_zoom_api_authentication_error,
     compute_zoom_webhook_validation_response,
     get_zoom_tokens_via_zoom_oauth_app,
@@ -194,6 +206,52 @@ class TestGetZoomTokensViaZoomOAuthApp(TestCase):
         mock_session.return_value.__exit__ = Mock(return_value=False)
         mock_session.return_value.send = mock_send
 
+    @patch("bots.zoom_oauth_connections_utils.requests.post")
+    def test_runtime_snapshot_access_token_refresh_updates_in_memory_credentials(self, mock_post):
+        runtime_zoom_oauth_connection = RuntimeZoomOAuthConnectionSnapshot(
+            object_id=self.zoom_oauth_connection.object_id,
+            user_id=self.zoom_oauth_connection.user_id,
+            account_id=self.zoom_oauth_connection.account_id,
+            client_id=self.zoom_oauth_app.client_id,
+            client_secret=self.zoom_oauth_app.client_secret,
+            credentials={"refresh_token": "test_refresh_token"},
+        )
+
+        mock_token_response = Mock()
+        mock_token_response.json.return_value = {
+            "access_token": "runtime_access_token",
+            "refresh_token": "rotated_refresh_token",
+        }
+        mock_token_response.raise_for_status.return_value = None
+        mock_post.return_value = mock_token_response
+
+        access_token = _get_access_token(runtime_zoom_oauth_connection)
+
+        self.assertEqual(access_token, "runtime_access_token")
+        self.assertEqual(
+            runtime_zoom_oauth_connection.get_credentials()["refresh_token"],
+            "rotated_refresh_token",
+        )
+
+    @patch("bots.zoom_oauth_connections_utils._handle_zoom_api_authentication_error")
+    @patch("bots.zoom_oauth_connections_utils._get_local_recording_token")
+    @patch("bots.zoom_oauth_connections_utils._get_access_token")
+    def test_db_backed_zoom_oauth_app_still_uses_auth_error_handler(
+        self,
+        mock_get_access_token,
+        mock_get_local_recording_token,
+        mock_handle_auth_error,
+    ):
+        bot = self._create_bot(use_web_adapter=False, onbehalf_user_id=None)
+        mock_get_access_token.side_effect = ZoomAPIAuthenticationError("Invalid credentials")
+
+        result = get_zoom_tokens_via_zoom_oauth_app(bot)
+
+        self.assertIsNone(result["app_privilege_token"])
+        self.assertIsNone(result["onbehalf_token"])
+        mock_handle_auth_error.assert_called_once_with(self.zoom_oauth_connection, mock_get_access_token.side_effect)
+        mock_get_local_recording_token.assert_not_called()
+
     @patch("bots.zoom_oauth_connections_utils.requests.Session")
     @patch("bots.zoom_oauth_connections_utils.requests.post")
     def test_returns_local_recording_token_when_no_onbehalf_configured(self, mock_post, mock_session):
@@ -229,3 +287,171 @@ class TestGetZoomTokensViaZoomOAuthApp(TestCase):
 
         self.assertEqual(result["app_privilege_token"], "local_rec_token_123")
         self.assertEqual(result["onbehalf_token"], "onbehalf_token_456")
+
+    @patch("bots.zoom_oauth_connections_utils.requests.Session")
+    @patch("bots.zoom_oauth_connections_utils.requests.post")
+    def test_works_with_runtime_snapshot_zoom_oauth_app(self, mock_post, mock_session):
+        """Test that runtime snapshot without meeting mappings exits cleanly without ORM access."""
+        runtime_zoom_oauth_app = RuntimeZoomOAuthAppSnapshot(
+            object_id=self.zoom_oauth_app.object_id,
+            client_id=self.zoom_oauth_app.client_id,
+            credentials={"client_secret": "test_secret"},
+        )
+        runtime_project = RuntimeProjectSnapshot(
+            id=self.project.id,
+            object_id=self.project.object_id,
+            name=self.project.name,
+            organization=RuntimeOrganizationSnapshot(),
+            credentials=RuntimeCredentialCollection([]),
+            zoom_oauth_apps=RuntimeZoomOAuthAppCollection([runtime_zoom_oauth_app]),
+        )
+        bot = Mock()
+        bot.project = runtime_project
+        bot.meeting_url = f"https://zoom.us/j/{self.meeting_id}"
+        bot.zoom_onbehalf_token_zoom_oauth_connection_user_id.return_value = None
+
+        result = get_zoom_tokens_via_zoom_oauth_app(bot)
+
+        self.assertIsNone(result["app_privilege_token"])
+        self.assertIsNone(result["onbehalf_token"])
+        mock_post.assert_not_called()
+
+    @patch("bots.zoom_oauth_connections_utils.requests.Session")
+    @patch("bots.zoom_oauth_connections_utils.requests.post")
+    def test_works_with_runtime_snapshot_zoom_oauth_app_for_onbehalf(self, mock_post, mock_session):
+        """Test that runtime snapshot zoom oauth apps work for onbehalf token lookup too."""
+        runtime_zoom_oauth_connection = RuntimeZoomOAuthConnectionSnapshot(
+            object_id=self.zoom_oauth_connection.object_id,
+            user_id=self.zoom_oauth_connection.user_id,
+            account_id=self.zoom_oauth_connection.account_id,
+            client_id=self.zoom_oauth_app.client_id,
+            client_secret=self.zoom_oauth_app.client_secret,
+            is_local_recording_token_supported=True,
+            is_onbehalf_token_supported=True,
+            credentials={"refresh_token": "test_refresh_token"},
+        )
+        runtime_zoom_oauth_app = RuntimeZoomOAuthAppSnapshot(
+            object_id=self.zoom_oauth_app.object_id,
+            client_id=self.zoom_oauth_app.client_id,
+            credentials={"client_secret": "test_secret"},
+            zoom_oauth_connections=RuntimeZoomOAuthConnectionCollection([runtime_zoom_oauth_connection]),
+            zoom_meeting_to_zoom_oauth_connection_mappings=RuntimeZoomMeetingToZoomOAuthConnectionMappingCollection(
+                [
+                    RuntimeZoomMeetingToZoomOAuthConnectionMappingSnapshot(
+                        meeting_id=self.meeting_id,
+                        zoom_oauth_connection_object_id=runtime_zoom_oauth_connection.object_id,
+                    )
+                ]
+            ),
+        )
+        runtime_project = RuntimeProjectSnapshot(
+            id=self.project.id,
+            object_id=self.project.object_id,
+            name=self.project.name,
+            organization=RuntimeOrganizationSnapshot(),
+            credentials=RuntimeCredentialCollection([]),
+            zoom_oauth_apps=RuntimeZoomOAuthAppCollection([runtime_zoom_oauth_app]),
+        )
+        bot = Mock()
+        bot.project = runtime_project
+        bot.meeting_url = f"https://zoom.us/j/{self.meeting_id}"
+        bot.zoom_onbehalf_token_zoom_oauth_connection_user_id.return_value = "test_user_id"
+
+        self._mock_zoom_api_responses(
+            mock_post,
+            mock_session,
+            local_recording_token="local_rec_token_789",
+            onbehalf_token="onbehalf_token_789",
+        )
+
+        result = get_zoom_tokens_via_zoom_oauth_app(bot)
+
+        self.assertEqual(result["app_privilege_token"], "local_rec_token_789")
+        self.assertEqual(result["onbehalf_token"], "onbehalf_token_789")
+
+    @patch("bots.zoom_oauth_connections_utils.requests.Session")
+    @patch("bots.zoom_oauth_connections_utils.requests.post")
+    def test_works_with_runtime_snapshot_zoom_oauth_app_for_local_recording(self, mock_post, mock_session):
+        """Test that runtime snapshot zoom oauth apps can resolve local recording token without ORM."""
+        runtime_zoom_oauth_connection = RuntimeZoomOAuthConnectionSnapshot(
+            object_id=self.zoom_oauth_connection.object_id,
+            user_id=self.zoom_oauth_connection.user_id,
+            account_id=self.zoom_oauth_connection.account_id,
+            client_id=self.zoom_oauth_app.client_id,
+            client_secret=self.zoom_oauth_app.client_secret,
+            is_local_recording_token_supported=True,
+            is_onbehalf_token_supported=True,
+            credentials={"refresh_token": "test_refresh_token"},
+        )
+        runtime_zoom_oauth_app = RuntimeZoomOAuthAppSnapshot(
+            object_id=self.zoom_oauth_app.object_id,
+            client_id=self.zoom_oauth_app.client_id,
+            credentials={"client_secret": "test_secret"},
+            zoom_oauth_connections=RuntimeZoomOAuthConnectionCollection([runtime_zoom_oauth_connection]),
+            zoom_meeting_to_zoom_oauth_connection_mappings=RuntimeZoomMeetingToZoomOAuthConnectionMappingCollection(
+                [
+                    RuntimeZoomMeetingToZoomOAuthConnectionMappingSnapshot(
+                        meeting_id=self.meeting_id,
+                        zoom_oauth_connection_object_id=runtime_zoom_oauth_connection.object_id,
+                    )
+                ]
+            ),
+        )
+        runtime_project = RuntimeProjectSnapshot(
+            id=self.project.id,
+            object_id=self.project.object_id,
+            name=self.project.name,
+            organization=RuntimeOrganizationSnapshot(),
+            credentials=RuntimeCredentialCollection([]),
+            zoom_oauth_apps=RuntimeZoomOAuthAppCollection([runtime_zoom_oauth_app]),
+        )
+        bot = Mock()
+        bot.project = runtime_project
+        bot.meeting_url = f"https://zoom.us/j/{self.meeting_id}"
+        bot.zoom_onbehalf_token_zoom_oauth_connection_user_id.return_value = None
+
+        self._mock_zoom_api_responses(mock_post, mock_session, local_recording_token="local_rec_token_runtime")
+
+        result = get_zoom_tokens_via_zoom_oauth_app(bot)
+
+        self.assertEqual(result["app_privilege_token"], "local_rec_token_runtime")
+        self.assertIsNone(result["onbehalf_token"])
+
+    @patch("bots.zoom_oauth_connections_utils.requests.Session")
+    @patch("bots.zoom_oauth_connections_utils.requests.post")
+    def test_runtime_snapshot_without_mapping_returns_none_without_db_lookup(self, mock_post, mock_session):
+        runtime_zoom_oauth_connection = RuntimeZoomOAuthConnectionSnapshot(
+            object_id=self.zoom_oauth_connection.object_id,
+            user_id=self.zoom_oauth_connection.user_id,
+            account_id=self.zoom_oauth_connection.account_id,
+            client_id=self.zoom_oauth_app.client_id,
+            client_secret=self.zoom_oauth_app.client_secret,
+            is_local_recording_token_supported=True,
+            is_onbehalf_token_supported=True,
+            credentials={"refresh_token": "test_refresh_token"},
+        )
+        runtime_zoom_oauth_app = RuntimeZoomOAuthAppSnapshot(
+            object_id=self.zoom_oauth_app.object_id,
+            client_id=self.zoom_oauth_app.client_id,
+            credentials={"client_secret": "test_secret"},
+            zoom_oauth_connections=RuntimeZoomOAuthConnectionCollection([runtime_zoom_oauth_connection]),
+            zoom_meeting_to_zoom_oauth_connection_mappings=RuntimeZoomMeetingToZoomOAuthConnectionMappingCollection([]),
+        )
+        runtime_project = RuntimeProjectSnapshot(
+            id=self.project.id,
+            object_id=self.project.object_id,
+            name=self.project.name,
+            organization=RuntimeOrganizationSnapshot(),
+            credentials=RuntimeCredentialCollection([]),
+            zoom_oauth_apps=RuntimeZoomOAuthAppCollection([runtime_zoom_oauth_app]),
+        )
+        bot = Mock()
+        bot.project = runtime_project
+        bot.meeting_url = f"https://zoom.us/j/{self.meeting_id}"
+        bot.zoom_onbehalf_token_zoom_oauth_connection_user_id.return_value = None
+
+        result = get_zoom_tokens_via_zoom_oauth_app(bot)
+
+        self.assertIsNone(result["app_privilege_token"])
+        self.assertIsNone(result["onbehalf_token"])
+        mock_post.assert_not_called()

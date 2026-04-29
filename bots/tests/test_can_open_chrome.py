@@ -25,6 +25,8 @@ class TestChromeDriver(TransactionTestCase):
             options.add_argument("--disable-setuid-sandbox")
             options.add_argument("--disable-dev-shm-usage")
             options.add_argument("--disable-blink-features=AutomationControlled")
+            if os.path.exists("/opt/chrome-linux64/chrome"):
+                options.binary_location = "/opt/chrome-linux64/chrome"
             # Initialize Chrome driver
             driver = webdriver.Chrome(options=options, service=Service(executable_path="/usr/local/bin/chromedriver"))
 

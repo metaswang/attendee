@@ -5,6 +5,7 @@ import os
 import random
 import signal
 import time
+from datetime import timedelta
 
 import redis
 from django.conf import settings
@@ -15,7 +16,7 @@ from django.db.models import Q
 from django.utils import timezone
 
 from accounts.models import Organization
-from bots.models import Bot, BotRuntimeLease, BotRuntimeLeaseStatuses, BotStates, Calendar, CalendarStates, ZoomOAuthConnection, ZoomOAuthConnectionStates
+from bots.models import Bot, BotEventManager, BotEventSubTypes, BotEventTypes, BotRuntimeLease, BotRuntimeLeaseStatuses, BotRuntimeProviderTypes, BotStates, Calendar, CalendarStates, ZoomOAuthConnection, ZoomOAuthConnectionStates
 from bots.runtime_providers import get_runtime_provider
 from bots.runtime_scheduler import idle_gcp_hosts, persist_targets_snapshot, pop_due_pending_bots
 from bots.tasks.launch_meetbot_runtime_task import launch_meetbot_runtime
@@ -88,6 +89,7 @@ class Command(BaseCommand):
                 self._run_pending_meetbot_launches()
                 self._run_scheduled_bots()
                 self._reconcile_bot_runtime_leases()
+                self._cleanup_stale_runtime_leases()
                 self._reconcile_idle_gcp_hosts()
                 self._sync_runtime_capacity_if_enabled()
                 self._run_periodic_calendar_syncs()
@@ -355,3 +357,65 @@ class Command(BaseCommand):
                     log.exception("Failed deleting idle GCP host %s", host_name)
         except Exception:
             log.exception("Failed to reconcile idle GCP hosts")
+
+    def _maybe_create_runtime_fatal_error_event(self, bot: Bot, event_sub_type: BotEventSubTypes) -> None:
+        if not BotEventManager.event_can_be_created_for_state(BotEventTypes.FATAL_ERROR, bot.state):
+            return
+        try:
+            BotEventManager.create_event(bot=bot, event_type=BotEventTypes.FATAL_ERROR, event_sub_type=event_sub_type)
+        except Exception:
+            log.exception("Failed to create stale runtime lease fatal error event for bot %s", bot.object_id)
+
+    def _cleanup_stale_runtime_leases(self):
+        now = timezone.now()
+        one_hour_ago = now - timedelta(hours=1)
+        seven_days_ago = now - timedelta(days=7)
+        heartbeat_timeout_cutoff = int((now - timedelta(minutes=10)).timestamp())
+
+        stale_leases = (
+            BotRuntimeLease.objects.select_related("bot")
+            .filter(provider__in=[BotRuntimeProviderTypes.VPS_DOCKER, BotRuntimeProviderTypes.GCP_COMPUTE_INSTANCE])
+            .exclude(status=BotRuntimeLeaseStatuses.DELETED)
+        )
+
+        for lease in stale_leases:
+            bot = lease.bot
+            if lease.status not in {BotRuntimeLeaseStatuses.PROVISIONING, BotRuntimeLeaseStatuses.ACTIVE}:
+                continue
+
+            should_delete = False
+            event_sub_type = None
+
+            if bot.state in BotStates.post_meeting_states():
+                should_delete = True
+            elif bot.last_heartbeat_timestamp is not None and bot.last_heartbeat_timestamp < heartbeat_timeout_cutoff:
+                should_delete = True
+                event_sub_type = BotEventSubTypes.FATAL_ERROR_HEARTBEAT_TIMEOUT
+            elif bot.first_heartbeat_timestamp is None:
+                if bot.join_at is None:
+                    should_delete = bool(bot.created_at and seven_days_ago < bot.created_at < one_hour_ago)
+                else:
+                    should_delete = bool(seven_days_ago < bot.join_at < one_hour_ago)
+                if should_delete:
+                    event_sub_type = BotEventSubTypes.FATAL_ERROR_BOT_NOT_LAUNCHED
+
+            if not should_delete:
+                continue
+
+            log.info(
+                "Cleaning up stale runtime lease %s for bot %s status=%s state=%s heartbeat=%s join_at=%s created_at=%s",
+                lease.id,
+                bot.object_id,
+                lease.status,
+                bot.state,
+                bot.last_heartbeat_timestamp,
+                bot.join_at,
+                bot.created_at,
+            )
+            if event_sub_type is not None:
+                self._maybe_create_runtime_fatal_error_event(bot, event_sub_type)
+            try:
+                provider = get_runtime_provider(lease.provider)
+                provider.delete_lease(lease)
+            except Exception:
+                log.exception("Failed to delete stale runtime lease %s for bot %s", lease.id, bot.object_id)

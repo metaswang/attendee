@@ -6,6 +6,8 @@ from unittest.mock import MagicMock, patch
 from types import SimpleNamespace
 import tomllib
 
+import redis
+from django.conf import settings
 from django.test import Client, TestCase, override_settings
 
 from accounts.models import Organization
@@ -13,7 +15,7 @@ from bots.bots_api_utils import BotCreationSource, create_bot
 from bots.bot_controller.bot_controller import RuntimeBotEventManagerProxy
 from bots.management.commands.clean_up_bots_with_heartbeat_timeout_or_that_never_launched import Command as CleanupCommand
 from bots.management.commands.sync_gcp_runtime_capacity import Command as SyncGCPRuntimeCapacityCommand
-from bots.models import ApiKey, AudioChunk, Bot, BotEvent, BotEventTypes, BotMediaRequest, BotMediaRequestMediaTypes, BotMediaRequestStates, BotRuntimeLease, BotRuntimeLeaseStatuses, BotRuntimeProviderTypes, BotStates, MediaBlob, Participant, ParticipantEvent, ParticipantEventTypes, Project, Recording, RecordingFormats, RecordingManager, RecordingTypes, RuntimeCapacityProviders, RuntimeCapacitySnapshot, TranscriptionTypes, Utterance
+from bots.models import ApiKey, AudioChunk, Bot, BotEvent, BotEventTypes, BotMediaRequest, BotMediaRequestMediaTypes, BotMediaRequestStates, BotRuntimeLease, BotRuntimeLeaseStatuses, BotRuntimeProviderTypes, BotStates, MediaBlob, Participant, ParticipantEvent, ParticipantEventTypes, Project, Recording, RecordingFormats, RecordingManager, RecordingTypes, RuntimeCapacityProviders, RuntimeCapacitySnapshot, TranscriptionTypes, Utterance, ZoomOAuthApp
 from bots.runtime_providers.gcp_compute_engine import GCPComputeInstanceProvider
 from bots.runtime_providers.host_runtime import runtime_container_env
 from bots.runtime_snapshot import RuntimeBotSnapshot
@@ -411,12 +413,15 @@ class TestGCPRuntime(TestCase):
 
     def test_bootstrap_view_returns_runtime_snapshot(self):
         session_id = "019d61ee-39d9-700b-80d8-1d554c5b5b70"
+        zoom_oauth_app = ZoomOAuthApp.objects.create(project=self.project, client_id="test_client_id")
+        zoom_oauth_app.set_credentials({"client_secret": "test_client_secret", "webhook_secret": "test_webhook_secret"})
         self.bot.settings = {
             "runtime_settings": {"region": "asia-southeast1"},
             "callback_settings": {
                 "recording_complete": {
                     "url": "http://api:8000/v2/meeting/app/bot/recording/complete",
                     "signing_secret": "api-secret",
+                    "upstream_signing_secret": "api-secret",
                 }
             },
         }
@@ -440,6 +445,11 @@ class TestGCPRuntime(TestCase):
         self.assertEqual(payload["bot"]["object_id"], self.bot.object_id)
         self.assertEqual(payload["lease"]["id"], lease.id)
         self.assertEqual(payload["project"]["object_id"], self.project.object_id)
+        self.assertEqual(len(payload["project"]["zoom_oauth_apps"]), 1)
+        self.assertEqual(payload["project"]["zoom_oauth_apps"][0]["object_id"], zoom_oauth_app.object_id)
+        self.assertEqual(payload["project"]["zoom_oauth_apps"][0]["client_id"], "test_client_id")
+        self.assertEqual(payload["project"]["zoom_oauth_apps"][0]["credentials"]["client_secret"], "test_client_secret")
+        self.assertEqual(payload["project"]["zoom_oauth_apps"][0]["credentials"]["webhook_secret"], "test_webhook_secret")
         self.assertEqual(payload["bot"]["settings"]["recording_settings"]["transport"], "r2_chunks")
         self.assertEqual(payload["bot"]["settings"]["recording_settings"]["format"], RecordingFormats.MP3)
         self.assertEqual(payload["bot"]["settings"]["recording_settings"]["audio_chunk_prefix"], f"customer_audio/{self.project.object_id}/{session_id}/chunks")
@@ -461,8 +471,55 @@ class TestGCPRuntime(TestCase):
         runtime_bot = RuntimeBotSnapshot(payload)
         self.assertEqual(runtime_bot.id, self.bot.id)
         self.assertEqual(runtime_bot.project.object_id, self.project.object_id)
+        self.assertTrue(runtime_bot.project.zoom_oauth_apps.exists())
+        self.assertEqual(runtime_bot.project.zoom_oauth_apps.first().client_id, "test_client_id")
+        self.assertEqual(runtime_bot.project.zoom_oauth_apps.first().client_secret, "test_client_secret")
+        self.assertEqual(runtime_bot.project.zoom_oauth_apps.first().webhook_secret, "test_webhook_secret")
         self.assertEqual(runtime_bot.recording_complete_signing_secret(), lease.shutdown_token)
         self.assertEqual(runtime_bot.recording_complete_upstream_signing_secret(), "api-secret")
+
+    def test_runtime_bot_snapshot_parses_zoom_oauth_apps(self):
+        payload = {
+            "id": self.bot.id,
+            "object_id": self.bot.object_id,
+            "name": self.bot.name,
+            "meeting_url": self.bot.meeting_url,
+            "state": self.bot.state,
+            "settings": self.bot.settings,
+            "metadata": self.bot.metadata,
+            "project": {
+                "id": self.project.id,
+                "object_id": self.project.object_id,
+                "name": self.project.name,
+                "organization": {"is_async_transcription_enabled": self.project.organization.is_async_transcription_enabled},
+                "credentials": [
+                    {
+                        "credential_type": 99,
+                        "credentials": {"client_secret": "cred-secret"},
+                    }
+                ],
+                "zoom_oauth_apps": [
+                    {
+                        "object_id": "zoa_test123",
+                        "client_id": "zoom-client-id",
+                        "credentials": {
+                            "client_secret": "zoom-client-secret",
+                            "webhook_secret": "zoom-webhook-secret",
+                        },
+                    }
+                ],
+            },
+        }
+
+        runtime_bot = RuntimeBotSnapshot(payload)
+
+        self.assertTrue(runtime_bot.project.zoom_oauth_apps.exists())
+        zoom_oauth_app = runtime_bot.project.zoom_oauth_apps.first()
+        self.assertEqual(zoom_oauth_app.object_id, "zoa_test123")
+        self.assertEqual(zoom_oauth_app.client_id, "zoom-client-id")
+        self.assertEqual(zoom_oauth_app.client_secret, "zoom-client-secret")
+        self.assertEqual(zoom_oauth_app.webhook_secret, "zoom-webhook-secret")
+        self.assertEqual(zoom_oauth_app.get_credentials()["client_secret"], "zoom-client-secret")
 
     @patch.dict("os.environ", {"MEETBOT_RUNTIME_API_BASE_URL": "https://api.voxstudio.me"}, clear=False)
     def test_bootstrap_view_uses_runtime_api_facade_for_recording_complete_url(self):
@@ -472,6 +529,7 @@ class TestGCPRuntime(TestCase):
                 "recording_complete": {
                     "url": "http://api:8000/v2/meeting/app/bot/recording/complete",
                     "signing_secret": "api-secret",
+                    "upstream_signing_secret": "api-secret",
                 }
             },
         }
@@ -495,6 +553,53 @@ class TestGCPRuntime(TestCase):
         self.assertEqual(
             payload["bot"]["settings"]["callback_settings"]["recording_complete"]["url"],
             f"https://api.voxstudio.me/internal/attendee-runtime-leases/{lease.id}/recording-complete",
+        )
+
+    @patch.dict("os.environ", {"MEETBOT_RUNTIME_API_BASE_URL": "https://api.voxstudio.me"}, clear=False)
+    def test_bootstrap_view_uses_runtime_api_facade_for_zoom_recording_complete_url(self):
+        self.bot.meeting_url = "https://app.zoom.us/wc/86787187920/join"
+        self.bot.settings = {
+            "callback_settings": {
+                "recording_complete": {
+                    "url": "http://api:8000/v2/meeting/app/bot/recording/complete",
+                    "signing_secret": "api-secret",
+                }
+            },
+            "recording_settings": {
+                "format": RecordingFormats.MP4,
+            },
+        }
+        self.bot.save(update_fields=["meeting_url", "settings", "updated_at"])
+
+        lease = BotRuntimeLease.objects.create(
+            bot=self.bot,
+            provider=BotRuntimeProviderTypes.VPS_DOCKER,
+            status=BotRuntimeLeaseStatuses.PROVISIONING,
+        )
+
+        response = self.client.get(
+            f"/internal/bot-runtime-leases/{lease.id}/bootstrap",
+            HTTP_AUTHORIZATION=f"Bearer {lease.shutdown_token}",
+            secure=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(
+            payload["bot"]["settings"]["callback_settings"]["recording_complete"]["url"],
+            f"https://api.voxstudio.me/internal/attendee-runtime-leases/{lease.id}/recording-complete",
+        )
+        self.assertEqual(
+            payload["bot"]["settings"]["callback_settings"]["recording_complete"]["signing_secret"],
+            lease.shutdown_token,
+        )
+        self.assertEqual(
+            payload["bot"]["settings"]["callback_settings"]["recording_complete"]["upstream_signing_secret"],
+            "api-secret",
+        )
+        self.assertNotEqual(
+            payload["bot"]["settings"].get("recording_settings", {}).get("transport"),
+            "r2_chunks",
         )
 
     @patch.dict("os.environ", {"ATTENDEE_INTERNAL_SERVICE_KEY": "svc-key"}, clear=False)
@@ -553,6 +658,7 @@ class TestGCPRuntime(TestCase):
                 "recording_complete": {
                     "url": "http://api:8000/v2/meeting/app/bot/recording/complete",
                     "signing_secret": "api-secret",
+                    "upstream_signing_secret": "api-secret",
                 }
             },
         }
@@ -593,17 +699,154 @@ class TestGCPRuntime(TestCase):
         )
 
         self.assertEqual(response.status_code, 200)
-        expected_upstream_signature = sign_payload(payload, "api-secret")
-        mock_post.assert_called_once_with(
-            "http://api:8000/v2/meeting/app/bot/recording/complete",
-            json=payload,
-            headers={
-                "Content-Type": "application/json",
-                "User-Agent": "Attendee-Runtime/1.0",
-                "X-Webhook-Signature": expected_upstream_signature,
+        assert mock_post.call_count == 1
+        call_kwargs = mock_post.call_args.kwargs
+        self.assertEqual(mock_post.call_args.args[0], "http://api:8000/v2/meeting/app/bot/recording/complete")
+        self.assertEqual(call_kwargs["data"], json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        self.assertEqual(call_kwargs["timeout"], 20)
+        self.assertEqual(call_kwargs["headers"]["Content-Type"], "application/json")
+        self.assertEqual(call_kwargs["headers"]["User-Agent"], "Attendee-Runtime/1.0")
+        self.assertIn("X-Webhook-Timestamp", call_kwargs["headers"])
+        self.assertIn("X-Webhook-Signature", call_kwargs["headers"])
+
+    @patch("bots.internal_views._upload_meetbot_global_diarization")
+    @patch("bots.internal_views._build_meetbot_global_diarization")
+    @patch("bots.internal_views.requests.post")
+    def test_recording_complete_view_attaches_global_diarization_when_build_succeeds(
+        self,
+        mock_post,
+        mock_build_global_diarization,
+        mock_upload_global_diarization,
+    ):
+        mock_post.return_value = SimpleNamespace(status_code=202, text="accepted")
+        mock_build_global_diarization.return_value = {
+            "session_id": "session-1",
+            "user_id": str(self.project.object_id),
+            "segments": [{"start_ms": 0, "end_ms": 1000, "speaker": "Jason"}],
+            "speakers": [{"speaker": "Jason", "speaker_id": "speaker-1"}],
+            "speaker_count": 1,
+            "backend": "meetbot_participant_events",
+        }
+        mock_upload_global_diarization.return_value = "customer_audio/test/session-1/diarization/global_diarization.json"
+
+        self.bot.settings = {
+            "runtime_settings": {"region": "asia-southeast1"},
+            "callback_settings": {
+                "recording_complete": {
+                    "url": "http://api:8000/v2/meeting/app/bot/recording/complete",
+                    "signing_secret": "api-secret",
+                    "upstream_signing_secret": "api-secret",
+                }
             },
-            timeout=20,
+        }
+        self.bot.save(update_fields=["settings", "updated_at"])
+
+        lease = BotRuntimeLease.objects.create(
+            bot=self.bot,
+            provider=BotRuntimeProviderTypes.GCP_COMPUTE_INSTANCE,
+            status=BotRuntimeLeaseStatuses.PROVISIONING,
         )
+
+        payload = {
+            "idempotency_key": "test-idempotency",
+            "trigger": "recording.complete",
+            "bot_id": self.bot.object_id,
+            "provider": "google",
+            "data": {
+                "session_id": "session-1",
+                "audio": {
+                    "chunk_paths": ["customer_audio/test/chunks/chunk_0000.webm"],
+                    "chunk_count": 1,
+                    "chunk_ext": "webm",
+                    "chunk_mime_type": "audio/webm",
+                    "chunk_interval_ms": 5000,
+                    "duration_sec": 7,
+                    "raw_path": "customer_audio/test/original.m4a",
+                },
+            },
+        }
+        signature = sign_payload(payload, lease.shutdown_token)
+
+        response = self.client.post(
+            f"/internal/bot-runtime-leases/{lease.id}/recording-complete",
+            data=json.dumps(payload),
+            content_type="application/json",
+            HTTP_X_WEBHOOK_SIGNATURE=signature,
+            secure=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        upstream_payload = json.loads(mock_post.call_args.kwargs["data"].decode("utf-8"))
+        self.assertEqual(
+            upstream_payload["data"]["audio"]["global_diarization_path"],
+            "customer_audio/test/session-1/diarization/global_diarization.json",
+        )
+        mock_build_global_diarization.assert_called_once()
+        mock_upload_global_diarization.assert_called_once()
+
+    @patch("bots.internal_views._upload_meetbot_global_diarization")
+    @patch("bots.internal_views._build_meetbot_global_diarization")
+    @patch("bots.internal_views.requests.post")
+    def test_recording_complete_view_does_not_attach_global_diarization_when_build_fails(
+        self,
+        mock_post,
+        mock_build_global_diarization,
+        mock_upload_global_diarization,
+    ):
+        mock_post.return_value = SimpleNamespace(status_code=202, text="accepted")
+        mock_build_global_diarization.return_value = None
+
+        self.bot.settings = {
+            "runtime_settings": {"region": "asia-southeast1"},
+            "callback_settings": {
+                "recording_complete": {
+                    "url": "http://api:8000/v2/meeting/app/bot/recording/complete",
+                    "signing_secret": "api-secret",
+                    "upstream_signing_secret": "api-secret",
+                }
+            },
+        }
+        self.bot.save(update_fields=["settings", "updated_at"])
+
+        lease = BotRuntimeLease.objects.create(
+            bot=self.bot,
+            provider=BotRuntimeProviderTypes.GCP_COMPUTE_INSTANCE,
+            status=BotRuntimeLeaseStatuses.PROVISIONING,
+        )
+
+        payload = {
+            "idempotency_key": "test-idempotency",
+            "trigger": "recording.complete",
+            "bot_id": self.bot.object_id,
+            "provider": "google",
+            "data": {
+                "session_id": "session-2",
+                "audio": {
+                    "chunk_paths": ["customer_audio/test/chunks/chunk_0000.webm"],
+                    "chunk_count": 1,
+                    "chunk_ext": "webm",
+                    "chunk_mime_type": "audio/webm",
+                    "chunk_interval_ms": 5000,
+                    "duration_sec": 7,
+                    "raw_path": "customer_audio/test/original.m4a",
+                },
+            },
+        }
+        signature = sign_payload(payload, lease.shutdown_token)
+
+        response = self.client.post(
+            f"/internal/bot-runtime-leases/{lease.id}/recording-complete",
+            data=json.dumps(payload),
+            content_type="application/json",
+            HTTP_X_WEBHOOK_SIGNATURE=signature,
+            secure=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        upstream_payload = json.loads(mock_post.call_args.kwargs["data"].decode("utf-8"))
+        self.assertNotIn("global_diarization_path", upstream_payload["data"]["audio"])
+        mock_build_global_diarization.assert_called_once()
+        mock_upload_global_diarization.assert_not_called()
 
     def test_control_view_returns_control_snapshot(self):
         lease = BotRuntimeLease.objects.create(
@@ -1175,6 +1418,20 @@ class TestRuntimeCapacityView(TestCase):
         self.project = Project.objects.create(name="Test Project", organization=self.organization)
         self.api_key, self.api_key_plain = ApiKey.create(project=self.project, name="API Key")
         self.client = Client()
+        self.redis_client = redis.from_url(settings.REDIS_URL_WITH_PARAMS)
+
+    def tearDown(self):
+        keys_to_delete = []
+        for pattern in (
+            "meetbot:scheduler:slots:myvps:*",
+            "meetbot:scheduler:lease:*",
+            "meetbot:scheduler:bot:*",
+            "meetbot:scheduler:targets",
+        ):
+            keys_to_delete.extend(self.redis_client.keys(pattern))
+        if keys_to_delete:
+            self.redis_client.delete(*keys_to_delete)
+        super().tearDown()
 
     def test_runtime_capacity_view_returns_cached_snapshots(self):
         RuntimeCapacitySnapshot.objects.create(
@@ -1199,3 +1456,83 @@ class TestRuntimeCapacityView(TestCase):
         self.assertEqual(len(payload), 1)
         self.assertEqual(payload[0]["provider"], RuntimeCapacityProviders.GCP_COMPUTE_INSTANCE)
         self.assertEqual(payload[0]["region"], "asia-southeast1")
+
+    @patch.dict(
+        "os.environ",
+        {
+            "MEETBOT_VPS_SLOT_CAPACITY_JSON": '{"myvps":3}',
+            "MEETBOT_VPS_TARGET_ORDER": "myvps",
+        },
+        clear=False,
+    )
+    def test_runtime_capacity_view_prunes_stale_vps_slots_for_terminal_lease(self):
+        bot = Bot.objects.create(
+            project=self.project,
+            name="Terminal Lease Bot",
+            meeting_url="https://app.zoom.us/wc/86787187920/join",
+        )
+        lease = BotRuntimeLease.objects.create(
+            bot=bot,
+            provider=BotRuntimeProviderTypes.VPS_DOCKER,
+            status=BotRuntimeLeaseStatuses.FAILED,
+            provider_instance_id="myvps",
+            metadata={"host_name": "myvps", "slot_index": 1},
+        )
+        slot_key = "meetbot:scheduler:slots:myvps:1"
+        self.redis_client.set(
+            slot_key,
+            json.dumps({"bot_id": bot.id, "lease_id": lease.id, "target": "myvps", "slot_index": 1}),
+        )
+        self.redis_client.set(f"meetbot:scheduler:lease:{lease.id}", json.dumps({"lease_id": lease.id}))
+        self.redis_client.set(f"meetbot:scheduler:bot:{bot.id}", json.dumps({"bot_id": bot.id}))
+
+        response = self.client.get(
+            "/api/v1/runtime_capacity?provider=vps_docker",
+            HTTP_AUTHORIZATION=f"Token {self.api_key_plain}",
+            HTTP_CONTENT_TYPE="application/json",
+            secure=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(len(payload), 1)
+        self.assertEqual(payload[0]["target"], "myvps")
+        self.assertEqual(payload[0]["quota_usage"], 0)
+        self.assertEqual(payload[0]["effective_available"], 3)
+        self.assertFalse(self.redis_client.exists(slot_key))
+        self.assertFalse(self.redis_client.exists(f"meetbot:scheduler:lease:{lease.id}"))
+        self.assertFalse(self.redis_client.exists(f"meetbot:scheduler:bot:{bot.id}"))
+
+    @patch.dict(
+        "os.environ",
+        {
+            "MEETBOT_VPS_SLOT_CAPACITY_JSON": '{"myvps":3}',
+            "MEETBOT_VPS_TARGET_ORDER": "myvps",
+        },
+        clear=False,
+    )
+    def test_runtime_capacity_view_prunes_stale_vps_slots_for_missing_lease(self):
+        slot_key = "meetbot:scheduler:slots:myvps:2"
+        self.redis_client.set(
+            slot_key,
+            json.dumps({"bot_id": 999001, "lease_id": 999002, "target": "myvps", "slot_index": 2}),
+        )
+        self.redis_client.set("meetbot:scheduler:lease:999002", json.dumps({"lease_id": 999002}))
+        self.redis_client.set("meetbot:scheduler:bot:999001", json.dumps({"bot_id": 999001}))
+
+        response = self.client.get(
+            "/api/v1/runtime_capacity?provider=vps_docker",
+            HTTP_AUTHORIZATION=f"Token {self.api_key_plain}",
+            HTTP_CONTENT_TYPE="application/json",
+            secure=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(len(payload), 1)
+        self.assertEqual(payload[0]["target"], "myvps")
+        self.assertEqual(payload[0]["quota_usage"], 0)
+        self.assertEqual(payload[0]["effective_available"], 3)
+        self.assertFalse(self.redis_client.exists(slot_key))
+        self.assertFalse(self.redis_client.exists("meetbot:scheduler:lease:999002"))
+        self.assertFalse(self.redis_client.exists("meetbot:scheduler:bot:999001"))

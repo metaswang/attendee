@@ -231,6 +231,7 @@ class WebpageStreamer:
             self.display.start()
             self.display_var_for_recording = self.display.new_display_var
 
+        chrome_binary_path = "/opt/chrome-linux64/chrome"
         options = webdriver.ChromeOptions()
 
         options.add_argument("--autoplay-policy=no-user-gesture-required")
@@ -264,6 +265,8 @@ class WebpageStreamer:
                 "profile.default_content_setting_values.media_stream_camera": 2,  # 1 = allow, 2 = block
             },
         )
+        if os.path.exists(chrome_binary_path):
+            options.binary_location = chrome_binary_path
 
         self.driver = webdriver.Chrome(options=options, service=Service(executable_path="/usr/local/bin/chromedriver"))
         logger.info(f"web driver server initialized at port {self.driver.service.port}")

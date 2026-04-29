@@ -483,11 +483,11 @@ class BotValidationMixin:
     def validate_meeting_url(self, value):
         meeting_type, normalized_url = normalize_meeting_url(value)
         if meeting_type is None:
-            logger.error(f"Invalid meeting URL: {value}")
+            logger.error("Invalid meeting URL")
             raise serializers.ValidationError("Invalid meeting URL")
 
         if normalized_url != value:
-            logger.info(f"Normalized Meeting URL: {normalized_url} from {value}")
+            logger.info("Normalized Meeting URL")
         return normalized_url
 
     def validate_join_at(self, value):
@@ -1735,9 +1735,16 @@ class CreateBotSerializer(BotValidationMixin, serializers.Serializer):
         if transport == "r2_chunks":
             meeting_type = meeting_type_from_url(data.get("meeting_url", ""))
             zoom_settings = data.get("zoom_settings") or {}
+            if meeting_type == MeetingTypes.ZOOM and zoom_settings.get("sdk", "native") == "web":
+                raise serializers.ValidationError(
+                    {
+                        "recording_settings": {
+                            "transport": "transport='r2_chunks' is not supported for Zoom when using the web SDK. Use zoom_settings.sdk='native' or Zoom RTMS instead."
+                        }
+                    }
+                )
             is_supported_web_adapter = (
                 meeting_type in [MeetingTypes.GOOGLE_MEET, MeetingTypes.TEAMS]
-                or (meeting_type == MeetingTypes.ZOOM and zoom_settings.get("sdk", "native") == "web")
             )
             if not is_supported_web_adapter:
                 raise serializers.ValidationError({"recording_settings": {"transport": "transport='r2_chunks' is only supported for web meeting adapters"}})
@@ -2352,7 +2359,7 @@ class CreateZoomOAuthConnectionSerializer(serializers.Serializer):
     authorization_code = serializers.CharField(help_text="The authorization code received from Zoom during the OAuth flow")
     redirect_uri = serializers.CharField(help_text="The redirect URI used to obtain the authorization code")
     is_local_recording_token_supported = serializers.BooleanField(help_text="Whether the Zoom OAuth Connection supports generating local recording tokens", required=False, default=True)
-    is_onbehalf_token_supported = serializers.BooleanField(help_text="Whether the Zoom OAuth Connection supports generating onbehalf tokens", required=False, default=False)
+    is_onbehalf_token_supported = serializers.BooleanField(help_text="Whether the Zoom OAuth Connection supports generating onbehalf tokens", required=False, default=True)
 
     metadata = serializers.JSONField(help_text="JSON object containing metadata to associate with the Zoom OAuth Connection", required=False, default=None)
 

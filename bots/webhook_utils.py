@@ -1,5 +1,3 @@
-import base64
-import hashlib
 import hmac
 import json
 import logging
@@ -7,6 +5,8 @@ import uuid
 from functools import partial
 
 from django.db import transaction
+
+from bots.signature_utils import sign_message_with_hmac_sha256
 
 logger = logging.getLogger(__name__)
 
@@ -68,14 +68,7 @@ def sign_payload(payload, secret):
     """
     # Convert the payload to a canonical JSON string
     payload_json = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
-    if isinstance(secret, str):
-        secret = secret.encode("utf-8")
-
-    # Create the signature
-    signature = hmac.new(secret, payload_json.encode("utf-8"), hashlib.sha256).digest()
-
-    # Return base64 encoded signature
-    return base64.b64encode(signature).decode("utf-8")
+    return sign_message_with_hmac_sha256(payload_json.encode("utf-8"), secret)
 
 
 def verify_signature(payload, signature, secret):

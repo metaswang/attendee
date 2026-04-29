@@ -191,7 +191,7 @@ def build_targets_snapshot() -> dict:
         occupied = 0
         client = redis_client()
         for slot_index in range(capacity):
-            if client.exists(slot_key(target, slot_index)):
+            if _slot_is_occupied(target, slot_index, client=client):
                 occupied += 1
         snapshot["vps_targets"].append(
             {
@@ -211,7 +211,7 @@ def build_targets_snapshot() -> dict:
         capacity = int(meta.get("slot_capacity") or gcp_vm_slot_capacity())
         occupied = 0
         for slot_index in range(capacity):
-            if client.exists(slot_key(f"gcp:{instance_name}", slot_index)):
+            if _slot_is_occupied(f"gcp:{instance_name}", slot_index, client=client):
                 occupied += 1
         snapshot["gcp"]["instances"].append(
             {
@@ -227,6 +227,43 @@ def build_targets_snapshot() -> dict:
             }
         )
     return snapshot
+
+
+def _clear_slot_allocation(client, target: str, slot_index: int, payload: dict | None) -> None:
+    client.delete(slot_key(target, slot_index))
+    if not payload:
+        return
+    lease_id = payload.get("lease_id")
+    bot_id = payload.get("bot_id")
+    if lease_id:
+        client.delete(lease_key(int(lease_id)))
+    if bot_id:
+        client.delete(bot_key(int(bot_id)))
+
+
+def _slot_is_occupied(target: str, slot_index: int, *, client=None) -> bool:
+    client = client or redis_client()
+    raw_payload = client.get(slot_key(target, slot_index))
+    payload = _json_load(raw_payload)
+    if not payload:
+        if raw_payload:
+            client.delete(slot_key(target, slot_index))
+        return False
+
+    lease_id = payload.get("lease_id")
+    if not lease_id:
+        _clear_slot_allocation(client, target, slot_index, payload)
+        return False
+
+    lease = BotRuntimeLease.objects.filter(id=lease_id).only("id", "status").first()
+    if lease is None or lease.status not in {
+        BotRuntimeLeaseStatuses.PROVISIONING,
+        BotRuntimeLeaseStatuses.ACTIVE,
+    }:
+        _clear_slot_allocation(client, target, slot_index, payload)
+        return False
+
+    return True
 
 
 def persist_targets_snapshot() -> dict:

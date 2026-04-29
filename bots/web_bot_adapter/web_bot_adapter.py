@@ -304,12 +304,38 @@ class WebBotAdapter(BotAdapter):
             self.only_one_participant_in_meeting_at = None
 
     def handle_removed_from_meeting(self):
+        logger.info(
+            "handle_removed_from_meeting left_meeting=%s was_removed_from_meeting=%s recording_paused=%s",
+            self.left_meeting,
+            self.was_removed_from_meeting,
+            self.recording_paused,
+        )
+        self.stop_media_sending_for_meeting_end()
         self.left_meeting = True
+        self.was_removed_from_meeting = True
         self.send_message_callback({"message": self.Messages.MEETING_ENDED})
 
     def handle_meeting_ended(self):
+        logger.info(
+            "handle_meeting_ended left_meeting=%s was_removed_from_meeting=%s recording_paused=%s",
+            self.left_meeting,
+            self.was_removed_from_meeting,
+            self.recording_paused,
+        )
+        self.stop_media_sending_for_meeting_end()
         self.left_meeting = True
         self.send_message_callback({"message": self.Messages.MEETING_ENDED})
+
+    def stop_media_sending_for_meeting_end(self):
+        if not self.driver:
+            return
+
+        try:
+            logger.info("disable media sending due to meeting end")
+            disable_result = self.driver.execute_script("return window.ws?.disableMediaSending?.();")
+            logger.info("disable media sending due to meeting end invoked result_type=%s", type(disable_result).__name__)
+        except Exception as e:
+            logger.warning(f"Error disabling media sending after meeting end: {e}")
 
     def handle_failed_to_join(self, reason):
         logger.info(f"failed to join meeting with reason {reason}")
@@ -389,6 +415,31 @@ class WebBotAdapter(BotAdapter):
         )
         self.update_recording_resize_events_callback(normalized_events)
 
+    def handle_recording_chunk_recorder_state(self, json_data):
+        kind = (json_data.get("kind") or "").strip().lower()
+        state = (json_data.get("state") or "").strip().lower()
+        reason = json_data.get("reason")
+        if kind not in {"audio", "video"} or state not in {"starting", "started", "failed", "stopped"}:
+            logger.warning("Received invalid RecordingChunkRecorderState payload: %s", json_data)
+            return
+
+        payload = {key: value for key, value in json_data.items() if key != "type"}
+        logger.info("Received RecordingChunkRecorderState kind=%s state=%s reason=%s payload=%s", kind, state, reason, payload)
+        self.send_message_callback(
+            {
+                "message": self.Messages.RECORDING_CHUNK_RECORDER_STATE,
+                "kind": kind,
+                "state": state,
+                "reason": reason,
+                "payload": payload,
+            }
+        )
+
+    def handle_browser_diagnostic_event(self, json_data):
+        diagnostic_type = json_data.get("type")
+        payload = {key: value for key, value in json_data.items() if key != "type"}
+        logger.info("Browser diagnostic event type=%s payload=%s", diagnostic_type, payload)
+
     def mask_transcript_if_required(self, json_data):
         if not settings.MASK_TRANSCRIPT_IN_LOGS:
             return json_data
@@ -434,6 +485,23 @@ class WebBotAdapter(BotAdapter):
 
                         elif json_data.get("type") == "RecordingResizeEvents":
                             self.handle_recording_resize_events(json_data)
+
+                        elif json_data.get("type") == "RecordingChunkRecorderState":
+                            self.handle_recording_chunk_recorder_state(json_data)
+
+                        elif json_data.get("type") in {
+                            "VideoSelectionDecision",
+                            "MediaSendingState",
+                            "MeetingAudioStreamReady",
+                            "MeetingEndLifecycle",
+                            "AudioRecordingState",
+                            "RecordingVideoSourceSelected",
+                            "RecordingVideoSourceUnavailable",
+                            "RecordingVideoFrameHealth",
+                            "RecordingChunkLifecycle",
+                            "EncodedMediaChunk",
+                        }:
+                            self.handle_browser_diagnostic_event(json_data)
 
                         elif json_data.get("type") == "ParticipantSpeechStartStopEvent":
                             self.handle_participant_speech_start_stop_event(json_data)
@@ -644,6 +712,7 @@ class WebBotAdapter(BotAdapter):
 
         options = webdriver.ChromeOptions()
 
+        chrome_binary_path = "/opt/chrome-linux64/chrome"
         options.add_argument(f"--user-data-dir={self._chrome_user_data_dir}")
         options.add_argument("--autoplay-policy=no-user-gesture-required")
         options.add_argument("--use-fake-device-for-media-stream")
@@ -675,6 +744,9 @@ class WebBotAdapter(BotAdapter):
             "profile.password_manager_enabled": False,
         }
         options.add_experimental_option("prefs", prefs)
+        if os.path.exists(chrome_binary_path):
+            # Chrome for Testing crashes when launched through /usr/local/bin/google-chrome in the GCP runtime image.
+            options.binary_location = chrome_binary_path
 
         self.add_subclass_specific_chrome_options(options)
 

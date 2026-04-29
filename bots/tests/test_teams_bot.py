@@ -5,13 +5,16 @@ import time
 from unittest.mock import MagicMock, mock_open, patch
 
 from django.db import connection
-from django.test import TransactionTestCase, tag
+from django.test import SimpleTestCase, TransactionTestCase, tag
 
 from bots.bot_controller.bot_controller import BotController
 from bots.bots_api_views import send_sync_command
 from bots.models import Bot, BotChatMessageRequest, BotChatMessageRequestStates, BotChatMessageToOptions, BotEventManager, BotEventSubTypes, BotEventTypes, BotMediaRequest, BotMediaRequestMediaTypes, BotMediaRequestStates, BotStates, Credentials, MediaBlob, Organization, Project, Recording, RecordingStates, RecordingTypes, TranscriptionProviders, TranscriptionTypes
+from bots.automatic_leave_configuration import AutomaticLeaveConfiguration
 from bots.teams_bot_adapter.teams_ui_methods import TeamsUIMethods, UiTeamsBlockingUsException
+from bots.teams_bot_adapter.teams_bot_adapter import TeamsBotAdapter
 from bots.web_bot_adapter.ui_methods import UiLoginRequiredException
+from bots.models import RecordingViews
 
 
 # Helper functions for creating mocks
@@ -192,6 +195,61 @@ class TestTeamsBot(TransactionTestCase):
                     message = call_args[0][0]
                     self.assertIn(self.bot.object_id, message, "Message should contain bot object_id")
                     self.assertIn("fatal error", message.lower(), "Message should mention fatal error")
+
+
+@tag("teams_tests")
+class TestTeamsMeetingEndMediaShutdown(SimpleTestCase):
+    def create_adapter(self):
+        return TeamsBotAdapter(
+            display_name="Test Teams Bot",
+            send_message_callback=MagicMock(),
+            meeting_url="https://teams.microsoft.com/meet/test",
+            add_video_frame_callback=None,
+            wants_any_video_frames_callback=None,
+            add_audio_chunk_callback=None,
+            add_mixed_audio_chunk_callback=None,
+            add_encoded_mp4_chunk_callback=None,
+            add_encoded_audio_chunk_callback=None,
+            update_recording_chunk_metadata_callback=None,
+            upsert_caption_callback=None,
+            upsert_chat_message_callback=None,
+            add_participant_event_callback=None,
+            automatic_leave_configuration=AutomaticLeaveConfiguration(),
+            recording_view=RecordingViews.SPEAKER_VIEW,
+            should_create_debug_recording=False,
+            start_recording_screen_callback=None,
+            stop_recording_screen_callback=None,
+            video_frame_size=(1280, 720),
+            record_chat_messages_when_paused=False,
+            disable_incoming_video=False,
+            record_participant_speech_start_stop_events=False,
+            recording_chunk_interval_ms=5000,
+            teams_closed_captions_language=None,
+            teams_bot_login_credentials=None,
+            teams_bot_login_should_be_used=False,
+            modify_dom_for_video_recording=False,
+        )
+
+    def test_handle_meeting_ended_disables_media_sending_immediately(self):
+        adapter = self.create_adapter()
+        adapter.driver = MagicMock()
+
+        adapter.handle_meeting_ended()
+
+        adapter.driver.execute_script.assert_called_once_with("window.ws?.disableMediaSending();")
+        adapter.send_message_callback.assert_called_once_with({"message": adapter.Messages.MEETING_ENDED})
+        self.assertTrue(adapter.left_meeting)
+
+    def test_handle_removed_from_meeting_disables_media_sending_immediately(self):
+        adapter = self.create_adapter()
+        adapter.driver = MagicMock()
+
+        adapter.handle_removed_from_meeting()
+
+        adapter.driver.execute_script.assert_called_once_with("window.ws?.disableMediaSending();")
+        adapter.send_message_callback.assert_called_once_with({"message": adapter.Messages.MEETING_ENDED})
+        self.assertTrue(adapter.left_meeting)
+        self.assertTrue(adapter.was_removed_from_meeting)
 
     @patch("bots.web_bot_adapter.web_bot_adapter.Display")
     @patch("bots.web_bot_adapter.web_bot_adapter.webdriver.Chrome")

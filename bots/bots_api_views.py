@@ -41,6 +41,7 @@ from .models import (
     Recording,
     RecordingViews,
     RuntimeCapacitySnapshot,
+    SessionTypes,
     Utterance,
 )
 from .serializers import (
@@ -557,10 +558,9 @@ class OutputAudioView(APIView):
             try:
                 # Create or get existing MediaBlob
                 media_blob = MediaBlob.get_or_create_from_blob(project=request.auth.project, blob=audio_data, content_type=content_type)
-            except Exception as e:
-                error_message_first_line = str(e).split("\n")[0]
-                logging.error(f"Error creating audio blob: {error_message_first_line} (content_type={content_type}, bot_id={object_id})")
-                return Response({"error": f"Error creating the audio blob. Are you sure it's a valid {content_type} file?", "raw_error": error_message_first_line}, status=status.HTTP_400_BAD_REQUEST)
+            except Exception:
+                logging.exception("Error creating audio blob (content_type=%s, bot_id=%s)", content_type, object_id)
+                return Response({"error": f"Error creating the audio blob. Are you sure it's a valid {content_type} file?"}, status=status.HTTP_400_BAD_REQUEST)
 
             # Create BotMediaRequest
             BotMediaRequest.objects.create(
@@ -672,12 +672,9 @@ class DeleteDataView(APIView):
             return Response(BotSerializer(bot).data, status=status.HTTP_200_OK)
         except Bot.DoesNotExist:
             return Response({"error": "Bot not found"}, status=status.HTTP_404_NOT_FOUND)
-        except Exception as e:
-            logging.exception(f"Error deleting bot data: {str(e)}", extra={"bot_id": object_id})
-            return Response(
-                {"error": str(e)},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        except Exception:
+            logging.exception("Error deleting bot data", extra={"bot_id": object_id})
+            return Response({"error": "Error deleting bot data"}, status=status.HTTP_400_BAD_REQUEST)
 
 
 class BotLeaveView(APIView):
@@ -1631,18 +1628,65 @@ class ParticipantEventsView(GenericAPIView):
 
             # Apply ordering for cursor pagination
             events = events_query.order_by("created_at")
+            speaking_segments = None
+            if bot.session_type == SessionTypes.APP_SESSION:
+                speaking_segments = self._build_speaking_segments(events)
 
             # Let the pagination class handle the rest
             page = self.paginate_queryset(events)
             if page is not None:
                 serializer = self.get_serializer(page, many=True)
-                return self.get_paginated_response(serializer.data)
+                response = self.get_paginated_response(serializer.data)
+                if speaking_segments is not None:
+                    response.data["speaking_segments"] = speaking_segments
+                return response
 
             serializer = self.get_serializer(events, many=True)
-            return Response(serializer.data)
+            if speaking_segments is None:
+                return Response(serializer.data)
+            return Response(
+                {
+                    "results": serializer.data,
+                    "speaking_segments": speaking_segments,
+                }
+            )
 
         except Bot.DoesNotExist:
             return Response({"error": "Bot not found"}, status=status.HTTP_404_NOT_FOUND)
+
+    def _build_speaking_segments(self, events):
+        segments = []
+        open_segments = {}
+        for event in events:
+            participant = getattr(event, "participant", None)
+            if participant is None:
+                continue
+            participant_key = str(getattr(participant, "uuid", "") or "")
+            if not participant_key:
+                continue
+            if event.event_type == ParticipantEventTypes.SPEECH_START:
+                open_segments[participant_key] = {
+                    "participant_uuid": participant_key,
+                    "participant_user_uuid": getattr(participant, "user_uuid", None),
+                    "participant_name": getattr(participant, "full_name", None),
+                    "start_timestamp_ms": int(event.timestamp_ms),
+                }
+            elif event.event_type == ParticipantEventTypes.SPEECH_STOP:
+                current = open_segments.pop(participant_key, None)
+                if current is None:
+                    continue
+                end_timestamp_ms = int(event.timestamp_ms)
+                if end_timestamp_ms <= current["start_timestamp_ms"]:
+                    continue
+                segments.append(
+                    {
+                        **current,
+                        "end_timestamp_ms": end_timestamp_ms,
+                    }
+                )
+        for current in open_segments.values():
+            segments.append(current)
+        return segments
 
 
 class ParticipantCursorPagination(CursorPagination):
