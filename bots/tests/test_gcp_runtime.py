@@ -1132,6 +1132,68 @@ class TestGCPRuntime(TestCase):
         self.assertEqual(response.status_code, 200)
         mock_provider.delete_lease.assert_called_once()
 
+    @patch("bots.internal_views.make_signed_callback_request")
+    @patch("bots.internal_views.get_runtime_provider")
+    def test_completion_callback_delivers_runtime_failed_fallback(self, mock_get_runtime_provider, mock_callback):
+        self.bot.settings = {
+            "callback_settings": {
+                "recording_complete": {
+                    "url": "https://api.example.com/internal/attendee-runtime-leases/184/recording-complete",
+                    "signing_secret": "runtime-shutdown-secret",
+                    "upstream_signing_secret": "api-secret",
+                }
+            }
+        }
+        self.bot.metadata = {"session_id": "019de422-216a-7002-8faa-5cfb0f428f5e"}
+        self.bot.state = BotStates.FATAL_ERROR
+        self.bot.save(update_fields=["settings", "metadata", "state", "updated_at"])
+        BotEvent.objects.create(
+            bot=self.bot,
+            event_type=BotEventTypes.COULD_NOT_JOIN,
+            old_state=BotStates.JOINING,
+            new_state=BotStates.FATAL_ERROR,
+        )
+
+        lease = BotRuntimeLease.objects.create(
+            bot=self.bot,
+            provider=BotRuntimeProviderTypes.GCP_COMPUTE_INSTANCE,
+            provider_instance_id="instance-123",
+            metadata={"instance": {"zone": "asia-southeast1-b"}},
+        )
+        mock_provider = MagicMock()
+        mock_get_runtime_provider.return_value = mock_provider
+
+        response = self.client.post(
+            f"/internal/bot-runtime-leases/{lease.id}/complete",
+            data='{"provider_instance_id":"instance-123","exit_code":1,"final_state":"failed","reason":"process_exit","log_tail":"bot exited before upload"}',
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {lease.shutdown_token}",
+            secure=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        mock_provider.delete_lease.assert_called_once()
+        mock_callback.assert_called_once()
+        self.assertEqual(
+            mock_callback.call_args.kwargs["url"],
+            "https://api.example.com/internal/attendee-runtime-leases/184/recording-complete",
+        )
+        self.assertEqual(mock_callback.call_args.kwargs["signing_secret"], "api-secret")
+        self.assertEqual(
+            mock_callback.call_args.kwargs["payload"]["idempotency_key"],
+            f"{self.bot.object_id}:019de422-216a-7002-8faa-5cfb0f428f5e:recording.failed",
+        )
+        self.assertEqual(mock_callback.call_args.kwargs["payload"]["trigger"], "recording.failed")
+        self.assertEqual(mock_callback.call_args.kwargs["payload"]["provider"], "google")
+        self.assertEqual(
+            mock_callback.call_args.kwargs["payload"]["data"]["failure_reason"],
+            "could_not_join",
+        )
+        self.assertIn(
+            "Runtime exited before recording handoff completed.",
+            mock_callback.call_args.kwargs["payload"]["data"]["message"],
+        )
+
     @patch("bots.management.commands.clean_up_bots_with_heartbeat_timeout_or_that_never_launched.get_runtime_provider")
     def test_cleanup_command_deletes_gcp_lease_on_heartbeat_timeout(self, mock_get_runtime_provider):
         lease = BotRuntimeLease.objects.create(

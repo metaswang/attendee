@@ -1041,6 +1041,10 @@ class BotController:
             )
         except Exception as inner_exc:
             logger.warning("Failed to create fatal error event for recording completion failure: %s", inner_exc)
+        try:
+            self.deliver_recording_failed_callback(exc)
+        except Exception as callback_exc:
+            logger.warning("Failed to deliver recording.failed callback for bot=%s: %s", self.bot_in_db.object_id, callback_exc)
         if self.main_loop and self.main_loop.is_running():
             self.main_loop.quit()
 
@@ -1140,6 +1144,61 @@ class BotController:
             audio_upload_result.get("chunk_ext"),
             audio_upload_result.get("chunk_mime_type"),
             ((audio_upload_result.get("chunk_paths") or [None])[0]),
+            callback_url,
+        )
+        make_signed_callback_request(
+            url=callback_url,
+            payload=payload,
+            signing_secret=callback_secret,
+        )
+
+    def deliver_recording_failed_callback(self, exc: Exception):
+        if not self.has_recording_complete_handoff():
+            return
+
+        session_id = self.recording_session_id()
+        if not session_id:
+            logger.warning("Skipping recording.failed callback because session id is missing for bot=%s", self.bot_in_db.object_id)
+            return
+
+        callback_url = self.bot_in_db.recording_complete_callback_url()
+        callback_secret = self.bot_in_db.recording_complete_signing_secret()
+        if not callback_url or not callback_secret:
+            logger.warning("Skipping recording.failed callback because callback settings are missing for bot=%s", self.bot_in_db.object_id)
+            return
+
+        last_event = self.bot_in_db.bot_events.order_by("-created_at").first()
+        event_type = BotEventTypes.type_to_api_code(last_event.event_type) if last_event else None
+        event_sub_type = BotEventSubTypes.sub_type_to_api_code(last_event.event_sub_type) if last_event and last_event.event_sub_type else None
+        bot_state = BotStates.state_to_api_code(self.bot_in_db.state)
+        error_message = str(exc)
+        failure_reason = "no_recording_chunks" if "No recording chunks were uploaded" in error_message else "recording_complete_callback_failed"
+        if event_type == "could_not_join_meeting":
+            failure_reason = "could_not_join"
+        elif event_sub_type == "request_to_join_denied":
+            failure_reason = "request_to_join_denied"
+
+        payload = {
+            "idempotency_key": f"{self.bot_in_db.object_id}:{session_id}:recording.failed",
+            "trigger": "recording.failed",
+            "bot_id": self.bot_in_db.object_id,
+            "provider": self.recording_complete_provider(),
+            "data": {
+                "session_id": session_id,
+                "failure_reason": failure_reason,
+                "event_type": event_type,
+                "event_sub_type": event_sub_type,
+                "bot_state": bot_state,
+                "message": error_message,
+            },
+        }
+        logger.info(
+            "Delivering recording.failed callback for bot=%s session=%s reason=%s event_type=%s event_sub_type=%s callback_url=%s",
+            self.bot_in_db.object_id,
+            session_id,
+            failure_reason,
+            event_type,
+            event_sub_type,
             callback_url,
         )
         make_signed_callback_request(

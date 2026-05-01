@@ -272,7 +272,7 @@ def _upsert_zoom_meeting_to_zoom_oauth_connection_mapping(zoom_meeting_ids: list
     # Iterate over the zoom meetings and upsert the zoom meeting to zoom oauth connection mapping
     for zoom_meeting_id in zoom_meeting_ids:
         if not zoom_meeting_id:
-        logger.warning("Zoom meeting id is None for zoom oauth connection %s", zoom_oauth_connection.id)
+            logger.warning("Zoom meeting id is None for zoom oauth connection %s", zoom_oauth_connection.id)
             continue
 
         zoom_meeting_to_zoom_oauth_connection_mapping, created = ZoomMeetingToZoomOAuthConnectionMapping.objects.update_or_create(

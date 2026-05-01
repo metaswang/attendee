@@ -20,6 +20,7 @@ from django.utils.decorators import method_decorator
 from django.views import View
 from django.views.decorators.csrf import csrf_exempt
 
+from bots.external_callback_utils import make_signed_callback_request
 from bots.models import (
     AudioChunk,
     Bot,
@@ -37,6 +38,7 @@ from bots.models import (
     BotMediaRequestManager,
     BotRuntimeLease,
     BotRuntimeProviderTypes,
+    BotStates,
     ChatMessage,
     ChatMessageToOptions,
     MediaBlob,
@@ -67,6 +69,118 @@ from bots.webhook_utils import sign_payload, verify_signature
 logger = logging.getLogger(__name__)
 REPO_ROOT = Path(__file__).resolve().parents[1]
 RECORDING_COMPLETE_UPSTREAM_TIMEOUT_SECONDS = 20
+
+
+def _runtime_recording_complete_provider(lease: BotRuntimeLease) -> str | None:
+    meeting_type = meeting_type_from_url(lease.bot.meeting_url)
+    return {
+        MeetingTypes.GOOGLE_MEET: "google",
+        MeetingTypes.TEAMS: "microsoft",
+        MeetingTypes.ZOOM: "zoom",
+    }.get(meeting_type)
+
+
+def _deliver_runtime_failure_callback_if_needed(
+    lease: BotRuntimeLease,
+    *,
+    exit_code,
+    final_state,
+    reason,
+    log_tail: str,
+) -> None:
+    if exit_code in (None, 0) and final_state != "failed":
+        return
+
+    session_id = str((lease.bot.metadata or {}).get("session_id") or "").strip()
+    if not session_id:
+        logger.warning(
+            "Skipping runtime fallback recording.failed callback because session id is missing for lease=%s bot=%s",
+            lease.id,
+            lease.bot.object_id,
+        )
+        return
+
+    callback_url = lease.bot.recording_complete_callback_url()
+    callback_secret = lease.bot.recording_complete_upstream_signing_secret() or lease.bot.recording_complete_signing_secret()
+    if not callback_url or not callback_secret:
+        logger.warning(
+            "Skipping runtime fallback recording.failed callback because callback settings are missing for lease=%s bot=%s",
+            lease.id,
+            lease.bot.object_id,
+        )
+        return
+
+    if lease.bot.recordings.filter(state=RecordingStates.COMPLETE).exists():
+        logger.info(
+            "Skipping runtime fallback recording.failed callback because a recording already completed lease=%s bot=%s",
+            lease.id,
+            lease.bot.object_id,
+        )
+        return
+
+    last_event = lease.bot.bot_events.order_by("-created_at").first()
+    event_type = BotEventTypes.type_to_api_code(last_event.event_type) if last_event else None
+    event_sub_type = BotEventSubTypes.sub_type_to_api_code(last_event.event_sub_type) if last_event and last_event.event_sub_type else None
+    bot_state = BotStates.state_to_api_code(lease.bot.state)
+
+    failure_reason = "recording_runtime_process_exit"
+    if event_sub_type in {
+        "request_to_join_denied",
+        "waiting_room_timeout",
+        "authorized_user_not_in_meeting",
+        "login_required",
+        "meeting_not_found",
+        "unable_to_connect",
+        "removed",
+    }:
+        failure_reason = event_sub_type
+    elif event_type == "could_not_join_meeting":
+        failure_reason = "could_not_join"
+
+    message_parts = [
+        "Runtime exited before recording handoff completed.",
+        f"exit_code={exit_code}",
+        f"final_state={final_state}",
+        f"reason={reason}",
+    ]
+    if log_tail:
+        message_parts.append(f"log_tail={shorten(log_tail, width=1000, placeholder='...')}")
+
+    payload = {
+        "idempotency_key": f"{lease.bot.object_id}:{session_id}:recording.failed",
+        "trigger": "recording.failed",
+        "bot_id": lease.bot.object_id,
+        "provider": _runtime_recording_complete_provider(lease),
+        "data": {
+            "session_id": session_id,
+            "failure_reason": failure_reason,
+            "event_type": event_type,
+            "event_sub_type": event_sub_type,
+            "bot_state": bot_state,
+            "message": " | ".join(message_parts),
+        },
+    }
+    try:
+        make_signed_callback_request(
+            url=callback_url,
+            payload=payload,
+            signing_secret=callback_secret,
+            timeout_seconds=RECORDING_COMPLETE_UPSTREAM_TIMEOUT_SECONDS,
+        )
+        logger.info(
+            "Delivered runtime fallback recording.failed callback for lease=%s bot=%s session=%s reason=%s",
+            lease.id,
+            lease.bot.object_id,
+            session_id,
+            failure_reason,
+        )
+    except Exception:
+        logger.exception(
+            "Failed to deliver runtime fallback recording.failed callback for lease=%s bot=%s session=%s",
+            lease.id,
+            lease.bot.object_id,
+            session_id,
+        )
 
 
 def _build_meetbot_global_diarization(
@@ -726,6 +840,13 @@ class BotRuntimeLeaseCompletionView(View):
                 summary_parts.append(f"log_tail={log_tail}")
             lease.last_error = shorten(" | ".join(summary_parts), width=4000, placeholder="...")
             lease.save(update_fields=["last_error", "updated_at"])
+            _deliver_runtime_failure_callback_if_needed(
+                lease,
+                exit_code=exit_code,
+                final_state=final_state,
+                reason=reason,
+                log_tail=log_tail,
+            )
 
         logger.info(
             "Lease %s completion accepted for bot %s with exit_code=%s final_state=%s reason=%s",

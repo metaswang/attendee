@@ -257,13 +257,17 @@ class TestZoomWebBot(TransactionTestCase):
         controller.bot_in_db.recording_complete_signing_secret = MagicMock(return_value="test-secret")
         controller.create_bot_event = MagicMock()
 
-        controller.cleanup()
+        with patch("bots.bot_controller.bot_controller.make_signed_callback_request") as callback_mock:
+            controller.cleanup()
 
         self.assertIsNotNone(controller.run_failure_exception)
         self.assertEqual(str(controller.run_failure_exception), "No recording chunks were uploaded")
         self.assertGreaterEqual(controller.main_loop.quit.call_count, 1)
         controller.recording_chunk_uploader.shutdown.assert_called_once_with(wait_for_uploads=False)
         controller.create_bot_event.assert_called()
+        callback_mock.assert_called_once()
+        self.assertEqual(callback_mock.call_args.kwargs["payload"]["trigger"], "recording.failed")
+        self.assertEqual(callback_mock.call_args.kwargs["payload"]["data"]["failure_reason"], "no_recording_chunks")
 
     def test_clear_zoom_token_references_removes_runtime_secret_refs(self):
         controller = BotController.__new__(BotController)

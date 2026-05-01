@@ -66,8 +66,25 @@ def _queue_key() -> str:
     return os.getenv("MEETBOT_RUNTIME_QUEUE_KEY") or f"meetbot:runtime:commands:{host_name}"
 
 
-def _runtime_env_path() -> Path:
+def _runtime_env_base_path() -> Path:
     return Path(os.getenv("RUNTIME_ENV_PATH", "/etc/attendee/runtime.env"))
+
+
+def _payload_identifier(payload: dict[str, object]) -> str:
+    lease_id = payload.get("lease_id")
+    if lease_id is not None:
+        return f"lease-{lease_id}"
+    bot_id = payload.get("bot_id")
+    if bot_id is not None:
+        return f"bot-{bot_id}"
+    return str(int(time.time()))
+
+
+def _runtime_env_path(payload: dict[str, object] | None = None) -> Path:
+    base_path = _runtime_env_base_path()
+    if payload is None:
+        return base_path
+    return base_path.with_name(f"{base_path.stem}-{_payload_identifier(payload)}{base_path.suffix}")
 
 
 def _runner_script_path() -> Path:
@@ -78,8 +95,7 @@ def _runner_script_path() -> Path:
     return repo_dir / "scripts/digitalocean/attendee-bot-runner.sh"
 
 
-def _write_runtime_env(runtime_env: dict[str, str]) -> None:
-    path = _runtime_env_path()
+def _write_runtime_env(runtime_env: dict[str, str], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = [f"export {key}={shlex.quote(str(value))}" for key, value in sorted(runtime_env.items())]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -111,14 +127,19 @@ def _spawn_runner(payload: dict[str, object]) -> None:
 
     merged_env = {str(key): str(value) for key, value in runtime_env.items()}
     _apply_host_bot_resource_overrides(merged_env)
-    _write_runtime_env(merged_env)
+    runtime_env_path = _runtime_env_path(payload)
+    _write_runtime_env(merged_env, runtime_env_path)
+
+    log_dir = Path(os.getenv("RUNNER_LOG_DIR", "/var/log/attendee"))
+    container_env_path = log_dir / f"runtime-{_payload_identifier(payload)}.env"
 
     env = os.environ.copy()
     env.update(
         {
             "BOT_ID": str(payload["bot_id"]),
             "LEASE_ID": str(payload["lease_id"]),
-            "RUNTIME_ENV_PATH": str(_runtime_env_path()),
+            "RUNTIME_ENV_PATH": str(runtime_env_path),
+            "CONTAINER_ENV_PATH": str(container_env_path),
             "ATTENDEE_REPO_DIR": _env("ATTENDEE_REPO_DIR"),
             "ATTENDEE_CONTAINER_WORKDIR": os.getenv("ATTENDEE_CONTAINER_WORKDIR", "/attendee"),
             "BOT_RUNTIME_IMAGE": _env("BOT_RUNTIME_IMAGE"),
@@ -130,7 +151,6 @@ def _spawn_runner(payload: dict[str, object]) -> None:
     if not runner.exists():
         raise RuntimeError(f"runner script not found: {runner}")
 
-    log_dir = Path(os.getenv("RUNNER_LOG_DIR", "/var/log/attendee"))
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = Path(os.getenv("RUNNER_LOG_PATH", str(log_dir / "runtime-agent.log")))
     with log_path.open("a", encoding="utf-8") as handle:
