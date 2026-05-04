@@ -145,6 +145,7 @@ def _deliver_runtime_failure_callback_if_needed(
     ]
     if log_tail:
         message_parts.append(f"log_tail={shorten(log_tail, width=1000, placeholder='...')}")
+    message_text = shorten(" | ".join(message_parts), width=1000, placeholder="...")
 
     payload = {
         "idempotency_key": f"{lease.bot.object_id}:{session_id}:recording.failed",
@@ -157,7 +158,7 @@ def _deliver_runtime_failure_callback_if_needed(
             "event_type": event_type,
             "event_sub_type": event_sub_type,
             "bot_state": bot_state,
-            "message": " | ".join(message_parts),
+            "message": message_text,
         },
     }
     try:
