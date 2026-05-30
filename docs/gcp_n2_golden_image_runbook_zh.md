@@ -2,6 +2,8 @@
 
 本文把 [GCP Compute Engine Meetbot 冷启动优化 Runbook](./gcp_compute_engine_cold_start_optimization_zh.md) 里的 “GCP N2 Golden Image 构建建议” 落成仓库内可执行步骤。
 
+> 补充：本文主线仍是 `voxella-attendee` 的 bot runtime golden image。`voxella-worker-modal-scaler` 当前也采用同类思路，把 Modal drain worker 的 Docker image 预烘焙到 GCP custom image 中，以便在 `modal.com` 资源不足时回退到 GCP VM。
+
 ## 目标
 
 把以下工作预先烘焙进 GCP custom image：
@@ -106,3 +108,101 @@ GCP_BOT_SOURCE_IMAGE_PROJECT=<image-project>
 - `BOT_RUNTIME_ALLOW_BOOTSTRAP=true`
 
 正常生产路径下应保持关闭。这意味着 runner/service 必须已经包含在 source image 中。
+
+## Modal Scaler 对应 GCP Golden Image 约定
+
+`voxella-worker-modal-scaler` 已扩展为双 provider：
+
+- `modal`
+- `gcp`
+
+调度顺序由环境变量决定：
+
+- 全局：`SCALER_PROVIDER_ORDER`
+- 单目标覆盖：`SCALER_ASR_PROVIDER_ORDER`、`SCALER_AUDIO_TOOLS_PROVIDER_ORDER`、`SCALER_DUB_PROVIDER_ORDER`、`SCALER_VIDEO_ENCODE_PROVIDER_ORDER`
+
+测试环境可直接使用：
+
+```bash
+SCALER_PROVIDER_ORDER=gcp
+```
+
+生产环境通常建议：
+
+```bash
+SCALER_PROVIDER_ORDER=modal,gcp
+```
+
+### 目标与资源映射
+
+当前四类 drain target 的 GCP 运行时映射如下：
+
+| target | Docker image | GCP 运行资源 | 说明 |
+|---|---|---|---|
+| `asr` | `docker.io/catblueberry/voxella-modal-transcribe-gcp:latest` | `n1-standard-4` + `1 x T4` | ASR GPU worker |
+| `audio_tools` | `docker.io/catblueberry/voxella-modal-audiotools-gcp:latest` | `n1-standard-4` + `1 x T4` | 音频工具 GPU worker |
+| `dub` | `docker.io/catblueberry/voxella-modal-dub-gcp:latest` | `g2-standard-4` | 使用 L4，不再使用 A10G |
+| `video_encode` | `docker.io/catblueberry/voxella-modal-video-encode-gcp:latest` | `n2-standard-4` | 纯 CPU worker |
+
+注意：
+
+- `video_encode` 预期是 CPU，不占用 T4/L4 quota。
+- golden image 构建阶段可以使用 CPU builder VM；真正运行时是否申请 GPU 由 scaler target 配置决定。
+
+### Golden image family
+
+每个 target 使用独立 image family，不共用单一 source image：
+
+```bash
+projects/gen-lang-client-0396714319/global/images/family/voxella-arq-asr-golden
+projects/gen-lang-client-0396714319/global/images/family/voxella-arq-audio-tools-golden
+projects/gen-lang-client-0396714319/global/images/family/voxella-arq-dub-golden
+projects/gen-lang-client-0396714319/global/images/family/voxella-arq-video-encode-golden
+```
+
+推荐通过：
+
+```bash
+GCP_DRAIN__TARGET_SOURCE_IMAGES_JSON='{"asr":"projects/gen-lang-client-0396714319/global/images/family/voxella-arq-asr-golden","audio_tools":"projects/gen-lang-client-0396714319/global/images/family/voxella-arq-audio-tools-golden","dub":"projects/gen-lang-client-0396714319/global/images/family/voxella-arq-dub-golden","video_encode":"projects/gen-lang-client-0396714319/global/images/family/voxella-arq-video-encode-golden"}'
+```
+
+做 target 到 source image 的映射；`GCP_DRAIN__SOURCE_IMAGE` 仅保留为兼容兜底值。
+
+### Secret 与基础配置
+
+运行时容器环境通过 GCP Secret Manager 注入：
+
+- dev：`GCP_DRAIN__SECRET_NAME=voxella-modal-worker-env-dev`
+- prod：`GCP_DRAIN__SECRET_NAME=voxella-modal-worker-env`
+
+对应文件：
+
+- dev：`.env.modal.secret.dev`
+- prod：`.env.modal.secret`
+
+Docker Hub 用户名当前约定为：
+
+```bash
+DOCKER_USERNAME=catblueberry
+```
+
+可用脚本：
+
+```bash
+scripts/gcp-workers/build-push-images.sh
+scripts/gcp-workers/sync-modal-secret.sh
+scripts/gcp-workers/build-golden-images.sh
+```
+
+### 区域与容量约束
+
+当前容量规划是：
+
+- `europe-west1`：10 台 T4，5 台 L4
+- `europe-west10`：10 台 T4，5 台 L4
+
+但实际可分配仍受 GCP zone 实时资源池影响。实践上：
+
+- T4/L4 worker 真正启动时可能出现 `ZONE_RESOURCE_POOL_EXHAUSTED`
+- 因此 provider 设计必须允许 `modal -> gcp` 或 `gcp -> modal` 的顺序切换
+- golden image builder 不应依赖 GPU quota，本仓库已改为 CPU builder VM 来预热镜像
