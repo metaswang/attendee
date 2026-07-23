@@ -2,6 +2,7 @@ import base64
 import html
 import json
 import logging
+import os
 import tempfile
 import uuid
 import xml.etree.ElementTree as ET
@@ -11,7 +12,10 @@ from urllib.parse import urlencode
 
 import redis
 from django.conf import settings
+from django.db import transaction
+from django.db.models import F
 from django.urls import reverse
+from django.utils import timezone
 from saml2 import BINDING_HTTP_POST
 
 # pysaml2
@@ -20,19 +24,35 @@ from saml2.saml import NAMEID_FORMAT_EMAILADDRESS, NameID
 from saml2.server import Server
 
 from bots.bots_api_utils import build_site_url
-from bots.models import Bot, GoogleMeetBotLogin
+from bots.google_workspace_sso import (
+    GoogleWorkspaceSsoConfigurationError,
+    GoogleWorkspaceSsoSessionContext,
+    public_sso_facade_url,
+    validate_tenant_configuration,
+)
+from bots.models import Bot, GoogleMeetBotLogin, GoogleWorkspaceSsoSigningCertificate, GoogleWorkspaceSsoTenant
 
 logger = logging.getLogger(__name__)
 
 
 def get_google_meet_set_cookie_url(session_id):
-    base_url = build_site_url(reverse("bot_sso:google_meet_set_cookie"))
+    sso_facade_base_url = os.getenv("GOOGLE_MEET_SSO_FACADE_BASE_URL", "").strip().rstrip("/")
+    base_url = (
+        f"{sso_facade_base_url}/set-cookie"
+        if sso_facade_base_url
+        else build_site_url(reverse("bot_sso:google_meet_set_cookie"))
+    )
     query_params = urlencode({"session_id": session_id})
     google_meet_set_cookie_url = f"{base_url}?{query_params}"
     return google_meet_set_cookie_url
 
 
-def create_google_meet_sign_in_session(bot: Bot, google_meet_bot_login: GoogleMeetBotLogin):
+def create_google_meet_sign_in_session(
+    bot: Bot,
+    google_meet_bot_login: GoogleMeetBotLogin,
+    tenant: GoogleWorkspaceSsoTenant,
+    signing_certificate: GoogleWorkspaceSsoSigningCertificate,
+):
     session_id = str(uuid.uuid4())
     redis_key = f"google_meet_sign_in_session:{session_id}"
     redis_client = redis.from_url(settings.REDIS_URL_WITH_PARAMS)
@@ -40,12 +60,70 @@ def create_google_meet_sign_in_session(bot: Bot, google_meet_bot_login: GoogleMe
     session_data = {
         "bot_object_id": bot.object_id,
         "google_meet_bot_login_object_id": google_meet_bot_login.object_id,
+        "google_workspace_sso_tenant_object_id": tenant.object_id,
+        "google_workspace_sso_signing_certificate_object_id": signing_certificate.object_id,
     }
     redis_client.setex(redis_key, 60 * 30, json.dumps(session_data))
     return session_id
 
 
-def get_bot_login_for_google_meet_sign_in_session(session_id):
+def create_google_meet_bot_login_session_for_bot(bot: Bot) -> dict[str, str] | None:
+    """Allocate an active Workspace login and create a short-lived SAML session.
+
+    The runtime receives only the opaque Redis session id and the public account
+    identifiers needed to start the Google Workspace SSO flow. The certificate
+    and private key remain in Attendee's encrypted credential storage.
+    """
+    if not bot.google_meet_use_bot_login():
+        return None
+
+    with transaction.atomic():
+        candidate_logins = list(
+            GoogleMeetBotLogin.objects.select_for_update()
+            .filter(group__project=bot.project, is_active=True)
+            .order_by(F("last_used_at").asc(nulls_first=True), "id")
+        )
+        workspace_domains = {login.workspace_domain.strip().lower().rstrip(".") for login in candidate_logins}
+        tenants_by_domain = {
+            tenant.workspace_domain: tenant
+            for tenant in GoogleWorkspaceSsoTenant.objects.filter(
+                project=bot.project,
+                workspace_domain__in=workspace_domains,
+                is_active=True,
+            )
+        }
+
+        google_meet_bot_login = None
+        tenant = None
+        signing_certificate = None
+        for candidate in candidate_logins:
+            candidate_tenant = tenants_by_domain.get(candidate.workspace_domain.strip().lower().rstrip("."))
+            if candidate_tenant is None:
+                continue
+            try:
+                candidate_certificate = validate_tenant_configuration(candidate_tenant)
+            except GoogleWorkspaceSsoConfigurationError:
+                continue
+            google_meet_bot_login = candidate
+            tenant = candidate_tenant
+            signing_certificate = candidate_certificate
+            break
+
+        if google_meet_bot_login is None or tenant is None or signing_certificate is None:
+            return None
+
+        google_meet_bot_login.last_used_at = timezone.now()
+        google_meet_bot_login.save(update_fields=["last_used_at", "updated_at"])
+        session_id = create_google_meet_sign_in_session(bot, google_meet_bot_login, tenant, signing_certificate)
+
+    return {
+        "session_id": session_id,
+        "login_email": google_meet_bot_login.email,
+        "login_domain": google_meet_bot_login.workspace_domain,
+    }
+
+
+def get_google_workspace_sso_session_context(session_id: str) -> GoogleWorkspaceSsoSessionContext | None:
     redis_key = f"google_meet_sign_in_session:{session_id}"
     redis_client = redis.from_url(settings.REDIS_URL_WITH_PARAMS)
     session_data_raw = redis_client.get(redis_key)
@@ -61,22 +139,83 @@ def get_bot_login_for_google_meet_sign_in_session(session_id):
 
     bot_object_id = session_data.get("bot_object_id")
     google_meet_bot_login_object_id = session_data.get("google_meet_bot_login_object_id")
+    tenant_object_id = session_data.get("google_workspace_sso_tenant_object_id")
+    signing_certificate_object_id = session_data.get("google_workspace_sso_signing_certificate_object_id")
 
     bot = Bot.objects.filter(object_id=bot_object_id).first()
-    google_meet_bot_login = GoogleMeetBotLogin.objects.filter(object_id=google_meet_bot_login_object_id, group__project=bot.project).first()
-    if not google_meet_bot_login:
-        logger.info(f"No google_meet_bot_login found for google_meet_sign_in_session: {session_id}. Data: {session_data}")
-        return None
-
     if not bot:
         logger.info(f"No bot found for google_meet_sign_in_session: {session_id}. Data: {session_data}")
         return None
 
-    return google_meet_bot_login
+    google_meet_bot_login = GoogleMeetBotLogin.objects.select_related("group__project").filter(
+        object_id=google_meet_bot_login_object_id,
+        group__project=bot.project,
+        is_active=True,
+    ).first()
+    if not google_meet_bot_login:
+        logger.info(f"No google_meet_bot_login found for google_meet_sign_in_session: {session_id}. Data: {session_data}")
+        return None
+
+    tenant = GoogleWorkspaceSsoTenant.objects.filter(
+        object_id=tenant_object_id,
+        project=bot.project,
+        workspace_domain=google_meet_bot_login.workspace_domain.strip().lower().rstrip("."),
+        is_active=True,
+    ).first()
+    if tenant is None:
+        logger.info("No active Workspace SSO tenant found for Google Meet sign-in session")
+        return None
+
+    signing_certificate = GoogleWorkspaceSsoSigningCertificate.objects.filter(
+        object_id=signing_certificate_object_id,
+        tenant=tenant,
+        state=GoogleWorkspaceSsoSigningCertificate.States.ACTIVE,
+        retired_at__isnull=True,
+    ).first()
+    if signing_certificate is None:
+        logger.info("No active Workspace SSO signing certificate found for Google Meet sign-in session")
+        return None
+
+    try:
+        validate_tenant_configuration(tenant)
+    except GoogleWorkspaceSsoConfigurationError as exc:
+        logger.info("Workspace SSO tenant is not ready for Google Meet sign-in: %s", exc)
+        return None
+    if signing_certificate.object_id != signing_certificate_object_id:
+        return None
+
+    return GoogleWorkspaceSsoSessionContext(
+        login=google_meet_bot_login,
+        tenant=tenant,
+        signing_certificate=signing_certificate,
+    )
 
 
-IDP_ENTITY_ID = "https://idp.attendee.local"  # Your IdP entityID (can be any stable URL you control)
-IDP_SSO_URL = "https://idp.attendee.local/sso"  # Dummy SSO endpoint to satisfy pysaml2 config
+def get_bot_login_for_google_meet_sign_in_session(session_id: str):
+    """Compatibility helper for callers that need only the allocated login."""
+    context = get_google_workspace_sso_session_context(session_id)
+    return context.login if context else None
+
+
+def google_meet_bot_login_is_available_for_bot(bot: Bot) -> bool:
+    if not bot.google_meet_use_bot_login():
+        return False
+    for login in GoogleMeetBotLogin.objects.filter(group__project=bot.project, is_active=True).only("workspace_domain"):
+        tenant = GoogleWorkspaceSsoTenant.objects.filter(
+            project=bot.project,
+            workspace_domain=login.workspace_domain.strip().lower().rstrip("."),
+            is_active=True,
+        ).first()
+        if tenant is None:
+            continue
+        try:
+            validate_tenant_configuration(tenant)
+            return True
+        except GoogleWorkspaceSsoConfigurationError:
+            continue
+    return False
+
+
 XMLSEC_BINARY = "/usr/bin/xmlsec1"  # adjust if different in your environment
 
 # XML namespaces for parsing the AuthnRequest
@@ -140,7 +279,15 @@ SP_MD_TEMPLATE = """<EntityDescriptor xmlns="urn:oasis:names:tc:SAML:2.0:metadat
 """
 
 
-def _build_idp_server(sp_entity_id: str, acs_url: str, cert_file: str, key_file: str) -> Server:
+def _build_idp_server(
+    *,
+    idp_entity_id: str,
+    idp_sso_url: str,
+    sp_entity_id: str,
+    acs_url: str,
+    cert_file: str,
+    key_file: str,
+) -> Server:
     """
     Construct a minimal pysaml2 IdP Server instance, injecting the SP's metadata inline
     so pysaml2 can resolve the SP entry (avoids KeyError lookups).
@@ -148,7 +295,7 @@ def _build_idp_server(sp_entity_id: str, acs_url: str, cert_file: str, key_file:
     sp_md_xml = SP_MD_TEMPLATE.format(sp_entity_id=sp_entity_id, acs_url=acs_url)
 
     conf = {
-        "entityid": IDP_ENTITY_ID,
+        "entityid": idp_entity_id,
         "xmlsec_binary": XMLSEC_BINARY,
         "key_file": key_file,
         "cert_file": cert_file,
@@ -156,8 +303,8 @@ def _build_idp_server(sp_entity_id: str, acs_url: str, cert_file: str, key_file:
             "idp": {
                 "endpoints": {
                     "single_sign_on_service": [
-                        (IDP_SSO_URL, "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect"),
-                        (IDP_SSO_URL, "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST"),
+                        (idp_sso_url, "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect"),
+                        (idp_sso_url, "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST"),
                     ]
                 }
             }
@@ -197,7 +344,11 @@ def _html_auto_post_form(action_url: str, saml_response_b64: str, relay_state: s
 </html>"""
 
 
-def _build_sign_in_saml_response(saml_request_b64: str, email_to_sign_in: str, cert: str, private_key: str) -> str:
+def _build_sign_in_saml_response(
+    *,
+    saml_request_b64: str,
+    session_context: GoogleWorkspaceSsoSessionContext,
+) -> tuple[str, str]:
     # 1) Inflate + parse the AuthnRequest
     try:
         xml_bytes = _inflate_redirect_binding(saml_request_b64)
@@ -216,22 +367,45 @@ def _build_sign_in_saml_response(saml_request_b64: str, email_to_sign_in: str, c
     if not in_response_to:
         raise ValueError("AuthnRequest missing ID")
 
+    try:
+        signing_certificate = validate_tenant_configuration(session_context.tenant)
+        if signing_certificate.object_id != session_context.signing_certificate.object_id:
+            raise GoogleWorkspaceSsoConfigurationError("Workspace SSO signing certificate changed during the login session")
+        from bots.google_workspace_sso import validate_authn_request_for_tenant
+
+        validate_authn_request_for_tenant(
+            tenant=session_context.tenant,
+            sp_entity_id=sp_entity_id,
+            acs_url=acs_url,
+        )
+        idp_sso_url = public_sso_facade_url("sign-in")
+    except GoogleWorkspaceSsoConfigurationError as exc:
+        raise ValueError(f"Workspace SSO configuration rejected the AuthnRequest: {exc}") from exc
+
     # 2) Build IdP server with inline SP metadata.
     # Write the cert and private key to temporary files, which are deleted after the function completes.
 
     with tempfile.NamedTemporaryFile("w+", delete=True, encoding="utf-8") as cert_file, tempfile.NamedTemporaryFile("w+", delete=True, encoding="utf-8") as key_file:
-        cert_file.write(cert)
+        cert_file.write(signing_certificate.certificate_pem)
         cert_file.flush()
-        key_file.write(private_key)
+        key_file.write(signing_certificate.private_key_pem)
         key_file.flush()
 
         try:
-            idp = _build_idp_server(sp_entity_id, acs_url, cert_file.name, key_file.name)
+            idp = _build_idp_server(
+                idp_entity_id=session_context.tenant.idp_entity_id,
+                idp_sso_url=idp_sso_url,
+                sp_entity_id=sp_entity_id,
+                acs_url=acs_url,
+                cert_file=cert_file.name,
+                key_file=key_file.name,
+            )
         except Exception as e:
             raise ValueError(f"Failed to build IdP server: {e}")
 
         # 3) Build a NameID and (optionally) attributes for the subject
         # Many SPs (incl. Google) are fine with just NameID. Attributes are optional.
+        email_to_sign_in = session_context.login.email
         name_id_obj = NameID(format=NAMEID_FORMAT_EMAILADDRESS, text=email_to_sign_in)
         identity = {
             "mail": [email_to_sign_in],
@@ -251,7 +425,7 @@ def _build_sign_in_saml_response(saml_request_b64: str, email_to_sign_in: str, c
             },
             authn={
                 "class_ref": "urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport",
-                "authn_auth": IDP_ENTITY_ID,
+                "authn_auth": session_context.tenant.idp_entity_id,
             },
             sign_assertion=True,
             sign_response=True,

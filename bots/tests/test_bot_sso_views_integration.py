@@ -17,7 +17,15 @@ from django.urls import reverse
 
 from accounts.models import Organization
 from bots.bot_sso_utils import create_google_meet_sign_in_session
-from bots.models import Bot, GoogleMeetBotLogin, GoogleMeetBotLoginGroup, Project
+from bots.google_workspace_sso import create_signing_certificate
+from bots.models import (
+    Bot,
+    GoogleMeetBotLogin,
+    GoogleMeetBotLoginGroup,
+    GoogleWorkspaceSsoSigningCertificate,
+    GoogleWorkspaceSsoTenant,
+    Project,
+)
 
 
 def _generate_rsa_key_and_self_signed_cert():
@@ -107,6 +115,12 @@ class BotSsoViewsIntegrationTest(TransactionTestCase):
 
     def setUp(self):
         """Set up test environment"""
+        self.sso_environment = patch.dict(
+            os.environ,
+            {"GOOGLE_MEET_SSO_FACADE_BASE_URL": "https://api.example.test/api/v1/integrations/google-workspace/meetbot-sso"},
+        )
+        self.sso_environment.start()
+        self.addCleanup(self.sso_environment.stop)
         # Create organization, project, and bot
         self.organization = Organization.objects.create(name="Test Organization", centicredits=10000)
         self.project = Project.objects.create(name="Test Project", organization=self.organization)
@@ -124,12 +138,20 @@ class BotSsoViewsIntegrationTest(TransactionTestCase):
             email="test-bot@test-workspace.com",
         )
 
-        # Set credentials for the GoogleMeetBotLogin
-        self.google_meet_bot_login.set_credentials(
-            {
-                "cert": TEST_CERT,
-                "private_key": TEST_PRIVATE_KEY,
-            }
+        self.request_id = f"_test_{uuid.uuid4()}"
+        self.sp_entity_id = "https://accounts.google.com/o/saml2?idpid=test-workspace"
+        self.acs_url = "https://accounts.google.com/a/test-workspace.com/acs"
+        self.workspace_sso_tenant = GoogleWorkspaceSsoTenant.objects.create(
+            project=self.project,
+            workspace_domain="test-workspace.com",
+            idp_entity_id="https://api.example.test/api/v1/integrations/google-workspace/meetbot-sso/tenants/test-workspace",
+            google_sp_entity_id=self.sp_entity_id,
+            google_acs_url=self.acs_url,
+            is_active=True,
+        )
+        self.signing_certificate = create_signing_certificate(
+            tenant=self.workspace_sso_tenant,
+            state=GoogleWorkspaceSsoSigningCertificate.States.ACTIVE,
         )
 
         # Set up Redis URL environment variable if not set
@@ -138,11 +160,6 @@ class BotSsoViewsIntegrationTest(TransactionTestCase):
 
         # Create a test client
         self.client = Client()
-
-        # Generate test SAML parameters
-        self.request_id = f"_test_{uuid.uuid4()}"
-        self.sp_entity_id = "https://test-sp.example.com"
-        self.acs_url = "https://test-sp.example.com/acs"
 
     def tearDown(self):
         """Clean up Redis after each test"""
@@ -156,7 +173,12 @@ class BotSsoViewsIntegrationTest(TransactionTestCase):
     def test_set_cookie_view_with_valid_session(self):
         """Test GoogleMeetSetCookieView with a valid session"""
         # Create a session in Redis
-        session_id = create_google_meet_sign_in_session(self.bot, self.google_meet_bot_login)
+        session_id = create_google_meet_sign_in_session(
+            self.bot,
+            self.google_meet_bot_login,
+            self.workspace_sso_tenant,
+            self.signing_certificate,
+        )
 
         # Make a GET request to the set cookie endpoint
         url = reverse("bot_sso:google_meet_set_cookie")
@@ -196,7 +218,12 @@ class BotSsoViewsIntegrationTest(TransactionTestCase):
     def test_sign_in_view_with_valid_saml_request(self):
         """Test GoogleMeetSignInView with a valid SAML AuthnRequest"""
         # Create a session in Redis
-        session_id = create_google_meet_sign_in_session(self.bot, self.google_meet_bot_login)
+        session_id = create_google_meet_sign_in_session(
+            self.bot,
+            self.google_meet_bot_login,
+            self.workspace_sso_tenant,
+            self.signing_certificate,
+        )
 
         # Set the cookie (simulate the set cookie flow)
         self.client.cookies["google_meet_sign_in_session_id"] = session_id
@@ -271,7 +298,12 @@ class BotSsoViewsIntegrationTest(TransactionTestCase):
     def test_sign_in_view_without_saml_request(self):
         """Test GoogleMeetSignInView without SAMLRequest parameter"""
         # Create a session and set cookie
-        session_id = create_google_meet_sign_in_session(self.bot, self.google_meet_bot_login)
+        session_id = create_google_meet_sign_in_session(
+            self.bot,
+            self.google_meet_bot_login,
+            self.workspace_sso_tenant,
+            self.signing_certificate,
+        )
         self.client.cookies["google_meet_sign_in_session_id"] = session_id
 
         # Make a GET request without SAMLRequest
@@ -283,30 +315,21 @@ class BotSsoViewsIntegrationTest(TransactionTestCase):
         self.assertEqual(response.content.decode(), "Missing SAMLRequest")
 
     @patch("bots.bot_sso_utils.XMLSEC_BINARY", "/usr/bin/xmlsec1")
-    def test_sign_in_view_with_invalid_cert_or_key(self):
-        """Test GoogleMeetSignInView with invalid certificate or private key"""
-        # Create a new bot login with invalid credentials
-        invalid_bot_login = GoogleMeetBotLogin.objects.create(
-            group=self.google_meet_bot_login_group,
-            workspace_domain="invalid-workspace.com",
-            email="invalid-bot@invalid-workspace.com",
+    def test_sign_in_view_rejects_authn_request_for_another_google_sp(self):
+        """A session can sign only the exact Google SP and ACS configured for its tenant."""
+        session_id = create_google_meet_sign_in_session(
+            self.bot,
+            self.google_meet_bot_login,
+            self.workspace_sso_tenant,
+            self.signing_certificate,
         )
-        invalid_bot_login.set_credentials(
-            {
-                "cert": "INVALID_CERT",
-                "private_key": "INVALID_KEY",
-            }
-        )
-
-        # Create a session with the invalid bot login
-        session_id = create_google_meet_sign_in_session(self.bot, invalid_bot_login)
         self.client.cookies["google_meet_sign_in_session_id"] = session_id
 
         # Generate a SAML AuthnRequest
         saml_request_b64 = _generate_saml_authn_request(
             request_id=self.request_id,
-            sp_entity_id=self.sp_entity_id,
-            acs_url=self.acs_url,
+            sp_entity_id="https://accounts.google.com/o/saml2?idpid=another-workspace",
+            acs_url="https://accounts.google.com/a/another-workspace.com/acs",
         )
 
         # Make a GET request
@@ -330,7 +353,12 @@ class BotSsoViewsIntegrationTest(TransactionTestCase):
     def test_full_sso_flow_end_to_end(self):
         """Test the complete SSO flow from session creation to SAML response"""
         # Step 1: Create a session in Redis
-        session_id = create_google_meet_sign_in_session(self.bot, self.google_meet_bot_login)
+        session_id = create_google_meet_sign_in_session(
+            self.bot,
+            self.google_meet_bot_login,
+            self.workspace_sso_tenant,
+            self.signing_certificate,
+        )
 
         # Verify session is created in Redis
         redis_client = redis.from_url(settings.REDIS_URL_WITH_PARAMS)

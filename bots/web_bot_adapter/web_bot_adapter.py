@@ -24,6 +24,7 @@ from bots.automatic_leave_configuration import AutomaticLeaveConfiguration
 from bots.automatic_leave_utils import participant_is_another_bot
 from bots.bot_adapter import BotAdapter
 from bots.models import ParticipantEventTypes, RecordingViews
+from bots.recording_quality import AUDIO_BITS_PER_SECOND, RECORDING_FPS, VIDEO_BITS_PER_SECOND
 from bots.utils import half_ceil, scale_i420
 
 from .ui_methods import UiAuthorizedUserNotInMeetingTimeoutExceededException, UiBlockedByCaptchaException, UiCouldNotJoinMeetingWaitingForHostException, UiCouldNotJoinMeetingWaitingRoomTimeoutException, UiIncorrectPasswordException, UiInfinitelyRetryableException, UiLoginAttemptFailedException, UiLoginRequiredException, UiMeetingNotFoundException, UiRequestToJoinDeniedException, UiRetryableException, UiRetryableExpectedException
@@ -58,6 +59,9 @@ class WebBotAdapter(BotAdapter):
         disable_incoming_video: bool,
         record_participant_speech_start_stop_events: bool,
         recording_chunk_interval_ms: int,
+        recording_fps: int = RECORDING_FPS,
+        video_bits_per_second: int = VIDEO_BITS_PER_SECOND,
+        audio_bits_per_second: int = AUDIO_BITS_PER_SECOND,
         update_recording_resize_events_callback=None,
     ):
         self.display_name = display_name
@@ -80,6 +84,9 @@ class WebBotAdapter(BotAdapter):
         self.disable_incoming_video = disable_incoming_video
         self.record_participant_speech_start_stop_events = record_participant_speech_start_stop_events
         self.recording_chunk_interval_ms = recording_chunk_interval_ms
+        self.recording_fps = recording_fps
+        self.video_bits_per_second = video_bits_per_second
+        self.audio_bits_per_second = audio_bits_per_second
         self.meeting_url = meeting_url
 
         # This is an internal ID that comes from the platform. It is currently only used for MS Teams.
@@ -369,7 +376,13 @@ class WebBotAdapter(BotAdapter):
             logger.warning("Received invalid RecordingChunkFormat payload: %s", json_data)
             return
 
-        self.update_recording_chunk_metadata_callback(kind, mime_type, extension)
+        capture_metadata = json_data.get("captureMetadata")
+        self.update_recording_chunk_metadata_callback(
+            kind,
+            mime_type,
+            extension,
+            capture_metadata if isinstance(capture_metadata, dict) else None,
+        )
 
     def handle_recording_resize_events(self, json_data):
         if not self.update_recording_resize_events_callback:
@@ -779,6 +792,9 @@ class WebBotAdapter(BotAdapter):
             f"sendEncodedVideoChunks: {'true' if self.add_encoded_mp4_chunk_callback else 'false'}, "
             f"sendEncodedAudioChunks: {'true' if self.add_encoded_audio_chunk_callback else 'false'}, "
             f"recordingChunkIntervalMs: {self.recording_chunk_interval_ms}, "
+            f"recordingFps: {self.recording_fps}, "
+            f"videoBitsPerSecond: {self.video_bits_per_second}, "
+            f"audioBitsPerSecond: {self.audio_bits_per_second}, "
             f"collectCaptions: {'true' if self.upsert_caption_callback else 'false'}, "
             f"recordParticipantSpeechStartStopEvents: {'true' if self.record_participant_speech_start_stop_events else 'false'}"
             "}"

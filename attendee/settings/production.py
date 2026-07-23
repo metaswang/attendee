@@ -1,21 +1,19 @@
 import os
 import sys
 
-import dj_database_url
-
 from .base import *
 from .base import LOG_FORMATTERS
+from .database import django_database_config
 
 DEBUG = False
 ALLOWED_HOSTS = ["*"]
 
 DATABASES = {
-    "default": dj_database_url.config(
-        env="DATABASE_URL",
+    "default": django_database_config(
         conn_max_age=600,
         conn_health_checks=True,
         ssl_require=os.getenv("POSTGRES_SSL_REQUIRE", "true") == "true",
-    ),
+    )
 }
 
 # PRESERVE CELERY TASKS IF WORKER IS SHUT DOWN

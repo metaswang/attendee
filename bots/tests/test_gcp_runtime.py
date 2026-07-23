@@ -12,10 +12,10 @@ from django.test import Client, TestCase, override_settings
 
 from accounts.models import Organization
 from bots.bots_api_utils import BotCreationSource, create_bot
-from bots.bot_controller.bot_controller import RuntimeBotEventManagerProxy
+from bots.bot_controller.bot_controller import BotController, RuntimeBotEventManagerProxy
 from bots.management.commands.clean_up_bots_with_heartbeat_timeout_or_that_never_launched import Command as CleanupCommand
 from bots.management.commands.sync_gcp_runtime_capacity import Command as SyncGCPRuntimeCapacityCommand
-from bots.models import ApiKey, AudioChunk, Bot, BotEvent, BotEventTypes, BotMediaRequest, BotMediaRequestMediaTypes, BotMediaRequestStates, BotRuntimeLease, BotRuntimeLeaseStatuses, BotRuntimeProviderTypes, BotStates, MediaBlob, Participant, ParticipantEvent, ParticipantEventTypes, Project, Recording, RecordingFormats, RecordingManager, RecordingTypes, RuntimeCapacityProviders, RuntimeCapacitySnapshot, TranscriptionTypes, Utterance, ZoomOAuthApp
+from bots.models import ApiKey, AudioChunk, Bot, BotEvent, BotEventSubTypes, BotEventTypes, BotMediaRequest, BotMediaRequestMediaTypes, BotMediaRequestStates, BotRuntimeLease, BotRuntimeLeaseStatuses, BotRuntimeProviderTypes, BotStates, MediaBlob, Participant, ParticipantEvent, ParticipantEventTypes, Project, Recording, RecordingFormats, RecordingManager, RecordingTypes, RuntimeCapacityProviders, RuntimeCapacitySnapshot, TranscriptionTypes, Utterance, ZoomOAuthApp
 from bots.runtime_providers.gcp_compute_engine import GCPComputeInstanceProvider
 from bots.runtime_providers.host_runtime import runtime_container_env
 from bots.runtime_snapshot import RuntimeBotSnapshot
@@ -520,6 +520,48 @@ class TestGCPRuntime(TestCase):
         self.assertEqual(zoom_oauth_app.client_secret, "zoom-client-secret")
         self.assertEqual(zoom_oauth_app.webhook_secret, "zoom-webhook-secret")
         self.assertEqual(zoom_oauth_app.get_credentials()["client_secret"], "zoom-client-secret")
+
+    def test_runtime_snapshot_delivers_recording_failed_callback_from_serialized_last_event(self):
+        payload = {
+            "id": self.bot.id,
+            "object_id": self.bot.object_id,
+            "name": self.bot.name,
+            "meeting_url": self.bot.meeting_url,
+            "state": BotStates.FATAL_ERROR,
+            "settings": {
+                "callback_settings": {
+                    "recording_complete": {
+                        "url": "https://api.example.com/v2/meeting/app/bot/recording/complete",
+                        "signing_secret": "runtime-secret",
+                    }
+                }
+            },
+            "metadata": {"session_id": "session-1"},
+            "last_bot_event": {
+                "event_type": BotEventTypes.COULD_NOT_JOIN,
+                "event_sub_type": BotEventSubTypes.COULD_NOT_JOIN_MEETING_BOT_LOGIN_ATTEMPT_FAILED,
+                "metadata": {},
+            },
+            "project": {
+                "id": self.project.id,
+                "object_id": self.project.object_id,
+                "name": self.project.name,
+                "organization": {"is_async_transcription_enabled": True},
+            },
+        }
+        controller = BotController.__new__(BotController)
+        controller.bot_in_db = RuntimeBotSnapshot(payload)
+        controller.recording_chunk_uploader = MagicMock()
+
+        with patch("bots.bot_controller.bot_controller.make_signed_callback_request") as callback_mock:
+            controller.deliver_recording_failed_callback(RuntimeError("No recording chunks were uploaded"))
+
+        callback_mock.assert_called_once()
+        callback_payload = callback_mock.call_args.kwargs["payload"]
+        self.assertEqual(callback_payload["trigger"], "recording.failed")
+        self.assertEqual(callback_payload["data"]["failure_reason"], "could_not_join")
+        self.assertEqual(callback_payload["data"]["event_type"], "could_not_join_meeting")
+        self.assertEqual(callback_payload["data"]["event_sub_type"], "bot_login_attempt_failed")
 
     @patch.dict("os.environ", {"MEETBOT_RUNTIME_API_BASE_URL": "https://api.voxstudio.me"}, clear=False)
     def test_bootstrap_view_uses_runtime_api_facade_for_recording_complete_url(self):

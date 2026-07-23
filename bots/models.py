@@ -79,6 +79,120 @@ class GoogleMeetBotLoginGroup(models.Model):
         return f"{self.project.name} - {self.object_id}"
 
 
+class GoogleWorkspaceSsoTenant(models.Model):
+    """A Google Workspace tenant for which VoxStudio acts as the SAML IdP.
+
+    Google SSO profiles trust one or two IdP signing certificates.  The trust
+    relationship is therefore a Workspace-tenant concern, not a per-bot-login
+    concern.  Bot accounts keep their workspace domain and resolve this record
+    at runtime.
+    """
+
+    OBJECT_ID_PREFIX = "gst_"
+
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name="google_workspace_sso_tenants")
+    object_id = models.CharField(max_length=32, unique=True, editable=False)
+    workspace_domain = models.CharField(max_length=255)
+    display_name = models.CharField(max_length=255, blank=True)
+    idp_entity_id = models.CharField(max_length=512, blank=True)
+    google_sp_entity_id = models.CharField(max_length=512, blank=True)
+    google_acs_url = models.URLField(max_length=1024, blank=True)
+    is_active = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def save(self, *args, **kwargs):
+        self.workspace_domain = self.workspace_domain.strip().lower().rstrip(".")
+        if not self.object_id:
+            random_string = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(16))
+            self.object_id = f"{self.OBJECT_ID_PREFIX}{random_string}"
+        super().save(*args, **kwargs)
+
+    def active_signing_certificate(self):
+        return self.signing_certificates.filter(
+            state=GoogleWorkspaceSsoSigningCertificate.States.ACTIVE,
+            retired_at__isnull=True,
+        ).order_by("-activated_at", "-id").first()
+
+    def is_saml_ready(self) -> bool:
+        certificate = self.active_signing_certificate()
+        return bool(
+            self.is_active
+            and self.idp_entity_id
+            and self.google_sp_entity_id
+            and self.google_acs_url
+            and certificate
+            and not certificate.is_expired()
+        )
+
+    def __str__(self):
+        return f"{self.workspace_domain} - {self.object_id}"
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["project", "workspace_domain"], name="unique_google_workspace_sso_tenant_domain"),
+        ]
+
+
+class GoogleWorkspaceSsoSigningCertificate(models.Model):
+    """Encrypted private key plus public signing certificate for an SSO tenant."""
+
+    OBJECT_ID_PREFIX = "gsc_"
+
+    class States(models.TextChoices):
+        ACTIVE = "active", "Active"
+        NEXT = "next", "Next"
+        RETIRED = "retired", "Retired"
+
+    tenant = models.ForeignKey(GoogleWorkspaceSsoTenant, on_delete=models.CASCADE, related_name="signing_certificates")
+    object_id = models.CharField(max_length=32, unique=True, editable=False)
+    _encrypted_data = models.BinaryField(null=True, editable=False)
+    fingerprint_sha256 = models.CharField(max_length=64, blank=True)
+    state = models.CharField(max_length=16, choices=States.choices, default=States.ACTIVE)
+    not_before = models.DateTimeField(null=True, blank=True)
+    not_after = models.DateTimeField(null=True, blank=True)
+    activated_at = models.DateTimeField(null=True, blank=True)
+    retired_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    @property
+    def certificate_pem(self):
+        credentials = self.get_credentials() or {}
+        # Legacy GoogleMeetBotLogin credentials used `cert`; accepting that
+        # shape keeps the migration reversible while the tenant remains
+        # explicitly disabled until its Google SP values are configured.
+        return credentials.get("certificate_pem") or credentials.get("cert")
+
+    @property
+    def private_key_pem(self):
+        credentials = self.get_credentials() or {}
+        return credentials.get("private_key_pem") or credentials.get("private_key")
+
+    def set_credentials(self, credentials_dict):
+        f = Fernet(settings.CREDENTIALS_ENCRYPTION_KEY)
+        self._encrypted_data = f.encrypt(json.dumps(credentials_dict).encode())
+        self.save()
+
+    def get_credentials(self):
+        if not self._encrypted_data:
+            return None
+        f = Fernet(settings.CREDENTIALS_ENCRYPTION_KEY)
+        return json.loads(f.decrypt(bytes(self._encrypted_data)).decode())
+
+    def is_expired(self) -> bool:
+        return bool(self.not_after and self.not_after <= timezone.now())
+
+    def save(self, *args, **kwargs):
+        if not self.object_id:
+            random_string = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(16))
+            self.object_id = f"{self.OBJECT_ID_PREFIX}{random_string}"
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.tenant.workspace_domain} - {self.state} - {self.object_id}"
+
+
 class GoogleMeetBotLogin(models.Model):
     OBJECT_ID_PREFIX = "gbl_"
     group = models.ForeignKey(GoogleMeetBotLoginGroup, on_delete=models.CASCADE, related_name="google_meet_bot_logins")
@@ -1121,8 +1235,17 @@ class Bot(models.Model):
         recording_settings = self.settings.get("recording_settings", {})
         if recording_settings is None:
             recording_settings = {}
-        resolution_value = recording_settings.get("resolution", RecordingResolutions.HD_1080P)
+        resolution_value = recording_settings.get("resolution", RecordingResolutions.HD_720P)
         return RecordingResolutions.get_dimensions(resolution_value)
+
+    def recording_fps(self):
+        return int((self.settings.get("recording_settings", {}) or {}).get("recording_fps", 24))
+
+    def recording_video_bits_per_second(self):
+        return int((self.settings.get("recording_settings", {}) or {}).get("video_bits_per_second", 1_200_000))
+
+    def recording_audio_bits_per_second(self):
+        return int((self.settings.get("recording_settings", {}) or {}).get("audio_bits_per_second", 96_000))
 
     def recording_view(self):
         recording_settings = self.settings.get("recording_settings", {})

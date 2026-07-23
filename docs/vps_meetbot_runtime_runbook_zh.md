@@ -235,6 +235,25 @@ sudo docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'
 - `BOT_RUNTIME_IMAGE` 不可拉取：runner 启动失败，检查镜像仓库权限和网络。
 - Redis 不通或 TLS 配置错误：agent 无法 `BLPOP`，journal 会出现 redis-cli 错误。
 - 回调地址不可达：bot 能跑但 lease 回收异常，需检查 `MEETBOT_RUNTIME_API_BASE_URL` 与网络连通。
+- `myvps2 -> myvps3` 直连报 `Permission denied (publickey,password)`：先确认网络走 WireGuard 内网，再配置专用 SSH key，不要复用本机私钥。
+
+  ```bash
+  # myvps2 上生成专用 key
+  ssh myvps2 'install -d -m 700 /root/.ssh && \
+    test -f /root/.ssh/voxella_vps_ed25519 || \
+    ssh-keygen -t ed25519 -N "" -f /root/.ssh/voxella_vps_ed25519 -C "voxella-vps-myvps2-to-myvps3"'
+
+  # 把 myvps2 公钥加入 myvps3 root 授权
+  ssh myvps2 'cat /root/.ssh/voxella_vps_ed25519.pub' | \
+    ssh myvps3 'read -r pub; grep -qxF "$pub" /root/.ssh/authorized_keys || printf "%s\n" "$pub" >> /root/.ssh/authorized_keys'
+
+  # myvps2 上配置 myvps3 alias 走 WireGuard
+  ssh myvps2 'grep -qE "^Host[[:space:]]+myvps3([[:space:]]|$)" /root/.ssh/config 2>/dev/null || \
+    printf "\nHost myvps3\n    HostName 10.88.0.3\n    User root\n    Port 22\n    IdentityFile /root/.ssh/voxella_vps_ed25519\n    IdentitiesOnly yes\n    StrictHostKeyChecking accept-new\n" >> /root/.ssh/config'
+
+  # 验证
+  ssh myvps2 'ssh -o BatchMode=yes myvps3 hostname'
+  ```
 
 ---
 

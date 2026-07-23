@@ -21,6 +21,11 @@ _LEASE_PATHS = [
         "bot-runtime-lease-bootstrap",
     ),
     (
+        "<int:lease_id>/google-meet-login-session",
+        internal_views.BotRuntimeLeaseGoogleMeetLoginSessionView.as_view(),
+        "bot-runtime-lease-google-meet-login-session",
+    ),
+    (
         "<int:lease_id>/control",
         internal_views.BotRuntimeLeaseControlView.as_view(),
         "bot-runtime-lease-control",
@@ -101,6 +106,36 @@ def _build_lease_paths(prefix: str, *, namespaced: bool) -> list:
 
 
 urlpatterns = [
+    path(
+        "google-workspace-sso-tenants",
+        internal_views.GoogleWorkspaceSsoTenantsInternalView.as_view(),
+        name="google-workspace-sso-tenants",
+    ),
+    path(
+        "google-workspace-sso-tenants/<str:tenant_object_id>",
+        internal_views.GoogleWorkspaceSsoTenantInternalView.as_view(),
+        name="google-workspace-sso-tenant",
+    ),
+    path(
+        "google-workspace-sso-tenants/<str:tenant_object_id>/certificates/rotate",
+        internal_views.GoogleWorkspaceSsoCertificateRotationInternalView.as_view(),
+        name="google-workspace-sso-certificate-rotate",
+    ),
+    path(
+        "google-workspace-sso-tenants/<str:tenant_object_id>/certificates/promote",
+        internal_views.GoogleWorkspaceSsoCertificatePromotionInternalView.as_view(),
+        name="google-workspace-sso-certificate-promote",
+    ),
+    path(
+        "google-workspace-sso-tenants/<str:tenant_object_id>/bot-logins",
+        internal_views.GoogleWorkspaceSsoBotLoginsInternalView.as_view(),
+        name="google-workspace-sso-bot-logins",
+    ),
+    path(
+        "google-workspace-sso-tenants/<str:tenant_object_id>/bot-logins/<str:login_object_id>",
+        internal_views.GoogleWorkspaceSsoBotLoginInternalView.as_view(),
+        name="google-workspace-sso-bot-login",
+    ),
     *_build_lease_paths("bot-runtime-leases", namespaced=True),
     *_build_lease_paths("attendee-runtime-leases", namespaced=False),
 ]

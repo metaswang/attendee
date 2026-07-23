@@ -23,11 +23,31 @@
 
 - builder VM: Ubuntu 22.04, N2 系列
 - 构建平台: `linux/amd64`
-- Python: `3.11`
+- Python: `python3`
 - 仓库已配置可在 `docker build` 中成功构建 runtime image
 - 如需从 Artifact Registry 预拉镜像，builder VM 已完成 `docker` 鉴权
 
-## Builder VM 上执行
+## 推荐自动构建流程
+
+从本地或已配置 `gcloud` 的运维环境执行：
+
+```bash
+GCP_PROJECT_ID=<image-project> \
+BOT_RUNTIME_IMAGE=catblueberry/attendee-bot-runner:latest \
+scripts/gcp/build-golden-image.sh
+```
+
+默认配置：
+
+- builder VM: `n2-standard-2`
+- builder boot disk: `20GB`
+- base image: `projects/ubuntu-os-cloud/global/images/family/ubuntu-2204-lts`
+- image family: `attendee-bot-golden`
+- storage location: `asia`
+
+`diskSizeGb` 会成为后续 GCP host VM 的 source image 最小 boot disk 要求。20GB 允许轻量实例直接使用 20GB；视频会议实例仍由 runtime class 扩展为 30GB 或 50GB。10GB 不作为生产默认值，120GB 这类过大的 builder disk 也应避免。
+
+## Builder VM 上手工执行
 
 在 builder VM 上拉取仓库后执行：
 
@@ -48,7 +68,7 @@ sudo ATTENDEE_REPO_URL=https://github.com/<org>/<repo>.git \
 - `BUILD_RUNTIME_IMAGE`: 是否本机执行 `docker build --platform linux/amd64`，默认 `true`
 - `PULL_RUNTIME_IMAGE`: 是否执行 `docker pull`，默认 `true`
 - `DOCKER_PLATFORM`: 默认 `linux/amd64`
-- `PYTHON_BIN`: 预期 Python 解释器，默认 `python3.11`
+- `PYTHON_BIN`: 预期 Python 解释器；自动构建脚本默认传 `python3`
 
 ### 脚本行为
 
@@ -60,8 +80,9 @@ sudo ATTENDEE_REPO_URL=https://github.com/<org>/<repo>.git \
 4. 执行 `docker pull $BOT_RUNTIME_IMAGE`
 5. 安装 `attendee-bot-runner` 和 systemd service
 6. 确保 `attendee-bot-runner.service` 处于 disabled 状态
-7. 执行 `cloud-init clean --logs`
-8. 清理 machine id，准备制作为 custom image
+7. 输出 `df -h` 与 `/var/lib/docker` 占用，清理 apt cache、临时源码包和 Docker builder cache，再输出清理后的占用
+8. 执行 `cloud-init clean --logs`
+9. 清理 machine id，准备制作为 custom image
 
 ## 发布 custom image
 

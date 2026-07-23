@@ -1252,6 +1252,36 @@ class WebSocketClient {
     return preferredMimeTypes.find((mime) => window.MediaRecorder && MediaRecorder.isTypeSupported(mime)) || '';
   }
 
+  getVideoChunkOutputDimensions() {
+    return {
+      width: window.initialData.videoFrameWidth || 1280,
+      height: window.initialData.videoFrameHeight || 720,
+    };
+  }
+
+  ensureVideoChunkOutputCanvasSize() {
+    const { width, height } = this.getVideoChunkOutputDimensions();
+    if (!this.videoChunkCanvas) {
+      return { width, height };
+    }
+    if (this.videoChunkCanvas.width !== width || this.videoChunkCanvas.height !== height) {
+      this.videoChunkCanvas.width = width;
+      this.videoChunkCanvas.height = height;
+    }
+    return { width, height };
+  }
+
+  buildVideoChunkMediaRecorderOptions(selectedMimeType) {
+    const options = {
+      videoBitsPerSecond: window.initialData.videoBitsPerSecond || 1_200_000,
+      audioBitsPerSecond: window.initialData.audioBitsPerSecond || 96_000,
+    };
+    if (selectedMimeType) {
+      options.mimeType = selectedMimeType;
+    }
+    return options;
+  }
+
   getVideoTrackForChunkRecording() {
     return window.videoTrackManager?.getTrackToSendCached?.()?.originalTrack || null;
   }
@@ -1393,15 +1423,12 @@ class WebSocketClient {
       return;
     }
 
+    const { width, height } = this.ensureVideoChunkOutputCanvasSize();
     if (video && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth && video.videoHeight) {
-      if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
-      }
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      ctx.drawImage(video, 0, 0, width, height);
     } else {
       ctx.fillStyle = 'black';
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillRect(0, 0, width, height);
     }
 
     this.videoChunkAnimationFrame = requestAnimationFrame(this.drawVideoChunkFrame);
@@ -1442,7 +1469,8 @@ class WebSocketClient {
       }),
     );
 
-    const recorderStream = this.videoChunkCanvas.captureStream(30);
+    const recordingFps = window.initialData.recordingFps || 24;
+    const recorderStream = this.videoChunkCanvas.captureStream(recordingFps);
     const meetingAudioStream = window.styleManager?.getMeetingAudioStream?.();
     const audioTrack = meetingAudioStream?.getAudioTracks?.()[0];
     if (audioTrack) {
@@ -1450,10 +1478,33 @@ class WebSocketClient {
     }
 
     const selectedMimeType = this.getPreferredVideoChunkMimeType();
-    console.log('Starting video chunk recording with mime type', selectedMimeType || 'browser-default');
-    this.videoChunkRecorder = selectedMimeType
-      ? new MediaRecorder(recorderStream, { mimeType: selectedMimeType })
-      : new MediaRecorder(recorderStream);
+    const recorderOptions = this.buildVideoChunkMediaRecorderOptions(selectedMimeType);
+    console.log(
+      'Starting video chunk recording with mime type',
+      selectedMimeType || 'browser-default',
+      JSON.stringify({
+        fps: recordingFps,
+        video_bits_per_second: recorderOptions.videoBitsPerSecond,
+        audio_bits_per_second: recorderOptions.audioBitsPerSecond,
+        canvas: this.getVideoChunkOutputDimensions(),
+      }),
+    );
+    this.videoChunkRecorder = new MediaRecorder(recorderStream, recorderOptions);
+    const videoChunkMimeType = this.videoChunkRecorder.mimeType || selectedMimeType || 'video/webm';
+    const outputDimensions = this.getVideoChunkOutputDimensions();
+    window.ws.sendJson({
+      type: 'RecordingChunkFormat',
+      kind: 'video',
+      mimeType: videoChunkMimeType,
+      extension: videoChunkMimeType.includes('mp4') ? 'mp4' : 'webm',
+      captureMetadata: {
+        width: outputDimensions.width,
+        height: outputDimensions.height,
+        fps: recordingFps,
+        video_bits_per_second: this.videoChunkRecorder.videoBitsPerSecond || recorderOptions.videoBitsPerSecond,
+        audio_bits_per_second: this.videoChunkRecorder.audioBitsPerSecond || recorderOptions.audioBitsPerSecond,
+      },
+    });
     this.videoChunkRecorder.ondataavailable = (event) => {
       if (event.data && event.data.size > 0) {
         console.log('Video chunk recorder produced chunk', event.data.type || selectedMimeType || 'unknown', event.data.size);

@@ -505,6 +505,29 @@ class RecordingChunkSettingsTests(TestCase):
         self.assertEqual(controller.recording_audio_chunk_ext, "webm")
         self.assertEqual(controller.recording_chunk_uploader.chunk_mime_type, "audio/webm;codecs=opus")
 
+    def test_video_recording_chunk_metadata_preserves_effective_capture_parameters(self):
+        controller = BotController.__new__(BotController)
+        controller.bot_in_db = MagicMock()
+        controller.bot_in_db.uses_muxed_screen_recording_chunks.return_value = True
+        controller.recording_chunk_uploader = MagicMock()
+
+        controller.update_recording_chunk_metadata_from_adapter(
+            "video",
+            "video/webm;codecs=vp9,opus",
+            "webm",
+            {
+                "width": 1920,
+                "height": 1080,
+                "fps": 15,
+                "video_bits_per_second": 4_000_000,
+                "audio_bits_per_second": 96_000,
+            },
+        )
+
+        self.assertEqual(controller.recording_capture_metadata["codec"], "vp9")
+        self.assertEqual(controller.recording_capture_metadata["width"], 1920)
+        self.assertEqual(controller.recording_capture_metadata["fps"], 15)
+
     @patch("bots.bot_controller.bot_controller.make_signed_callback_request")
     def test_muxed_screen_recording_callback_uses_video_as_single_source(self, mock_callback):
         bot = Bot.objects.create(

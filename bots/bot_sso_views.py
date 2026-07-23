@@ -6,7 +6,11 @@ from django.utils.decorators import method_decorator
 from django.views import View
 from django.views.decorators.csrf import csrf_exempt
 
-from bots.bot_sso_utils import _build_sign_in_saml_response, _html_auto_post_form, get_bot_login_for_google_meet_sign_in_session
+from bots.bot_sso_utils import (
+    _build_sign_in_saml_response,
+    _html_auto_post_form,
+    get_google_workspace_sso_session_context,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +36,7 @@ class GoogleMeetSetCookieView(View):
             return HttpResponseBadRequest("Could not set cookie")
 
         # Check in redis store to confirm that a key with the id "google_meet_sign_in_session:<session_id>" exists
-        if not get_bot_login_for_google_meet_sign_in_session(session_id):
+        if not get_google_workspace_sso_session_context(session_id):
             logger.warning("GoogleMeetSetCookieView could not set cookie: no bot login found for session_id")
             return HttpResponseBadRequest("Could not set cookie")
 
@@ -64,8 +68,8 @@ class GoogleMeetSignInView(View):
             return HttpResponseBadRequest("Could not sign in")
 
         # Get the google meet bot login to use from the session id
-        google_meet_bot_login = get_bot_login_for_google_meet_sign_in_session(session_id)
-        if not google_meet_bot_login:
+        session_context = get_google_workspace_sso_session_context(session_id)
+        if not session_context:
             logger.warning("GoogleMeetSignInView could not sign in: no bot login found for session_id")
             return HttpResponseBadRequest("Could not sign in")
 
@@ -80,9 +84,7 @@ class GoogleMeetSignInView(View):
         try:
             saml_response_b64, acs_url = _build_sign_in_saml_response(
                 saml_request_b64=saml_request_b64,
-                email_to_sign_in=google_meet_bot_login.email,
-                cert=google_meet_bot_login.cert,
-                private_key=google_meet_bot_login.private_key,
+                session_context=session_context,
             )
         except Exception:
             logger.exception("Failed to create SAMLResponse")

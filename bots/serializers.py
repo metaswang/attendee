@@ -645,7 +645,7 @@ class RTMPSettingsJSONField(serializers.JSONField):
 BOT_RECORDING_SETTINGS_DEFAULT_VALUES = {
     "format": RecordingFormats.MP4,
     "view": RecordingViews.SPEAKER_VIEW,
-    "resolution": RecordingResolutions.HD_1080P,
+    "resolution": RecordingResolutions.HD_720P,
     "record_chat_messages_when_paused": False,
     "record_async_transcription_audio_chunks": False,
     "record_participant_speech_start_stop_events": False,
@@ -670,8 +670,26 @@ BOT_RECORDING_SETTINGS_SCHEMA = {
         },
         "resolution": {
             "type": "string",
-            "description": "The resolution to use for the recording. The supported resolutions are '1080p' and '720p'. Defaults to '1080p'.",
+            "description": "The resolution to use for the recording. The supported resolutions are '1080p' and '720p'. Defaults to '720p'.",
             "enum": RecordingResolutions.values,
+        },
+        "recording_fps": {
+            "type": "integer",
+            "minimum": 5,
+            "maximum": 60,
+            "description": "Target frames per second for browser MediaRecorder capture.",
+        },
+        "video_bits_per_second": {
+            "type": "integer",
+            "minimum": 500000,
+            "maximum": 20000000,
+            "description": "Target video bitrate for browser MediaRecorder capture.",
+        },
+        "audio_bits_per_second": {
+            "type": "integer",
+            "minimum": 32000,
+            "maximum": 320000,
+            "description": "Target audio bitrate for browser MediaRecorder capture.",
         },
         "record_chat_messages_when_paused": {
             "type": "boolean",

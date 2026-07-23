@@ -1,5 +1,6 @@
 import os
 
+from .database import django_database_config
 from .base import *
 
 DEBUG = True
@@ -9,7 +10,8 @@ _extra_allowed_hosts = [host.strip() for host in os.getenv("ALLOWED_HOSTS", "").
 ALLOWED_HOSTS = list(dict.fromkeys(_allowed_hosts + _extra_allowed_hosts))
 
 DATABASES = {
-    "default": {
+    "default": django_database_config()
+    or {
         "ENGINE": "django.db.backends.postgresql",
         "NAME": os.getenv("POSTGRES_DB", "attendee_development"),
         "USER": os.getenv("POSTGRES_USER", "attendee_development_user"),

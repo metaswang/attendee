@@ -15,6 +15,7 @@ from textwrap import shorten
 
 import requests
 from django.conf import settings as django_settings
+from django.db import transaction
 from django.http import FileResponse, HttpResponseNotAllowed, JsonResponse
 from django.utils.decorators import method_decorator
 from django.views import View
@@ -43,6 +44,10 @@ from bots.models import (
     ChatMessageToOptions,
     MediaBlob,
     MeetingTypes,
+    GoogleMeetBotLogin,
+    GoogleMeetBotLoginGroup,
+    GoogleWorkspaceSsoSigningCertificate,
+    GoogleWorkspaceSsoTenant,
     BotChatMessageRequestManager,
     Participant,
     ParticipantEvent,
@@ -52,10 +57,20 @@ from bots.models import (
     RecordingManager,
     RecordingStates,
     RecordingTranscriptionStates,
+    Project,
     Utterance,
     WebhookTriggerTypes,
 )
 from bots.bots_api_utils import build_site_url
+from bots.bot_sso_utils import create_google_meet_bot_login_session_for_bot, google_meet_bot_login_is_available_for_bot
+from bots.google_workspace_sso import (
+    GoogleWorkspaceSsoConfigurationError,
+    create_signing_certificate,
+    normalize_workspace_domain,
+    public_sso_facade_url,
+    retire_and_promote_next_certificate,
+    validate_tenant_configuration,
+)
 from bots.runtime_providers import get_runtime_provider
 from bots.meeting_url_utils import meeting_type_from_url
 from bots.meetbot_diarization import (
@@ -543,6 +558,279 @@ def _runtime_lease_for_request(lease_id: int, request):
     return lease, None
 
 
+def _has_internal_service_key(request) -> bool:
+    """Authorize API-to-Attendee administrative calls without a browser session."""
+    expected = os.getenv("ATTENDEE_INTERNAL_SERVICE_KEY", "").strip()
+    provided = request.headers.get("X-Internal-Service-Key", "").strip()
+    return bool(expected and provided and hmac.compare_digest(provided, expected))
+
+
+def _workspace_sso_json_error(detail: str, status: int = 400) -> JsonResponse:
+    return JsonResponse({"detail": detail}, status=status)
+
+
+def _workspace_sso_json_body(request) -> tuple[dict, JsonResponse | None]:
+    try:
+        data = json.loads(request.body or b"{}")
+    except (TypeError, ValueError):
+        return {}, _workspace_sso_json_error("Request body must be valid JSON")
+    if not isinstance(data, dict):
+        return {}, _workspace_sso_json_error("Request body must be a JSON object")
+    return data, None
+
+
+def _workspace_sso_project(project_object_id: str) -> tuple[Project | None, JsonResponse | None]:
+    project = Project.objects.filter(object_id=str(project_object_id or "").strip()).first()
+    if project is None:
+        return None, _workspace_sso_json_error("Attendee project was not found", status=404)
+    return project, None
+
+
+def _workspace_sso_certificate_payload(certificate: GoogleWorkspaceSsoSigningCertificate) -> dict:
+    return {
+        "object_id": certificate.object_id,
+        "state": certificate.state,
+        "fingerprint_sha256": certificate.fingerprint_sha256 or None,
+        "not_before": certificate.not_before.isoformat() if certificate.not_before else None,
+        "not_after": certificate.not_after.isoformat() if certificate.not_after else None,
+        "activated_at": certificate.activated_at.isoformat() if certificate.activated_at else None,
+        # This is the public X.509 certificate; the encrypted private key is
+        # intentionally never serialized outside Attendee.
+        "certificate_pem": certificate.certificate_pem,
+    }
+
+
+def _workspace_sso_tenant_payload(tenant: GoogleWorkspaceSsoTenant) -> dict:
+    certificates = list(
+        tenant.signing_certificates.filter(retired_at__isnull=True)
+        .order_by("state", "-activated_at", "-created_at", "-id")
+    )
+    logins = list(
+        GoogleMeetBotLogin.objects.filter(
+            group__project=tenant.project,
+            workspace_domain=tenant.workspace_domain,
+        ).order_by("email", "id")
+    )
+    try:
+        sign_in_url = public_sso_facade_url("sign-in")
+        sign_out_url = public_sso_facade_url("sign-out")
+    except GoogleWorkspaceSsoConfigurationError:
+        sign_in_url = None
+        sign_out_url = None
+    try:
+        validate_tenant_configuration(tenant)
+        saml_ready = True
+    except GoogleWorkspaceSsoConfigurationError:
+        saml_ready = False
+    return {
+        "object_id": tenant.object_id,
+        "project_object_id": tenant.project.object_id,
+        "workspace_domain": tenant.workspace_domain,
+        "display_name": tenant.display_name,
+        "idp_entity_id": tenant.idp_entity_id,
+        "sign_in_url": sign_in_url,
+        "sign_out_url": sign_out_url,
+        "google_sp_entity_id": tenant.google_sp_entity_id,
+        "google_acs_url": tenant.google_acs_url,
+        "is_active": tenant.is_active,
+        "saml_ready": saml_ready,
+        "certificates": [_workspace_sso_certificate_payload(certificate) for certificate in certificates],
+        "bot_logins": [
+            {
+                "object_id": login.object_id,
+                "email": login.email,
+                "is_active": login.is_active,
+                "last_used_at": login.last_used_at.isoformat() if login.last_used_at else None,
+            }
+            for login in logins
+        ],
+    }
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class GoogleWorkspaceSsoTenantsInternalView(View):
+    """Private control-plane API for the Admin Web's Google Workspace SSO UI."""
+
+    def dispatch(self, request, *args, **kwargs):
+        if not _has_internal_service_key(request):
+            return _workspace_sso_json_error("Unauthorized", status=401)
+        return super().dispatch(request, *args, **kwargs)
+
+    def get(self, request):
+        project, error = _workspace_sso_project(request.GET.get("project_object_id", ""))
+        if error:
+            return error
+        tenants = GoogleWorkspaceSsoTenant.objects.filter(project=project).order_by("workspace_domain", "id")
+        return JsonResponse({"items": [_workspace_sso_tenant_payload(tenant) for tenant in tenants]})
+
+    def post(self, request):
+        payload, error = _workspace_sso_json_body(request)
+        if error:
+            return error
+        project, error = _workspace_sso_project(payload.get("project_object_id", ""))
+        if error:
+            return error
+        try:
+            domain = normalize_workspace_domain(payload.get("workspace_domain", ""))
+            with transaction.atomic():
+                if GoogleWorkspaceSsoTenant.objects.filter(project=project, workspace_domain=domain).exists():
+                    return _workspace_sso_json_error("A Workspace SSO tenant already exists for this project and domain", status=409)
+                tenant = GoogleWorkspaceSsoTenant.objects.create(
+                    project=project,
+                    workspace_domain=domain,
+                    display_name=str(payload.get("display_name") or "").strip(),
+                    is_active=False,
+                )
+                tenant.idp_entity_id = public_sso_facade_url(f"tenants/{tenant.object_id}")
+                tenant.save(update_fields=["idp_entity_id", "updated_at"])
+                create_signing_certificate(tenant=tenant, state=GoogleWorkspaceSsoSigningCertificate.States.ACTIVE)
+        except (GoogleWorkspaceSsoConfigurationError, ValueError) as exc:
+            return _workspace_sso_json_error(str(exc))
+        return JsonResponse(_workspace_sso_tenant_payload(tenant), status=201)
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class GoogleWorkspaceSsoTenantInternalView(View):
+    def dispatch(self, request, *args, **kwargs):
+        if not _has_internal_service_key(request):
+            return _workspace_sso_json_error("Unauthorized", status=401)
+        return super().dispatch(request, *args, **kwargs)
+
+    def _tenant(self, tenant_object_id: str) -> tuple[GoogleWorkspaceSsoTenant | None, JsonResponse | None]:
+        tenant = GoogleWorkspaceSsoTenant.objects.select_related("project").filter(object_id=tenant_object_id).first()
+        if tenant is None:
+            return None, _workspace_sso_json_error("Workspace SSO tenant was not found", status=404)
+        return tenant, None
+
+    def get(self, request, tenant_object_id):
+        tenant, error = self._tenant(tenant_object_id)
+        return error or JsonResponse(_workspace_sso_tenant_payload(tenant))
+
+    def patch(self, request, tenant_object_id):
+        tenant, error = self._tenant(tenant_object_id)
+        if error:
+            return error
+        payload, error = _workspace_sso_json_body(request)
+        if error:
+            return error
+        try:
+            with transaction.atomic():
+                tenant = GoogleWorkspaceSsoTenant.objects.select_for_update().select_related("project").get(pk=tenant.pk)
+                if "display_name" in payload:
+                    tenant.display_name = str(payload["display_name"] or "").strip()
+                if "google_sp_entity_id" in payload:
+                    tenant.google_sp_entity_id = str(payload["google_sp_entity_id"] or "").strip()
+                if "google_acs_url" in payload:
+                    tenant.google_acs_url = str(payload["google_acs_url"] or "").strip()
+                if "is_active" in payload:
+                    tenant.is_active = bool(payload["is_active"])
+                tenant.save()
+                if tenant.is_active:
+                    validate_tenant_configuration(tenant)
+        except GoogleWorkspaceSsoConfigurationError as exc:
+            return _workspace_sso_json_error(str(exc))
+        return JsonResponse(_workspace_sso_tenant_payload(tenant))
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class GoogleWorkspaceSsoCertificateRotationInternalView(View):
+    def dispatch(self, request, *args, **kwargs):
+        if not _has_internal_service_key(request):
+            return _workspace_sso_json_error("Unauthorized", status=401)
+        return super().dispatch(request, *args, **kwargs)
+
+    def post(self, request, tenant_object_id):
+        try:
+            with transaction.atomic():
+                tenant = GoogleWorkspaceSsoTenant.objects.select_for_update().select_related("project").get(object_id=tenant_object_id)
+                if tenant.signing_certificates.filter(
+                    state=GoogleWorkspaceSsoSigningCertificate.States.NEXT,
+                    retired_at__isnull=True,
+                ).exists():
+                    return _workspace_sso_json_error("A next signing certificate already exists", status=409)
+                create_signing_certificate(tenant=tenant, state=GoogleWorkspaceSsoSigningCertificate.States.NEXT)
+        except GoogleWorkspaceSsoTenant.DoesNotExist:
+            return _workspace_sso_json_error("Workspace SSO tenant was not found", status=404)
+        return JsonResponse(_workspace_sso_tenant_payload(tenant))
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class GoogleWorkspaceSsoCertificatePromotionInternalView(View):
+    def dispatch(self, request, *args, **kwargs):
+        if not _has_internal_service_key(request):
+            return _workspace_sso_json_error("Unauthorized", status=401)
+        return super().dispatch(request, *args, **kwargs)
+
+    def post(self, request, tenant_object_id):
+        try:
+            with transaction.atomic():
+                tenant = GoogleWorkspaceSsoTenant.objects.select_for_update().select_related("project").get(object_id=tenant_object_id)
+                retire_and_promote_next_certificate(tenant=tenant)
+        except GoogleWorkspaceSsoTenant.DoesNotExist:
+            return _workspace_sso_json_error("Workspace SSO tenant was not found", status=404)
+        except GoogleWorkspaceSsoConfigurationError as exc:
+            return _workspace_sso_json_error(str(exc))
+        return JsonResponse(_workspace_sso_tenant_payload(tenant))
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class GoogleWorkspaceSsoBotLoginsInternalView(View):
+    def dispatch(self, request, *args, **kwargs):
+        if not _has_internal_service_key(request):
+            return _workspace_sso_json_error("Unauthorized", status=401)
+        return super().dispatch(request, *args, **kwargs)
+
+    def post(self, request, tenant_object_id):
+        tenant = GoogleWorkspaceSsoTenant.objects.select_related("project").filter(object_id=tenant_object_id).first()
+        if tenant is None:
+            return _workspace_sso_json_error("Workspace SSO tenant was not found", status=404)
+        payload, error = _workspace_sso_json_body(request)
+        if error:
+            return error
+        email = str(payload.get("email") or "").strip().lower()
+        if not email or "@" not in email:
+            return _workspace_sso_json_error("A valid bot email is required")
+        with transaction.atomic():
+            group, _created = GoogleMeetBotLoginGroup.objects.get_or_create(project=tenant.project)
+            if GoogleMeetBotLogin.objects.filter(group=group, email=email).exists():
+                return _workspace_sso_json_error("A bot login with this email already exists", status=409)
+            GoogleMeetBotLogin.objects.create(
+                group=group,
+                workspace_domain=tenant.workspace_domain,
+                email=email,
+                is_active=bool(payload.get("is_active", True)),
+            )
+        return JsonResponse(_workspace_sso_tenant_payload(tenant), status=201)
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class GoogleWorkspaceSsoBotLoginInternalView(View):
+    def dispatch(self, request, *args, **kwargs):
+        if not _has_internal_service_key(request):
+            return _workspace_sso_json_error("Unauthorized", status=401)
+        return super().dispatch(request, *args, **kwargs)
+
+    def patch(self, request, tenant_object_id, login_object_id):
+        tenant = GoogleWorkspaceSsoTenant.objects.select_related("project").filter(object_id=tenant_object_id).first()
+        if tenant is None:
+            return _workspace_sso_json_error("Workspace SSO tenant was not found", status=404)
+        login = GoogleMeetBotLogin.objects.filter(
+            object_id=login_object_id,
+            group__project=tenant.project,
+            workspace_domain=tenant.workspace_domain,
+        ).first()
+        if login is None:
+            return _workspace_sso_json_error("Google Meet bot login was not found", status=404)
+        payload, error = _workspace_sso_json_body(request)
+        if error:
+            return error
+        if "is_active" not in payload:
+            return _workspace_sso_json_error("is_active is required")
+        login.is_active = bool(payload["is_active"])
+        login.save(update_fields=["is_active", "updated_at"])
+        return JsonResponse(_workspace_sso_tenant_payload(tenant))
+
+
 def _runtime_recording_complete_callback_url(lease: BotRuntimeLease) -> str:
     runtime_api_base_url = os.getenv("MEETBOT_RUNTIME_API_BASE_URL", "").strip().rstrip("/")
     if runtime_api_base_url:
@@ -683,6 +971,7 @@ def _serialize_bot_runtime_snapshot(bot: Bot, lease: BotRuntimeLease) -> dict:
             "updated_at": bot.updated_at.isoformat(),
             "first_heartbeat_timestamp": bot.first_heartbeat_timestamp,
             "last_heartbeat_timestamp": bot.last_heartbeat_timestamp,
+            "google_meet_bot_login_available": google_meet_bot_login_is_available_for_bot(bot),
         },
         "project": {
             "id": bot.project.id,
@@ -1106,6 +1395,28 @@ class BotRuntimeLeaseBootstrapView(View):
     def dispatch(self, request, *args, **kwargs):
         if request.method.lower() != "get":
             return HttpResponseNotAllowed(["GET"])
+        return super().dispatch(request, *args, **kwargs)
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class BotRuntimeLeaseGoogleMeetLoginSessionView(View):
+    """Create the opaque SAML login session used by a leased Google Meet bot."""
+
+    http_method_names = ["post"]
+
+    def post(self, request, lease_id: int):
+        lease, error_response = _runtime_lease_for_request(lease_id, request)
+        if error_response is not None:
+            return error_response
+
+        login_session = create_google_meet_bot_login_session_for_bot(lease.bot)
+        if login_session is None:
+            return JsonResponse({"error": "No active Google Meet bot login is configured"}, status=409)
+        return JsonResponse(login_session)
+
+    def dispatch(self, request, *args, **kwargs):
+        if request.method.lower() != "post":
+            return HttpResponseNotAllowed(["POST"])
         return super().dispatch(request, *args, **kwargs)
 
 

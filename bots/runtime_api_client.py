@@ -93,6 +93,9 @@ class BotRuntimeApiClient:
     def get_control(self) -> dict[str, Any]:
         return self._get(self.control_url)
 
+    def create_google_meet_login_session(self) -> dict[str, Any]:
+        return self._post_json(f"{self.bootstrap_url.rsplit('/bootstrap', 1)[0]}/google-meet-login-session", {})
+
     def post_complete(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._post_json(f"{self.bootstrap_url.rsplit('/bootstrap', 1)[0]}/complete", payload)
 

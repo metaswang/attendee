@@ -464,6 +464,7 @@ class RuntimeBotSnapshot:
         self.updated_at = self._parse_datetime(payload.get("updated_at"))
         self.first_heartbeat_timestamp = payload.get("first_heartbeat_timestamp")
         self.last_heartbeat_timestamp = payload.get("last_heartbeat_timestamp")
+        self.google_meet_bot_login_available = bool(payload.get("google_meet_bot_login_available", False))
         self.last_bot_event_data = payload.get("last_bot_event")
 
         project_payload = payload.get("project") or {}
@@ -691,8 +692,17 @@ class RuntimeBotSnapshot:
 
     def recording_dimensions(self):
         recording_settings = self.settings.get("recording_settings", {}) or {}
-        resolution_value = recording_settings.get("resolution", RecordingResolutions.HD_1080P)
+        resolution_value = recording_settings.get("resolution", RecordingResolutions.HD_720P)
         return RecordingResolutions.get_dimensions(resolution_value)
+
+    def recording_fps(self):
+        return int((self.settings.get("recording_settings", {}) or {}).get("recording_fps", 24))
+
+    def recording_video_bits_per_second(self):
+        return int((self.settings.get("recording_settings", {}) or {}).get("video_bits_per_second", 1_200_000))
+
+    def recording_audio_bits_per_second(self):
+        return int((self.settings.get("recording_settings", {}) or {}).get("audio_bits_per_second", 96_000))
 
     def recording_view(self):
         recording_settings = self.settings.get("recording_settings", {}) or {}

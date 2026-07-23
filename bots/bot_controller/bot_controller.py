@@ -15,13 +15,12 @@ import gi
 import redis
 from django.conf import settings
 from django.core.files.base import ContentFile
-from django.db.models import F
 from django.utils import timezone
 
 from bots.automatic_leave_configuration import AutomaticLeaveConfiguration
 from bots.bot_adapter import BotAdapter
 from bots.bot_controller.bot_websocket_client_manager import BotWebsocketClientManager
-from bots.bot_sso_utils import create_google_meet_sign_in_session
+from bots.bot_sso_utils import create_google_meet_bot_login_session_for_bot, google_meet_bot_login_is_available_for_bot
 from bots.bots_api_utils import BotCreationSource
 from bots.external_callback_utils import get_zoom_tokens, make_signed_callback_request
 from bots.meeting_url_utils import meeting_type_from_url, parse_zoom_registrant_token
@@ -44,8 +43,6 @@ from bots.models import (
     ChatMessage,
     ChatMessageToOptions,
     Credentials,
-    GoogleMeetBotLogin,
-    GoogleMeetBotLoginGroup,
     MeetingTypes,
     Participant,
     ParticipantEvent,
@@ -331,28 +328,15 @@ class BotController:
 
     def create_google_meet_bot_login_session(self):
         if self.runtime_mode:
-            return None
-        if not self.bot_in_db.google_meet_use_bot_login():
-            return None
-        first_google_meet_bot_login_group = GoogleMeetBotLoginGroup.objects.filter(project=self.bot_in_db.project).first()
-        if not first_google_meet_bot_login_group:
-            return None
-        least_used_google_meet_bot_login = first_google_meet_bot_login_group.google_meet_bot_logins.order_by(F("last_used_at").asc(nulls_first=True)).first()
-        if not least_used_google_meet_bot_login:
-            return None
-        least_used_google_meet_bot_login.last_used_at = timezone.now()
-        least_used_google_meet_bot_login.save()
-        session_id = create_google_meet_sign_in_session(self.bot_in_db, least_used_google_meet_bot_login)
-        return {
-            "session_id": session_id,
-            "login_email": least_used_google_meet_bot_login.email,
-            "login_domain": least_used_google_meet_bot_login.workspace_domain,
-        }
+            if not self.runtime_api_client:
+                return None
+            return self.runtime_api_client.create_google_meet_login_session()
+        return create_google_meet_bot_login_session_for_bot(self.bot_in_db)
 
     def google_meet_bot_login_is_available(self):
         if self.runtime_mode:
-            return False
-        return self.bot_in_db.google_meet_use_bot_login() and GoogleMeetBotLogin.objects.filter(group__project=self.bot_in_db.project).exists()
+            return bool(getattr(self.bot_in_db, "google_meet_bot_login_available", False))
+        return google_meet_bot_login_is_available_for_bot(self.bot_in_db)
 
     def get_google_meet_bot_adapter(self):
         from bots.google_meet_bot_adapter import GoogleMeetBotAdapter
@@ -383,6 +367,9 @@ class BotController:
             disable_incoming_video=self.disable_incoming_video_for_web_bots(),
             record_participant_speech_start_stop_events=self.bot_in_db.record_participant_speech_start_stop_events(),
             recording_chunk_interval_ms=self.bot_in_db.recording_chunk_interval_ms(),
+            recording_fps=self.bot_in_db.recording_fps(),
+            video_bits_per_second=self.bot_in_db.recording_video_bits_per_second(),
+            audio_bits_per_second=self.bot_in_db.recording_audio_bits_per_second(),
             modify_dom_for_video_recording=self.should_modify_dom_for_video_recording_for_web_bots(),
             google_meet_bot_login_is_available=self.google_meet_bot_login_is_available(),
             google_meet_bot_login_should_be_used=self.bot_in_db.google_meet_login_mode_is_always(),
@@ -421,6 +408,9 @@ class BotController:
             record_participant_speech_start_stop_events=self.bot_in_db.record_participant_speech_start_stop_events(),
             disable_incoming_video=self.disable_incoming_video_for_web_bots(),
             recording_chunk_interval_ms=self.bot_in_db.recording_chunk_interval_ms(),
+            recording_fps=self.bot_in_db.recording_fps(),
+            video_bits_per_second=self.bot_in_db.recording_video_bits_per_second(),
+            audio_bits_per_second=self.bot_in_db.recording_audio_bits_per_second(),
             modify_dom_for_video_recording=self.should_modify_dom_for_video_recording_for_web_bots(),
         )
 
@@ -493,6 +483,9 @@ class BotController:
             record_chat_messages_when_paused=self.bot_in_db.record_chat_messages_when_paused(),
             disable_incoming_video=self.disable_incoming_video_for_web_bots(),
             recording_chunk_interval_ms=self.bot_in_db.recording_chunk_interval_ms(),
+            recording_fps=self.bot_in_db.recording_fps(),
+            video_bits_per_second=self.bot_in_db.recording_video_bits_per_second(),
+            audio_bits_per_second=self.bot_in_db.recording_audio_bits_per_second(),
             modify_dom_for_video_recording=self.should_modify_dom_for_video_recording_for_web_bots(),
             record_participant_speech_start_stop_events=self.bot_in_db.record_participant_speech_start_stop_events(),
             zoom_tokens=zoom_tokens,
@@ -799,7 +792,13 @@ class BotController:
             self.recording_resize_events = None
         self.recording_chunk_uploader.enqueue_chunk(chunk_bytes)
 
-    def update_recording_chunk_metadata_from_adapter(self, kind: str, mime_type: str, extension: str):
+    def update_recording_chunk_metadata_from_adapter(
+        self,
+        kind: str,
+        mime_type: str,
+        extension: str,
+        capture_metadata: dict | None = None,
+    ):
         if kind == "video" and not self.bot_in_db.uses_muxed_screen_recording_chunks():
             return
         if kind == "audio" and self.bot_in_db.uses_muxed_screen_recording_chunks():
@@ -810,6 +809,14 @@ class BotController:
 
         self.recording_audio_chunk_mime_type = mime_type
         self.recording_audio_chunk_ext = extension
+        if kind == "video" and capture_metadata:
+            codecs_value = mime_type.split("codecs=", 1)[1] if "codecs=" in mime_type else ""
+            codec = codecs_value.split(",", 1)[0].split(";", 1)[0].strip()
+            self.recording_capture_metadata = {
+                **capture_metadata,
+                "mime_type": mime_type,
+                "codec": codec or None,
+            }
         self.recording_chunk_uploader.update_chunk_metadata(
             chunk_ext=extension,
             chunk_mime_type=mime_type,
@@ -1079,6 +1086,17 @@ class BotController:
 
         if self.bot_in_db.uses_muxed_screen_recording_chunks():
             raw_path = self.bot_in_db.audio_raw_path()
+            capture_width, capture_height = self.bot_in_db.recording_dimensions()
+            capture_metadata = {
+                "width": capture_width,
+                "height": capture_height,
+                "fps": self.bot_in_db.recording_fps(),
+                "mime_type": "video/webm",
+                "codec": None,
+                "video_bits_per_second": self.bot_in_db.recording_video_bits_per_second(),
+                "audio_bits_per_second": self.bot_in_db.recording_audio_bits_per_second(),
+            }
+            capture_metadata.update(getattr(self, "recording_capture_metadata", None) or {})
             video_upload_result = {
                 "chunk_paths": uploaded_chunk_paths,
                 "chunk_count": len(uploaded_chunk_paths),
@@ -1087,6 +1105,7 @@ class BotController:
                 "chunk_interval_ms": self.bot_in_db.recording_chunk_interval_ms(),
                 "duration_sec": self.recording_output_duration_sec(),
                 "raw_path": raw_path,
+                "capture_metadata": capture_metadata,
             }
             audio_upload_result = {
                 **video_upload_result,
@@ -1167,9 +1186,15 @@ class BotController:
             logger.warning("Skipping recording.failed callback because callback settings are missing for bot=%s", self.bot_in_db.object_id)
             return
 
-        last_event = self.bot_in_db.bot_events.order_by("-created_at").first()
-        event_type = BotEventTypes.type_to_api_code(last_event.event_type) if last_event else None
-        event_sub_type = BotEventSubTypes.sub_type_to_api_code(last_event.event_sub_type) if last_event and last_event.event_sub_type else None
+        last_event = self.bot_in_db.last_bot_event()
+        if isinstance(last_event, dict):
+            last_event_type = last_event.get("event_type")
+            last_event_sub_type = last_event.get("event_sub_type")
+        else:
+            last_event_type = getattr(last_event, "event_type", None)
+            last_event_sub_type = getattr(last_event, "event_sub_type", None)
+        event_type = BotEventTypes.type_to_api_code(last_event_type) if last_event_type is not None else None
+        event_sub_type = BotEventSubTypes.sub_type_to_api_code(last_event_sub_type) if last_event_sub_type is not None else None
         bot_state = BotStates.state_to_api_code(self.bot_in_db.state)
         error_message = str(exc)
         failure_reason = "no_recording_chunks" if "No recording chunks were uploaded" in error_message else "recording_complete_callback_failed"

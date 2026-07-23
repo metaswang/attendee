@@ -46,7 +46,7 @@ BUILD_RUNTIME_IMAGE="${BUILD_RUNTIME_IMAGE:-false}"
 PULL_RUNTIME_IMAGE="${PULL_RUNTIME_IMAGE:-true}"
 DOCKER_PLATFORM="${DOCKER_PLATFORM:-linux/amd64}"
 BOT_RUNTIME_DOCKERFILE="${BOT_RUNTIME_DOCKERFILE:-Dockerfile.bot-runtime}"
-PYTHON_BIN="${PYTHON_BIN:-python3.11}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 BOT_RUNTIME_IMAGE_ALIAS="${BOT_RUNTIME_IMAGE_ALIAS:-attendee-bot-runner:latest}"
 DOCKER_LOGOUT_AFTER_DEFAULT="false"
 if [[ "$PULL_RUNTIME_IMAGE" == "true" ]]; then
@@ -167,6 +167,29 @@ if [[ "$DOCKER_LOGOUT_AFTER" == "true" ]]; then
     rm -f /root/.docker/config.json
   fi
 fi
+
+echo
+echo "Golden image disk usage before cleanup:"
+df -h /
+du -sh /var/lib/docker /var/lib/containerd "$ATTENDEE_REPO_DIR" 2>/dev/null || true
+docker system df || true
+
+# Keep the runnable source tree and tagged runtime image, but remove builder-only
+# downloads, package indexes, the uploaded source archive, and unreferenced
+# Docker build data before snapshotting the disk.
+apt-get clean
+rm -rf /var/lib/apt/lists/* /tmp/voxella-attendee-src.tgz
+if [[ -d "$ATTENDEE_REPO_URL" && "$ATTENDEE_REPO_URL" != "$ATTENDEE_REPO_DIR" ]]; then
+  rm -rf "$ATTENDEE_REPO_URL"
+fi
+docker builder prune --all --force || true
+docker image prune --force || true
+
+echo
+echo "Golden image disk usage after cleanup:"
+df -h /
+du -sh /var/lib/docker /var/lib/containerd "$ATTENDEE_REPO_DIR" 2>/dev/null || true
+docker system df || true
 
 cloud-init clean --logs
 truncate -s 0 /etc/machine-id || true
