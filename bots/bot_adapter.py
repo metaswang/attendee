@@ -49,3 +49,12 @@ class BotAdapter:
         AUTO_LEAVE_COULD_NOT_ENABLE_CLOSED_CAPTIONS = "AUTO_LEAVE_COULD_NOT_ENABLE_CLOSED_CAPTIONS"
 
     DEBUG_RECORDING_FILE_PATH = "/tmp/debug_screen_recording.mp4"
+
+    def check_meeting_end_navigation(self):
+        """Allow browser-backed adapters to report a provider end signal.
+
+        Non-browser adapters do not have a page navigation to inspect. Keeping
+        this hook on the base class lets the controller run the check from its
+        existing heartbeat loop without adding provider-specific branching.
+        """
+        return None

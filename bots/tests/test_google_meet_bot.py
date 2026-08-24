@@ -16,6 +16,7 @@ from selenium.common.exceptions import TimeoutException
 from websockets.sync.client import connect as ws_connect
 
 from bots.bot_controller import BotController
+from bots.google_meet_bot_adapter.google_meet_bot_adapter import GoogleMeetBotAdapter
 from bots.google_meet_bot_adapter.google_meet_ui_methods import GoogleMeetUIMethods
 from bots.models import (
     AsyncTranscription,
@@ -344,7 +345,8 @@ class TestGoogleMeetBot(TransactionTestCase):
         self.assertIsNotNone(webhook_attempt.payload["transcription"])
 
         # Verify WebSocket media sending was enabled and performance.timeOrigin was queried
-        mock_driver.execute_script.assert_has_calls([call("window.ws?.enableMediaSending();"), call("return performance.timeOrigin;")])
+        mock_driver.execute_async_script.assert_called_once()
+        mock_driver.execute_script.assert_any_call("return performance.timeOrigin;")
 
         # Verify file uploader was used
         mock_uploader.upload_file.assert_called_once()
@@ -358,6 +360,31 @@ class TestGoogleMeetBot(TransactionTestCase):
 
         # Close the database connection since we're in a thread
         connection.close()
+
+    def test_home_navigation_after_recording_emits_one_structured_end_signal(self):
+        adapter = object.__new__(GoogleMeetBotAdapter)
+        adapter.meeting_url = "https://meet.google.com/fgg-rrqh-pfy"
+        adapter.driver = MagicMock()
+        adapter.driver.current_url = "https://meet.google.com/home"
+        adapter.driver.execute_script.return_value = "https://meet.google.com/fgg-rrqh-pfy"
+        adapter.recording_permission_granted_at = time.time()
+        adapter.left_meeting = False
+        adapter.cleaned_up = False
+        adapter._meeting_end_signal_sent = False
+        adapter._meeting_end_navigation_candidate_at = time.monotonic() - 3
+        adapter._meeting_end_navigation_url = adapter.driver.current_url
+        adapter.stop_media_sending_for_meeting_end = MagicMock()
+        adapter._send_meeting_ended_message = MagicMock()
+
+        adapter.check_meeting_end_navigation()
+
+        adapter.stop_media_sending_for_meeting_end.assert_called_once_with()
+        adapter._send_meeting_ended_message.assert_called_once_with(
+            meeting_end_signal="browser_navigation",
+            current_url="https://meet.google.com/home",
+            referrer="https://meet.google.com/fgg-rrqh-pfy",
+        )
+        self.assertTrue(adapter.left_meeting)
 
         # Now test creating an async transcription
         async_transcription = AsyncTranscription.objects.create(recording=self.recording, settings={"transcription_settings": {"deepgram": {}}})
@@ -896,7 +923,8 @@ class TestGoogleMeetBot(TransactionTestCase):
             self.assertEqual(webhook_delivery_attempts.count(), 0, "Expected zero webhook delivery attempts for transcript updates")
 
             # Verify WebSocket media sending was enabled and performance.timeOrigin was queried
-            mock_driver.execute_script.assert_has_calls([call("window.ws?.enableMediaSending();"), call("return performance.timeOrigin;")])
+            mock_driver.execute_async_script.assert_called_once()
+            mock_driver.execute_script.assert_any_call("return performance.timeOrigin;")
 
             # Verify that no charge was created (since the env var is not set in this test suite)
             credit_transaction = CreditTransaction.objects.filter(bot=self.bot).first()
@@ -1041,7 +1069,8 @@ class TestGoogleMeetBot(TransactionTestCase):
         self.assertEqual(post_processing_completed_event.event_type, BotEventTypes.POST_PROCESSING_COMPLETED)
         self.assertEqual(post_processing_completed_event.new_state, BotStates.ENDED)
 
-        mock_driver.execute_script.assert_has_calls([call("window.ws?.enableMediaSending();"), call("return performance.timeOrigin;")])
+        mock_driver.execute_async_script.assert_called_once()
+        mock_driver.execute_script.assert_any_call("return performance.timeOrigin;")
 
         mock_uploader.upload_file.assert_called_once()
         mock_uploader.wait_for_upload.assert_called_once()
@@ -1263,7 +1292,8 @@ class TestGoogleMeetBot(TransactionTestCase):
         self.assertEqual(post_processing_completed_event.new_state, BotStates.ENDED)
 
         # Verify WebSocket media sending was enabled
-        mock_driver.execute_script.assert_has_calls([call("window.ws?.enableMediaSending();"), call("return performance.timeOrigin;")])
+        mock_driver.execute_async_script.assert_called_once()
+        mock_driver.execute_script.assert_any_call("return performance.timeOrigin;")
 
         # Verify file uploader was used
         mock_uploader.upload_file.assert_called_once()

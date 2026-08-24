@@ -1395,7 +1395,8 @@ class WebSocketClient {
     };
   
     constructor() {
-        const url = `ws://localhost:${window.initialData.websocketPort}`;
+        const host = window.initialData.websocketHost || '127.0.0.1';
+        const url = `ws://${host}:${window.initialData.websocketPort}`;
         console.log('WebSocketClient url', url);
         this.ws = new WebSocket(url);
         this.ws.binaryType = 'arraybuffer';

@@ -62,18 +62,40 @@ VPS 不是直接跑 Django 控制面；VPS 侧应以 **systemd 常驻进程**运
 
 ### 4.1 同步代码到 VPS
 
-按项目约定，先在本机更新后同步：
+runtime 镜像较大，不要在本机执行 `docker save | docker load`。推荐从
+`voxella-docker-deploy` 运行只同步 attendee/commons 的命令，再在目标 VPS 上使用
+`Dockerfile.bot-runtime` 的 BuildKit cache 构建：
 
 ```bash
-rsync -avr /Users/adamwang/Project/subdub/voxella-attendee/ myvps2:/voxstudio/attendee/
+cd /Users/adamwang/Project/subdub/voxella-docker-deploy
+./scripts/ops/build_attendee_runtime_on_vps.sh myvps myvps3
 ```
 
-然后登录 VPS（示例）：
+该命令只在远端执行 `docker build`，本机不会构建镜像；目标 Docker 有 buildx 时使用
+`Dockerfile.bot-runtime` 的缓存层，否则自动回退到兼容的 `Dockerfile`；构建完成会校验 image ID、Chrome 和
+ChromeDriver 版本。若仅需同步代码而暂不构建，可使用：
+
+```bash
+./scripts/ops/sync_attendee_runtime_code.sh myvps myvps3
+```
+
+然后登录 VPS（示例）检查镜像：
 
 ```bash
 ssh myvps2
-cd /voxstudio/attendee
+docker image inspect attendee-bot-runner:latest --format '{{.Id}}'
 ```
+
+若已配置 registry，则应由 `myvps2` 构建并推送、目标机直接 `docker pull`；不要把
+`docker save/load` 设为默认发布方式。现有分发脚本在 `TRANSFER_MODE=auto` 下会拒绝隐式本机
+relay，relay 只能显式指定用于应急。
+
+### 4.1.1 Meet SSO header 生产默认值
+
+生产必须保持 `GOOGLE_MEET_SSO_ALLOWED_DOMAINS_HEADER_ENABLED=false`。VPS canary 已证明
+全局 `X-GoogApps-AllowedDomains` 会污染 Google identifier 之后的 SAML `/continue` 页面；
+关闭 header 后同一账号池可以完成身份确认、回到 Meet 并申请入会。只有受控诊断或回滚实验
+才显式设为 `true`，且必须同时检查浏览器是否真的回到 `meet.google.com`。
 
 ### 4.2 安装运行脚本与 service
 

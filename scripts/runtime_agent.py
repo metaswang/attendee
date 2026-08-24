@@ -11,7 +11,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-
 LOG = logging.getLogger("attendee.runtime_agent")
 
 
@@ -42,12 +41,17 @@ def _redis_cli(*args: str, input_text: str | None = None) -> str:
         cmd.extend(["-n", redis_url.path.lstrip("/")])
     if redis_url.username:
         cmd.extend(["--user", unquote(redis_url.username)])
+    child_env = os.environ.copy()
     if redis_url.password:
-        cmd.extend(["-a", unquote(redis_url.password)])
+        # Keep the Redis credential out of argv. Besides exposing it through the
+        # process list, subprocess.CalledProcessError includes argv verbatim and
+        # therefore used to write the credential to journald on connection errors.
+        child_env["REDISCLI_AUTH"] = unquote(redis_url.password)
     cmd.extend(args)
 
     result = subprocess.run(
         cmd,
+        env=child_env,
         input=input_text,
         text=True,
         capture_output=True,
@@ -220,7 +224,14 @@ def main() -> int:
             else:
                 _spawn_runner(payload)
         except Exception as exc:
-            LOG.exception("failed to handle command=%s payload=%s error=%s", command_type, payload, exc)
+            # runtime_env can contain service credentials and SSO material, so
+            # identify the failed command without serializing its payload.
+            LOG.exception(
+                "failed to handle command=%s payload_id=%s error=%s",
+                command_type,
+                _payload_identifier(payload),
+                exc,
+            )
 
 
 if __name__ == "__main__":

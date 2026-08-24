@@ -192,6 +192,8 @@ class BotSsoViewsIntegrationTest(TransactionTestCase):
         self.assertIn("google_meet_sign_in_session_id", response.cookies)
         cookie = response.cookies["google_meet_sign_in_session_id"]
         self.assertEqual(cookie.value, session_id)
+        self.assertEqual(int(cookie["max-age"]), 1800)
+        self.assertEqual(cookie["path"], "/")
         self.assertTrue(cookie["secure"])
         self.assertTrue(cookie["httponly"])
         self.assertEqual(cookie["samesite"], "Lax")

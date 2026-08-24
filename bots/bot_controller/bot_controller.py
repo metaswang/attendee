@@ -359,7 +359,10 @@ class BotController:
             update_recording_resize_events_callback=self.update_recording_resize_events_from_adapter,
             recording_view=self.bot_in_db.recording_view(),
             google_meet_closed_captions_language=self.bot_in_db.transcription_settings.google_meet_closed_captions_language(),
-            should_create_debug_recording=False,
+            # Preserve the existing per-bot debug opt-in in remote runtimes. For
+            # signed-in Google Meet bots this also enables privacy-safe SSO
+            # failure diagnostics; it does not enable diagnostics globally.
+            should_create_debug_recording=self.bot_in_db.create_debug_recording(),
             start_recording_screen_callback=None,
             stop_recording_screen_callback=None,
             video_frame_size=self.bot_in_db.recording_dimensions(),
@@ -2225,6 +2228,7 @@ class BotController:
             self.closed_caption_manager.process_captions()
 
             # Check if auto-leave conditions are met
+            self.adapter.check_meeting_end_navigation()
             self.adapter.check_auto_leave_conditions()
 
             # Process audio output
@@ -2908,12 +2912,30 @@ class BotController:
             return
 
         if message.get("message") == BotAdapter.Messages.MEETING_ENDED:
-            logger.info("Received message that meeting ended")
+            logger.info(
+                "Received message that meeting ended signal=%s current_url=%s referrer=%s",
+                message.get("meeting_end_signal"),
+                message.get("current_url"),
+                message.get("referrer"),
+            )
             self.flush_utterances()
+            event_metadata = {
+                key: message[key]
+                for key in ("meeting_end_signal", "current_url", "referrer")
+                if message.get(key)
+            }
             if self.bot_in_db.state == BotStates.LEAVING:
-                new_bot_event = BotEventManager.create_event(bot=self.bot_in_db, event_type=BotEventTypes.BOT_LEFT_MEETING)
+                new_bot_event = BotEventManager.create_event(
+                    bot=self.bot_in_db,
+                    event_type=BotEventTypes.BOT_LEFT_MEETING,
+                    event_metadata=event_metadata,
+                )
             else:
-                new_bot_event = BotEventManager.create_event(bot=self.bot_in_db, event_type=BotEventTypes.MEETING_ENDED)
+                new_bot_event = BotEventManager.create_event(
+                    bot=self.bot_in_db,
+                    event_type=BotEventTypes.MEETING_ENDED,
+                    event_metadata=event_metadata,
+                )
 
             self.save_debug_artifacts(message, new_bot_event)
 

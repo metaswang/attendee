@@ -139,6 +139,8 @@ class StyleManager {
         this.silenceCheckInterval = null;
         this.memoryUsageCheckInterval = null;
         this.neededInteractionsInterval = null;
+        this.loggedIgnoredRemovalBanner = false;
+        this.reportedRemovedFromMeeting = false;
 
         // Stream used which combines the audio tracks from the meeting. Does NOT include the bot's audio
         this.meetingAudioStream = null;
@@ -212,14 +214,55 @@ class StyleManager {
             }
         }
 
-        // Check if bot has been removed from the meeting
+        // Check if bot has been removed from the meeting. Meet reuses obfuscated
+        // banner classes for hidden copy, so a raw querySelector match is not a
+        // terminal leave signal while the bot is still on the meeting path.
         const removedFromMeetingElement = document.querySelector('.roSPhc');
-        if (removedFromMeetingElement && (removedFromMeetingElement.textContent.includes('You\'ve been removed from the meeting') || removedFromMeetingElement.textContent.includes('Your host ended the meeting for everyone'))) {
-            window.ws.sendJson({
-                type: 'MeetingStatusChange',
-                change: 'removed_from_meeting'
-            });
+        if (!removedFromMeetingElement) {
+            return;
         }
+        const bannerText = (removedFromMeetingElement.textContent || '').replace(/\s+/g, ' ').trim();
+        const looksRemoved = bannerText.includes("You've been removed from the meeting") || bannerText.includes('Your host ended the meeting for everyone');
+        if (!looksRemoved) {
+            return;
+        }
+        const bannerVisible = this.isVisibleElement(removedFromMeetingElement);
+        if (!bannerVisible || this.isActiveMeetingPath()) {
+            if (!this.loggedIgnoredRemovalBanner) {
+                this.loggedIgnoredRemovalBanner = true;
+                window.ws.sendJson({
+                    type: 'UiInteraction',
+                    message: 'Ignored Meet removal banner while still in the meeting',
+                    visible: bannerVisible,
+                    path: window.location.pathname,
+                });
+            }
+            return;
+        }
+        if (this.reportedRemovedFromMeeting) {
+            return;
+        }
+        this.reportedRemovedFromMeeting = true;
+        window.ws.sendJson({
+            type: 'MeetingStatusChange',
+            change: 'removed_from_meeting'
+        });
+    }
+
+    isVisibleElement(element) {
+        if (!element || !element.isConnected) {
+            return false;
+        }
+        const style = window.getComputedStyle(element);
+        if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) {
+            return false;
+        }
+        const rect = element.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+    }
+
+    isActiveMeetingPath() {
+        return /\/[a-z]{2,4}-[a-z]{3,5}-[a-z]{2,4}\/?$/i.test(window.location.pathname || '');
     }
 
     startSilenceDetection() {
@@ -285,6 +328,11 @@ class StyleManager {
         }, 5000);
 
         this.meetingAudioStream = destination.stream;
+        window.ws?.sendJson({
+            type: 'UiInteraction',
+            message: 'Meeting audio mix started',
+            audio_track_count: this.audioTracks.length,
+        });
     }
 
     getMeetingAudioStream() {
@@ -1032,26 +1080,18 @@ class WebSocketClient {
   };
 
   constructor() {
-      const url = `ws://localhost:${window.initialData.websocketPort}`;
+      const host = window.initialData.websocketHost || '127.0.0.1';
+      const url = `ws://${host}:${window.initialData.websocketPort}`;
       console.log('WebSocketClient url', url);
-      this.ws = new WebSocket(url);
-      this.ws.binaryType = 'arraybuffer';
-      
-      this.ws.onopen = () => {
-          console.log('WebSocket Connected');
-      };
-      
-      this.ws.onmessage = (event) => {
-          this.handleMessage(event.data);
-      };
-      
-      this.ws.onerror = (error) => {
-          console.error('WebSocket Error:', error);
-      };
-      
-      this.ws.onclose = () => {
-          console.log('WebSocket Disconnected');
-      };
+      this.websocketUrl = url;
+      this.ws = null;
+      this.pendingMessages = [];
+      this.pendingMessageLimit = 64;
+      this.websocketReconnectTimer = null;
+      this.shouldReconnectWebSocket = true;
+      // Only construct this class after Meet DOMContentLoaded. Connecting here
+      // during document-start aborts SSO facade → Meet navigation.
+      this.connectWebSocket();
 
       this.mediaSendingEnabled = false;
       this.audioChunkRecorder = null;
@@ -1079,6 +1119,82 @@ class WebSocketClient {
       this.lastVideoFrame = this.getBlackFrame();
       this.blackVideoFrame = this.getBlackFrame();
       */
+  }
+
+  connectWebSocket() {
+      if (this.ws && [WebSocket.CONNECTING, WebSocket.OPEN].includes(this.ws.readyState)) {
+          return;
+      }
+
+      const socket = new WebSocket(this.websocketUrl);
+      socket.binaryType = 'arraybuffer';
+      this.ws = socket;
+
+      socket.onopen = () => {
+          console.log('WebSocket Connected');
+          const pendingMessages = this.pendingMessages.splice(0);
+          for (const message of pendingMessages) {
+              try {
+                  socket.send(message);
+              } catch (error) {
+                  console.error('Error flushing queued WebSocket message:', error);
+                  break;
+              }
+          }
+      };
+
+      socket.onmessage = (event) => {
+          this.handleMessage(event.data);
+      };
+
+      socket.onerror = (error) => {
+          console.error('WebSocket Error:', error);
+      };
+
+      socket.onclose = () => {
+          console.log('WebSocket Disconnected');
+          if (this.shouldReconnectWebSocket && !this.websocketReconnectTimer) {
+              this.websocketReconnectTimer = setTimeout(() => {
+                  this.websocketReconnectTimer = null;
+                  this.connectWebSocket();
+              }, 250);
+          }
+      };
+  }
+
+  waitForWebSocketOpen(timeoutMs = 10000) {
+      if (this.ws?.readyState === WebSocket.OPEN) {
+          return Promise.resolve();
+      }
+
+      return new Promise((resolve, reject) => {
+          const startedAt = Date.now();
+          const check = () => {
+              if (this.ws?.readyState === WebSocket.OPEN) {
+                  resolve();
+                  return;
+              }
+              if (Date.now() - startedAt >= timeoutMs) {
+                  reject(new Error(`WebSocket did not open within ${timeoutMs}ms`));
+                  return;
+              }
+              setTimeout(check, 50);
+          };
+          check();
+      });
+  }
+
+  queueOrSendMessage(message) {
+      if (this.ws?.readyState === WebSocket.OPEN) {
+          this.ws.send(message);
+          return true;
+      }
+
+      if (this.pendingMessages.length >= this.pendingMessageLimit) {
+          this.pendingMessages.shift();
+      }
+      this.pendingMessages.push(message);
+      return false;
   }
 
   /*
@@ -1136,13 +1252,29 @@ class WebSocketClient {
   */
 
   async enableMediaSending() {
+    this.sendJson({ type: 'MediaSendingState', state: 'starting' });
     this.mediaSendingEnabled = true;
-    await window.styleManager.start();
-    if (window.initialData.sendEncodedVideoChunks) {
-      await this.startVideoChunkRecording();
-    }
-    if (window.initialData.sendEncodedAudioChunks) {
-      await this.startAudioChunkRecording();
+    try {
+      await this.waitForWebSocketOpen();
+      await window.styleManager.start();
+      if (window.initialData.sendEncodedVideoChunks) {
+        await this.startVideoChunkRecording();
+      }
+      if (window.initialData.sendEncodedAudioChunks) {
+        await this.startAudioChunkRecording();
+      }
+      this.sendJson({ type: 'MediaSendingState', state: 'started' });
+      return {
+        wsReadyState: this.ws?.readyState ?? null,
+        sendEncodedVideoChunks: !!window.initialData.sendEncodedVideoChunks,
+        sendEncodedAudioChunks: !!window.initialData.sendEncodedAudioChunks,
+        videoRecorderState: this.videoChunkRecorder?.state ?? null,
+        audioRecorderState: this.audioChunkRecorder?.state ?? null,
+      };
+    } catch (error) {
+      this.mediaSendingEnabled = false;
+      this.sendJson({ type: 'MediaSendingState', state: 'failed', error: String(error?.message || error) });
+      throw error;
     }
 
     // No longer need this because we're not using MediaStreamTrackProcessor's
@@ -1150,12 +1282,15 @@ class WebSocketClient {
   }
 
   async disableMediaSending() {
+    this.sendJson({ type: 'MediaSendingState', state: 'stopping' });
     await this.stopVideoChunkRecording();
     await this.stopAudioChunkRecording();
     window.styleManager.stop();
     // Give the media recorder a bit of time to send the final data
     await new Promise(resolve => setTimeout(resolve, 2000));
     this.mediaSendingEnabled = false;
+    this.shouldReconnectWebSocket = false;
+    this.sendJson({ type: 'MediaSendingState', state: 'stopped' });
 
     // No longer need this because we're not using MediaStreamTrackProcessor's
     //this.stopFillerFrameTimer();
@@ -1178,11 +1313,6 @@ class WebSocketClient {
   }
   
   sendJson(data) {
-      if (this.ws.readyState !== WebSocket.OPEN) {
-          console.error('WebSocket is not connected');
-          return;
-      }
-
       try {
           // Convert JSON to string then to Uint8Array
           const jsonString = JSON.stringify(data);
@@ -1197,8 +1327,7 @@ class WebSocketClient {
           // Copy JSON data after type
           message.set(jsonBytes, 4);
           
-          // Send the binary message
-          this.ws.send(message.buffer);
+          this.queueOrSendMessage(message.buffer);
       } catch (error) {
           console.error('Error sending WebSocket message:', error);
           console.error('Message data:', data);
@@ -1216,11 +1345,6 @@ class WebSocketClient {
   }
 
   sendEncodedMP4Chunk(encodedMP4Data) {
-    if (this.ws.readyState !== WebSocket.OPEN) {
-      console.error('WebSocket is not connected for video chunk send', this.ws.readyState);
-      return;
-    }
-
     if (!this.mediaSendingEnabled) {
       return;
     }
@@ -1234,8 +1358,7 @@ class WebSocketClient {
       // Create a Blob that combines the header and the MP4 data
       const message = new Blob([headerBuffer, encodedMP4Data]);
 
-      // Send the combined Blob directly
-      this.ws.send(message);
+      this.queueOrSendMessage(message);
     } catch (error) {
       console.error('Error sending WebSocket video chunk:', error);
     }
@@ -1438,8 +1561,10 @@ class WebSocketClient {
     if (this.videoChunkRecorder && this.videoChunkRecorder.state !== 'inactive') {
       return;
     }
+    this.sendJson({ type: 'RecordingChunkRecorderState', kind: 'video', state: 'starting' });
     if (!window.MediaRecorder) {
       console.warn('MediaRecorder is not available for video chunk recording');
+      this.sendJson({ type: 'RecordingChunkRecorderState', kind: 'video', state: 'failed', reason: 'media_recorder_unavailable' });
       return;
     }
 
@@ -1523,6 +1648,7 @@ class WebSocketClient {
         console.warn('Video chunk recorder requestData failed', error);
       }
     }, window.initialData.recordingChunkIntervalMs || 5000);
+    this.sendJson({ type: 'RecordingChunkRecorderState', kind: 'video', state: 'started' });
   }
 
   async stopVideoChunkRecording() {
@@ -1551,6 +1677,7 @@ class WebSocketClient {
       recorder.stop();
     });
     this.videoChunkRecorder = null;
+    this.sendJson({ type: 'RecordingChunkRecorderState', kind: 'video', state: 'stopped' });
     this.stopVideoChunkCanvasLoop();
     const resizeEvents = this.videoChunkResizeEvents.slice();
     console.log(
@@ -1586,7 +1713,7 @@ class WebSocketClient {
   }
 
   sendEncodedAudioChunk(encodedAudioData) {
-    if (this.ws.readyState !== WebSocket.OPEN || !this.mediaSendingEnabled) {
+    if (!this.mediaSendingEnabled) {
       return;
     }
 
@@ -1594,7 +1721,7 @@ class WebSocketClient {
       const headerBuffer = new ArrayBuffer(4);
       const headerView = new DataView(headerBuffer);
       headerView.setInt32(0, WebSocketClient.MESSAGE_TYPES.ENCODED_AUDIO_CHUNK, true);
-      this.ws.send(new Blob([headerBuffer, encodedAudioData]));
+      this.queueOrSendMessage(new Blob([headerBuffer, encodedAudioData]));
     } catch (error) {
       console.error('Error sending WebSocket audio chunk:', error);
     }
@@ -1604,9 +1731,11 @@ class WebSocketClient {
     if (this.audioChunkRecorder && this.audioChunkRecorder.state !== 'inactive') {
       return;
     }
+    this.sendJson({ type: 'RecordingChunkRecorderState', kind: 'audio', state: 'starting' });
     const audioStream = window.styleManager?.getMeetingAudioStream?.();
     if (!audioStream || audioStream.getAudioTracks().length === 0) {
       console.warn('No meeting audio stream available for audio chunk recording');
+      this.sendJson({ type: 'RecordingChunkRecorderState', kind: 'audio', state: 'failed', reason: 'meeting_audio_stream_unavailable' });
       return;
     }
 
@@ -1635,6 +1764,7 @@ class WebSocketClient {
         console.warn('Audio chunk recorder requestData failed', error);
       }
     }, window.initialData.recordingChunkIntervalMs || 5000);
+    this.sendJson({ type: 'RecordingChunkRecorderState', kind: 'audio', state: 'started' });
   }
 
   async stopAudioChunkRecording() {
@@ -1657,6 +1787,7 @@ class WebSocketClient {
       recorder.stop();
     });
     this.audioChunkRecorder = null;
+    this.sendJson({ type: 'RecordingChunkRecorderState', kind: 'audio', state: 'stopped' });
   }
 
   sendPerParticipantAudio(participantId, audioData) {
@@ -2021,34 +2152,119 @@ function createMessageDecoder(messageType) {
     };
 }
 
-const ws = new WebSocketClient();
-window.ws = ws;
-const userManager = new UserManager(ws);
-const captionManager = new CaptionManager(ws);
-const videoTrackManager = new VideoTrackManager(ws);
-const styleManager = new StyleManager();
-const receiverManager = new ReceiverManager();
-const chatMessageManager = new ChatMessageManager(ws);
-const participantSpeechStartStopManager = new ParticipantSpeechStartStopManager();
+// This script is installed with Page.addScriptToEvaluateOnNewDocument, so it
+// also runs on the SSO facade and Google's account pages before the browser
+// reaches Meet. Opening the bot websocket or installing RTC/fetch interceptors
+// on those non-Meet origins keeps Selenium's navigation stuck on the facade.
+// Define the shared bindings globally, but initialize their side effects only
+// once the new document is actually a Meet origin.
+const isGoogleMeetOrigin = ["meet.google.com", "www.meet.google.com"].includes(window.location.hostname);
+let ws = null;
+let userManager = null;
+let captionManager = null;
+let videoTrackManager = null;
+let styleManager = null;
+let receiverManager = null;
+let chatMessageManager = null;
+let participantSpeechStartStopManager = null;
 let rtpReceiverInterceptor = null;
-if (window.initialData.sendPerParticipantAudio || window.initialData.recordParticipantSpeechStartStopEvents) {
-    rtpReceiverInterceptor = new RTCRtpReceiverInterceptor((receiver, result, ...args) => {
-        receiverManager.updateContributingSources(receiver, result);
-    });
+const messageDecoders = {};
+const syncMeetingSpaceCollectionsUrl = "https://meet.google.com/$rpc/google.rtc.meetings.v1.MeetingSpaceService/SyncMeetingSpaceCollections";
+const userMap = new Map();
+const pendingMeetPeerTrackEvents = [];
+
+function applyMeetPeerTrack(event) {
+    if (!event?.track) {
+        return;
+    }
+    if (event.track.kind === 'audio') {
+        window.styleManager?.addAudioTrack(event.track);
+        if (window.initialData.sendPerParticipantAudio) {
+            handleAudioTrack(event);
+        }
+        return;
+    }
+    if (event.track.kind !== 'video') {
+        return;
+    }
+    window.styleManager?.addVideoTrack(event);
+    const firstStreamId = event.streams[0]?.id;
+    if (firstStreamId && window.videoTrackManager && window.userManager) {
+        const isScreenShare = userManager
+            .getCurrentUsersInMeetingWhoAreScreenSharing()
+            .some(user => userManager.getDeviceOutput(user.deviceId, DEVICE_OUTPUT_TYPE.VIDEO).streamId === firstStreamId);
+        videoTrackManager.upsertVideoTrack(event.track, firstStreamId, isScreenShare);
+        event.track.addEventListener('ended', () => {
+            videoTrackManager.deleteVideoTrack(event.track);
+        });
+    }
 }
 
-window.videoTrackManager = videoTrackManager;
-window.userManager = userManager;
-window.styleManager = styleManager;
-window.receiverManager = receiverManager;
-window.chatMessageManager = chatMessageManager;
-window.participantSpeechStartStopManager = participantSpeechStartStopManager;
-window.sendChatMessage = sendChatMessage;
-// Create decoders for all message types
-const messageDecoders = {};
-messageTypes.forEach(type => {
-    messageDecoders[type.name] = createMessageDecoder(type);
-});
+function captureMeetPeerTrack(event) {
+    if (!event?.track) {
+        return;
+    }
+    if (!window.styleManager) {
+        pendingMeetPeerTrackEvents.push(event);
+        return;
+    }
+    applyMeetPeerTrack(event);
+}
+
+function flushPendingMeetPeerTracks() {
+    const queued = pendingMeetPeerTrackEvents.splice(0);
+    queued.forEach(applyMeetPeerTrack);
+}
+
+const initializeMeetWebSocket = () => {
+    if (!ws) {
+        // Open the media socket only after Meet DOMContentLoaded. Constructing
+        // WebSocketClient earlier — even on meet.google.com — starts a loopback
+        // LNA handshake during document parse and aborts SSO facade → Meet
+        // navigation, leaving Selenium on /meetbot-sso/set-cookie. After DCL
+        // the document is committed; Chrome loopback policies plus
+        // waitForWebSocketOpen/reconnect cover the media handshake.
+        ws = new WebSocketClient();
+        window.ws = ws;
+    }
+};
+
+const initializeMeetDomRuntime = () => {
+        initializeMeetWebSocket();
+        userManager = new UserManager(ws);
+        captionManager = new CaptionManager(ws);
+        videoTrackManager = new VideoTrackManager(ws);
+        styleManager = new StyleManager();
+        receiverManager = new ReceiverManager();
+        chatMessageManager = new ChatMessageManager(ws);
+        participantSpeechStartStopManager = new ParticipantSpeechStartStopManager();
+        if (window.initialData.sendPerParticipantAudio || window.initialData.recordParticipantSpeechStartStopEvents) {
+            rtpReceiverInterceptor = new RTCRtpReceiverInterceptor((receiver, result, ...args) => {
+                receiverManager.updateContributingSources(receiver, result);
+            });
+        }
+
+        window.videoTrackManager = videoTrackManager;
+        window.userManager = userManager;
+        window.styleManager = styleManager;
+        window.receiverManager = receiverManager;
+        window.chatMessageManager = chatMessageManager;
+        window.participantSpeechStartStopManager = participantSpeechStartStopManager;
+        window.sendChatMessage = sendChatMessage;
+        // Create decoders for all message types
+        messageTypes.forEach(type => {
+            messageDecoders[type.name] = createMessageDecoder(type);
+        });
+        flushPendingMeetPeerTracks();
+};
+
+if (isGoogleMeetOrigin) {
+    if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", initializeMeetDomRuntime, { once: true });
+    } else {
+        initializeMeetDomRuntime();
+    }
+}
 
 function base64ToUint8Array(base64) {
     const binaryString = atob(base64);
@@ -2059,20 +2275,22 @@ function base64ToUint8Array(base64) {
     return bytes;
 }
 
-const syncMeetingSpaceCollectionsUrl = "https://meet.google.com/$rpc/google.rtc.meetings.v1.MeetingSpaceService/SyncMeetingSpaceCollections";
-const userMap = new Map();
-new FetchInterceptor(async (response) => {
-    if (response.url === syncMeetingSpaceCollectionsUrl) {
-        const responseText = await response.text();
-        const decodedData = base64ToUint8Array(responseText);
-        const userInfoListResponse = messageDecoders['UserInfoListResponse'](decodedData);
-        const userInfoList = userInfoListResponse.userInfoListWrapperWrapper?.userInfoListWrapper?.userInfoList || [];
-        console.log('userInfoList', userInfoList);
-        if (userInfoList.length > 0) {
-            userManager.newUsersListSynced(userInfoList);
-        }
-    }
-});
+if (isGoogleMeetOrigin) {
+    document.addEventListener("DOMContentLoaded", () => {
+        new FetchInterceptor(async (response) => {
+            if (response.url === syncMeetingSpaceCollectionsUrl) {
+                const responseText = await response.text();
+                const decodedData = base64ToUint8Array(responseText);
+                const userInfoListResponse = messageDecoders['UserInfoListResponse'](decodedData);
+                const userInfoList = userInfoListResponse.userInfoListWrapperWrapper?.userInfoListWrapper?.userInfoList || [];
+                console.log('userInfoList', userInfoList);
+                if (userInfoList.length > 0) {
+                    userManager.newUsersListSynced(userInfoList);
+                }
+            }
+        });
+    });
+}
 
 const handleCollectionEvent = (event) => {
   const decodedData = pako.inflate(new Uint8Array(event.data));
@@ -2392,6 +2610,12 @@ const handleAudioTrack = async (event) => {
   }
 };
 
+// Patch RTCPeerConnection as soon as this Meet document starts parsing.
+// Delaying the patch until DOMContentLoaded lets Meet create peer connections
+// first, so later mix/recording sees an empty audio track list. Opening the
+// media WebSocket still waits for DOMContentLoaded so SSO navigation is not
+// blocked.
+if (isGoogleMeetOrigin) {
 new RTCInterceptor({
     onPeerConnectionCreate: (peerConnection) => {
         console.log('New RTCPeerConnection created:', peerConnection);
@@ -2411,28 +2635,7 @@ new RTCInterceptor({
                 trackKind: event.track.kind,
                 streams: event.streams,
             });
-            // We need to capture every audio track in the meeting,
-            // but we don't need to do anything with the video tracks
-            if (event.track.kind === 'audio') {
-                window.styleManager.addAudioTrack(event.track);
-                if (window.initialData.sendPerParticipantAudio) {
-                    handleAudioTrack(event);
-                }
-            }
-            if (event.track.kind === 'video') {
-                window.styleManager.addVideoTrack(event);
-                // Register in videoTrackManager for canvas-based muxed chunk recording
-                const firstStreamId = event.streams[0]?.id;
-                if (firstStreamId) {
-                    const isScreenShare = userManager
-                        .getCurrentUsersInMeetingWhoAreScreenSharing()
-                        .some(user => userManager.getDeviceOutput(user.deviceId, DEVICE_OUTPUT_TYPE.VIDEO).streamId === firstStreamId);
-                    videoTrackManager.upsertVideoTrack(event.track, firstStreamId, isScreenShare);
-                    event.track.addEventListener('ended', () => {
-                        videoTrackManager.deleteVideoTrack(event.track);
-                    });
-                }
-            }
+            captureMeetPeerTrack(event);
         });
 
         /*
@@ -2509,6 +2712,7 @@ new RTCInterceptor({
         }
     }
 });
+}
 
 function setClosedCaptionsLanguage(language) {
     // Look for an <li> element whose data-value attribute matches the language code
@@ -2765,15 +2969,20 @@ function turnOffScreenshare() {
 
 
 
-// BotOutputManager is defined in shared_chromedriver_payload.js
+// BotOutputManager is defined in shared_chromedriver_payload.js. It opens the
+// runtime media plumbing, so defer it until the document is the Meet origin.
+let botOutputManager = null;
+if (isGoogleMeetOrigin) {
+    document.addEventListener("DOMContentLoaded", () => {
+        botOutputManager = new BotOutputManager({
+            turnOnWebcam: turnOnCamera,
+            turnOffWebcam: turnOffCamera,
+            turnOnScreenshare: turnOnScreenshare,
+            turnOffScreenshare: turnOffScreenshare,
+            turnOnMic: turnOnMic,
+            turnOffMic: turnOffMic,
+        });
 
-botOutputManager = new BotOutputManager({
-    turnOnWebcam: turnOnCamera,
-    turnOffWebcam: turnOffCamera,
-    turnOnScreenshare: turnOnScreenshare,
-    turnOffScreenshare: turnOffScreenshare,
-    turnOnMic: turnOnMic,
-    turnOffMic: turnOffMic,
-});
-
-window.botOutputManager = botOutputManager;
+        window.botOutputManager = botOutputManager;
+    });
+}

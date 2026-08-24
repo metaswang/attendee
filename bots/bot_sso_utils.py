@@ -35,16 +35,23 @@ from bots.models import Bot, GoogleMeetBotLogin, GoogleWorkspaceSsoSigningCertif
 logger = logging.getLogger(__name__)
 
 
-def get_google_meet_set_cookie_url(session_id):
+def _google_meet_sso_url(path: str, reverse_name: str) -> str:
     sso_facade_base_url = os.getenv("GOOGLE_MEET_SSO_FACADE_BASE_URL", "").strip().rstrip("/")
-    base_url = (
-        f"{sso_facade_base_url}/set-cookie"
-        if sso_facade_base_url
-        else build_site_url(reverse("bot_sso:google_meet_set_cookie"))
-    )
+    if sso_facade_base_url:
+        return f"{sso_facade_base_url}/{path.lstrip('/')}"
+    return build_site_url(reverse(reverse_name))
+
+
+def get_google_meet_set_cookie_url(session_id):
+    base_url = _google_meet_sso_url("set-cookie", "bot_sso:google_meet_set_cookie")
     query_params = urlencode({"session_id": session_id})
     google_meet_set_cookie_url = f"{base_url}?{query_params}"
     return google_meet_set_cookie_url
+
+
+def get_google_meet_sign_in_url() -> str:
+    """Return the trusted public IdP endpoint used by Google's SAML redirect."""
+    return _google_meet_sso_url("sign-in", "bot_sso:google_meet_sign_in")
 
 
 def create_google_meet_sign_in_session(

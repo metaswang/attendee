@@ -45,6 +45,8 @@ class GoogleMeetSetCookieView(View):
         response.set_cookie(
             "google_meet_sign_in_session_id",
             session_id,
+            max_age=60 * 30,
+            path="/",
             secure=True,
             httponly=True,
             samesite="Lax",

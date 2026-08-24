@@ -101,8 +101,10 @@ class WebBotAdapter(BotAdapter):
         self.left_meeting = False
         self.was_removed_from_meeting = False
         self.cleaned_up = False
+        self._meeting_end_signal_sent = False
 
         self.websocket_port = None
+        self.websocket_host = os.getenv("BROWSER_MEDIA_WEBSOCKET_HOST", "127.0.0.1").strip() or "127.0.0.1"
         self.websocket_server = None
         self.websocket_thread = None
         self.last_websocket_message_processed_time = None
@@ -153,6 +155,7 @@ class WebBotAdapter(BotAdapter):
         self.last_media_message_processed_time = time.time()
         if len(message) > 4:
             encoded_audio_data = message[4:]
+            logger.info("encoded audio data length %s", len(encoded_audio_data))
             self.add_encoded_audio_chunk_callback(encoded_audio_data)
 
     def get_participant(self, participant_id):
@@ -320,7 +323,7 @@ class WebBotAdapter(BotAdapter):
         self.stop_media_sending_for_meeting_end()
         self.left_meeting = True
         self.was_removed_from_meeting = True
-        self.send_message_callback({"message": self.Messages.MEETING_ENDED})
+        self._send_meeting_ended_message()
 
     def handle_meeting_ended(self):
         logger.info(
@@ -331,7 +334,23 @@ class WebBotAdapter(BotAdapter):
         )
         self.stop_media_sending_for_meeting_end()
         self.left_meeting = True
-        self.send_message_callback({"message": self.Messages.MEETING_ENDED})
+        self._send_meeting_ended_message()
+
+    def _send_meeting_ended_message(self, **metadata):
+        """Send the terminal adapter message at most once per bot run."""
+        if self._meeting_end_signal_sent:
+            logger.info("Meeting end signal already sent; ignoring duplicate metadata=%s", metadata)
+            return False
+
+        self._meeting_end_signal_sent = True
+        payload = {"message": self.Messages.MEETING_ENDED}
+        payload.update(metadata)
+        self.send_message_callback(payload)
+        return True
+
+    def check_meeting_end_navigation(self):
+        """Provider adapters may override this with a browser lifecycle check."""
+        return None
 
     def stop_media_sending_for_meeting_end(self):
         if not self.driver:
@@ -339,8 +358,17 @@ class WebBotAdapter(BotAdapter):
 
         try:
             logger.info("disable media sending due to meeting end")
-            disable_result = self.driver.execute_script("return window.ws?.disableMediaSending?.();")
-            logger.info("disable media sending due to meeting end invoked result_type=%s", type(disable_result).__name__)
+            disable_result = self.driver.execute_async_script(
+                """
+                const done = arguments[arguments.length - 1];
+                const disable = window.ws?.disableMediaSending?.();
+                Promise.resolve(disable).then(
+                    () => done({ok: true}),
+                    (error) => done({ok: false, error: String(error?.message || error)})
+                );
+                """
+            )
+            logger.info("disable media sending due to meeting end completed result=%s", disable_result)
         except Exception as e:
             logger.warning(f"Error disabling media sending after meeting end: {e}")
 
@@ -464,6 +492,7 @@ class WebBotAdapter(BotAdapter):
 
     def handle_websocket(self, websocket):
         audio_format = None
+        logger.info("Browser media websocket connected")
 
         try:
             for message in websocket:
@@ -577,24 +606,27 @@ class WebBotAdapter(BotAdapter):
         except Exception as e:
             logger.info(f"Websocket error: {e}")
             raise e
+        finally:
+            logger.info("Browser media websocket disconnected")
 
     def run_websocket_server(self):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
         port = self.get_websocket_port()
+        host = self.websocket_host
         max_retries = 10
 
         for attempt in range(max_retries):
             try:
                 self.websocket_server = serve(
                     self.handle_websocket,
-                    "localhost",
+                    host,
                     port,
                     compression=None,
                     max_size=None,
                 )
-                logger.info(f"Websocket server started on ws://localhost:{port}")
+                logger.info(f"Websocket server started on ws://{host}:{port}")
                 self.websocket_port = port
                 self.websocket_server.serve_forever()
                 break
@@ -781,6 +813,7 @@ class WebBotAdapter(BotAdapter):
 
         initial_data_code = (
             "window.initialData = {"
+            f"websocketHost: {json.dumps(self.websocket_host)}, "
             f"websocketPort: {self.websocket_port}, "
             f"videoFrameWidth: {self.video_frame_size[0]}, "
             f"videoFrameHeight: {self.video_frame_size[1]}, "
@@ -987,7 +1020,27 @@ class WebBotAdapter(BotAdapter):
         self.recording_permission_granted_at = time.time()
         self.send_message_callback({"message": self.Messages.BOT_RECORDING_PERMISSION_GRANTED})
         self.send_frames = True
-        self.driver.execute_script("window.ws?.enableMediaSending();")
+        try:
+            enable_result = self.driver.execute_async_script(
+                """
+                const done = arguments[arguments.length - 1];
+                if (!window.ws?.enableMediaSending) {
+                    done({ok: false, error: "browser media websocket is not ready"});
+                    return;
+                }
+                const enable = window.ws.enableMediaSending();
+                Promise.resolve(enable).then(
+                    (result) => done({ok: true, result}),
+                    (error) => done({ok: false, error: String(error?.message || error)})
+                );
+                """
+            )
+            if not isinstance(enable_result, dict) or not enable_result.get("ok"):
+                raise RuntimeError(f"Browser media sending did not start: {enable_result!r}")
+            logger.info("enable media sending completed result=%s", enable_result)
+        except Exception:
+            logger.exception("Failed to start browser media sending after recording permission was granted")
+            raise
         self.first_buffer_timestamp_ms_offset = self.driver.execute_script("return performance.timeOrigin;")
 
         if self.start_recording_screen_callback:
@@ -1012,19 +1065,16 @@ class WebBotAdapter(BotAdapter):
         mhtml_file_path_right_before_leave = None
         try:
             logger.info("disable media sending")
-            self.driver.execute_script("window.ws?.disableMediaSending();")
+            self.stop_media_sending_for_meeting_end()
 
             screenshot_path_right_before_leave, mhtml_file_path_right_before_leave, _ = self.capture_screenshot_and_mhtml_file()
             self.click_leave_button()
         except Exception as e:
             logger.warning(f"Error during leave: {e}")
         finally:
-            self.send_message_callback(
-                {
-                    "message": self.Messages.MEETING_ENDED,
-                    "mhtml_file_path": mhtml_file_path_right_before_leave,
-                    "screenshot_path": screenshot_path_right_before_leave,
-                }
+            self._send_meeting_ended_message(
+                mhtml_file_path=mhtml_file_path_right_before_leave,
+                screenshot_path=screenshot_path_right_before_leave,
             )
             self.left_meeting = True
 
@@ -1040,7 +1090,7 @@ class WebBotAdapter(BotAdapter):
 
         try:
             logger.info("disable media sending")
-            self.driver.execute_script("window.ws?.disableMediaSending();")
+            self.stop_media_sending_for_meeting_end()
         except Exception as e:
             logger.warning(f"Error during media sending disable: {e}")
 

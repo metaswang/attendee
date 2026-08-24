@@ -41,6 +41,8 @@ COPYFILE_DISABLE=1 tar -C "$REPO_ROOT" \
   --exclude='__pycache__' \
   --exclude='.pytest_cache' \
   --exclude='node_modules' \
+  --exclude='.env' \
+  --exclude='.env.*' \
   -czf "$archive_file" \
   .
 
@@ -89,8 +91,8 @@ remote_env=(
   "ATTENDEE_REPO_URL=${REMOTE_REPO_DIR}"
   "BOT_RUNTIME_IMAGE=${BOT_RUNTIME_IMAGE}"
   "BOT_RUNTIME_IMAGE_ALIAS=${BOT_RUNTIME_IMAGE_ALIAS}"
-  "BUILD_RUNTIME_IMAGE=false"
-  "PULL_RUNTIME_IMAGE=true"
+  "BUILD_RUNTIME_IMAGE=${BUILD_RUNTIME_IMAGE}"
+  "PULL_RUNTIME_IMAGE=${PULL_RUNTIME_IMAGE}"
   "DOCKER_PLATFORM=${DOCKER_PLATFORM}"
   "PYTHON_BIN=${PYTHON_BIN}"
 )

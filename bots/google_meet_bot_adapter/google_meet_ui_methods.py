@@ -1,17 +1,19 @@
+import json
 import logging
 import os
+import re
 import time
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urljoin, urlparse
 
 import requests
-from django.conf import settings
-from selenium.common.exceptions import ElementNotInteractableException, NoSuchElementException, TimeoutException
+from selenium.common.exceptions import ElementNotInteractableException, NoSuchElementException, StaleElementReferenceException, TimeoutException, WebDriverException
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-from bots.bot_sso_utils import get_google_meet_set_cookie_url
+from bots.bot_sso_utils import get_google_meet_set_cookie_url, get_google_meet_sign_in_url
 from bots.models import RecordingViews
 from bots.web_bot_adapter.ui_methods import UiCouldNotClickElementException, UiCouldNotJoinMeetingWaitingForHostException, UiCouldNotJoinMeetingWaitingRoomTimeoutException, UiCouldNotLocateElementException, UiLoginAttemptFailedException, UiLoginRequiredException, UiMeetingNotFoundException, UiRequestToJoinDeniedException, UiRetryableExpectedException
 
@@ -24,6 +26,410 @@ class UiGoogleBlockingUsException(UiRetryableExpectedException):
 
 
 class GoogleMeetUIMethods:
+    # This spelling is Google's documented SSO identity-confirmation bypass.
+    # In particular, ``AllowedDomains`` is one token: a hyphenated variant is
+    # silently ignored by Google and leaves an ephemeral bot profile stuck on
+    # the interactive confirmation page after ACS.
+    _GOOGLE_ALLOWED_DOMAINS_HEADER = "X-GoogApps-AllowedDomains"
+    _GOOGLE_SSO_REDIRECT_HOSTS = frozenset({"www.google.com", "accounts.google.com"})
+    _GOOGLE_SSO_MAX_REDIRECTS = 5
+    _GOOGLE_SSO_HANDOFF_TIMEOUT_SECONDS = 60
+    _GOOGLE_SSO_MEET_STABILITY_SECONDS = 2.0
+    _GOOGLE_SSO_INTERSTITIAL_RETRY_SECONDS = 2.0
+    _GOOGLE_SSO_DIAGNOSTIC_HOSTS = frozenset({"www.google.com", "accounts.google.com", "mail.google.com"})
+    _GOOGLE_SSO_NETWORK_DIAGNOSTIC_LIMIT = 20
+    _COOKIE_ATTRIBUTE_NAMES = frozenset({"domain", "expires", "httponly", "max-age", "partitioned", "path", "priority", "samesite", "secure"})
+    _GOOGLE_SSO_ENTRYPOINT_MEET = "meet"
+    _GOOGLE_SSO_ENTRYPOINT_DOMAIN_SERVICE_LOGIN = "domain_service_login"
+    # The slash root redirects to the public Meet landing page when the
+    # profile is unauthenticated; ``/home`` jumps straight into the app and
+    # can land on a generic account identifier form without a Meet SSO link.
+    _GOOGLE_MEET_HOME_URL = "https://meet.google.com/"
+    _GOOGLE_MEET_SSO_SESSION_COOKIE = "google_meet_sign_in_session_id"
+    _GOOGLE_MEET_HOSTS = frozenset({"meet.google.com", "www.meet.google.com"})
+    _GOOGLE_MEET_GREEN_ROOM_LOADING_SELECTOR = "div[jsname='OQ2Y6']"
+    _GOOGLE_MEET_GREEN_ROOM_LOADING_MARKERS = (
+        "getting ready",
+        "you'll be able to join in just a moment",
+    )
+    _GOOGLE_PRODUCT_SIGN_IN_LINK_SELECTORS = (
+        "a[href*='accounts.google.com/ServiceLogin']",
+        "a[href*='accounts.google.com/v3/signin']",
+        "a[href*='www.google.com/ServiceLogin']",
+        "a[href*='www.google.com/v3/signin']",
+    )
+    _GOOGLE_IDENTIFIER_CONTINUE_SELECTORS = (
+        "#identifierNext",
+        "button[jsname='LgbsSe']",
+        "[role='button'][jsname='LgbsSe']",
+        "button[type='submit']",
+        "input[type='submit']",
+    )
+    _GOOGLE_SAML_CONFIRMATION_PATH_SUFFIX = "/samlconfirmaccount"
+    _GOOGLE_SSO_CONTINUE_SELECTORS = (
+        "#confirm",
+        "button[jsname='LgbsSe']",
+        "[role='button'][jsname='LgbsSe']",
+        "button[type='submit']",
+        "input[type='submit']",
+    )
+    _GOOGLE_SSO_SKIP_SELECTORS = (
+        "#skip",
+        "[data-action='skip']",
+        "[data-value='skip']",
+        "[id*='skip']",
+        "[href*='skip']",
+    )
+    # These strings are a fallback only. Google normally exposes the stable
+    # jsname/data attributes above; the fallback keeps the flow usable when a
+    # localized account page omits them. It is intentionally scoped to the
+    # identity-confirmation/passkey pages, never used as a general Meet locator.
+    _GOOGLE_SSO_CONTINUE_LABELS = frozenset(
+        {
+            "continue",
+            "weiter",
+            "continuer",
+            "continuar",
+            "continua",
+            "avançar",
+            "doorgaan",
+            "продолжить",
+            "继续",
+            "继续操作",
+            "下一步",
+        }
+    )
+    _GOOGLE_SSO_SKIP_LABELS = frozenset(
+        {
+            "not now",
+            "jetzt nicht",
+            "pas maintenant",
+            "ahora no",
+            "agora não",
+            "non ora",
+            "überspringen",
+            "skip",
+            "暂时不要",
+            "暂不",
+            "以后再说",
+            "稍后",
+        }
+    )
+    _GOOGLE_SSO_IDENTITY_MARKERS = (
+        "verify it's you",
+        "verify it’s you",
+        "verify that it's you",
+        "verify that it’s you",
+        "verify your identity",
+        "bestätige, dass du es bist",
+        "bestätigen sie, dass sie es sind",
+        "vérifiez que c'est vous",
+        "verifica que eres tú",
+        "验证是你",
+    )
+    _GOOGLE_SSO_PASSKEY_MARKERS = (
+        "passkey",
+        "pass-key",
+        "webauthn",
+        "simplify your sign-in",
+        "simplify your sign in",
+        "set up a passkey",
+        "use a passkey",
+    )
+
+    @staticmethod
+    def _normalized_workspace_domain(value):
+        """Return a header-safe Workspace domain, or ``None`` when invalid."""
+        if not isinstance(value, str):
+            return None
+
+        domain = value.strip().lower().rstrip(".")
+        if not domain or any(character in domain for character in (",", "\r", "\n", "/", "\\", ":")):
+            return None
+        return domain
+
+    def configure_google_workspace_sso_allowed_domains_header(self) -> bool:
+        """Restrict this browser's Google sign-in flow to the assigned Workspace domain.
+
+        Google displays an identity-confirmation interstitial once per account and
+        Chrome device for SAML SSO sign-ins. Bot Chrome instances intentionally run
+        in isolated ephemeral profiles, so they do not retain that per-device approval.
+        Google's documented ``X-GoogApps-AllowedDomains`` mechanism both limits
+        the sign-in to the verified Workspace domain and lets a managed caller opt
+        out of that otherwise interactive interstitial.
+
+        The assigned domain comes from the server-side SSO session. Operators can
+        disable the behavior, or require an explicit allowlist, with environment
+        variables without baking a tenant-specific domain into the bot runtime.
+        """
+        # Every bot gets a new Chrome profile, so Google's otherwise once-per-
+        # device SAML identity confirmation is not suitable for this unattended
+        # flow. Google documents this header as the organization-level way to
+        # suppress that confirmation. The value is still restricted to the
+        # server-validated Workspace domain and operators retain a fail-closed
+        # rollback switch.
+        # This header is an opt-in experiment/rollback only. In the current
+        # Google account flow it can contaminate the post-identifier SAML
+        # navigation and Meet's cross-origin assets, so production defaults to
+        # the normal browser flow with no extra header.
+        enabled = os.getenv("GOOGLE_MEET_SSO_ALLOWED_DOMAINS_HEADER_ENABLED", "false").strip().lower()
+        if enabled not in {"1", "true", "yes", "on"}:
+            logger.info("Google Workspace allowed-domains header is disabled by configuration")
+            return False
+
+        session = self.google_meet_bot_login_session or {}
+        login_domain = self._normalized_workspace_domain(session.get("login_domain"))
+        if login_domain is None:
+            logger.warning("Skipping Google Workspace allowed-domains header because the allocated login domain is invalid")
+            return False
+
+        configured_domains = os.getenv("GOOGLE_MEET_SSO_ALLOWED_DOMAINS", "").strip()
+        if configured_domains:
+            allowed_domains = []
+            for configured_domain in configured_domains.split(","):
+                normalized_domain = self._normalized_workspace_domain(configured_domain)
+                if normalized_domain is None:
+                    logger.warning("Skipping Google Workspace allowed-domains header because its configured allowlist is invalid")
+                    return False
+                if normalized_domain not in allowed_domains:
+                    allowed_domains.append(normalized_domain)
+            if login_domain not in allowed_domains:
+                logger.warning("Skipping Google Workspace allowed-domains header because the allocated login domain is not allowlisted")
+                return False
+        else:
+            # The SSO allocator has already verified this domain against an active
+            # tenant, so the narrowest safe default is the account's own domain.
+            allowed_domains = [login_domain]
+
+        try:
+            self.driver.execute_cdp_cmd("Network.enable", {})
+            self.driver.execute_cdp_cmd(
+                "Network.setExtraHTTPHeaders",
+                {"headers": {self._GOOGLE_ALLOWED_DOMAINS_HEADER: ",".join(allowed_domains)}},
+            )
+        except Exception as exc:
+            raise UiLoginAttemptFailedException(
+                "Could not configure the Google Workspace SSO allowed-domains header",
+                "configure_google_workspace_sso_allowed_domains_header",
+                exc,
+            ) from exc
+
+        logger.info("Configured Google Workspace allowed-domains header for the allocated SSO login")
+        return True
+
+    def _safe_browser_location_for_log(self) -> str:
+        """Return only the origin and path, never query parameters or fragments."""
+        try:
+            location = urlparse(self.driver.current_url)
+            if location.scheme and location.netloc:
+                return f"{location.scheme}://{location.netloc}{location.path}"
+        except Exception:
+            pass
+        return "<unavailable>"
+
+    @staticmethod
+    def _safe_parameter_names(raw_keys):
+        names = []
+        for key in raw_keys:
+            if re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", key):
+                names.append(key)
+            else:
+                names.append("<redacted>")
+        return sorted(set(names))[:12]
+
+    @classmethod
+    def _safe_network_url_metadata(cls, value):
+        """Return URL metadata suitable for logs, without query values or fragments."""
+        try:
+            parsed = urlparse(str(value or ""))
+        except Exception:
+            return None
+
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return None
+
+        try:
+            raw_query_keys = [key for key, _ in parse_qsl(parsed.query, keep_blank_values=True)]
+        except ValueError:
+            raw_query_keys = []
+
+        return {
+            "host": parsed.hostname.lower(),
+            "path": parsed.path or "/",
+            "query_key_count": len(raw_query_keys),
+            "query_keys": cls._safe_parameter_names(raw_query_keys),
+        }
+
+    @classmethod
+    def _safe_network_request_metadata(cls, request):
+        if not isinstance(request, dict):
+            return None
+        url = cls._safe_network_url_metadata(request.get("url"))
+        if url is None:
+            return None
+
+        method = str(request.get("method") or "").upper()[:12]
+        metadata = {"method": method, "url": url}
+        if method == "POST" and isinstance(request.get("postData"), str):
+            try:
+                raw_post_data_keys = [key for key, _ in parse_qsl(request["postData"], keep_blank_values=True)]
+            except ValueError:
+                raw_post_data_keys = []
+            metadata["post_data_key_count"] = len(raw_post_data_keys)
+            metadata["post_data_keys"] = cls._safe_parameter_names(raw_post_data_keys)
+        return metadata
+
+    @staticmethod
+    def _header_value(headers, name):
+        if not isinstance(headers, dict):
+            return None
+        for header_name, header_value in headers.items():
+            if str(header_name).lower() == name.lower():
+                return header_value
+        return None
+
+    @classmethod
+    def _set_cookie_names(cls, value):
+        if isinstance(value, (list, tuple)):
+            raw_value = ", ".join(str(item) for item in value)
+        else:
+            raw_value = str(value or "")
+
+        names = re.findall(r"(?:^|[,;]\\s*)([!#$%&'*+.^_`|~0-9A-Za-z-]+)=", raw_value)
+        return sorted({name for name in names if name.lower() not in cls._COOKIE_ATTRIBUTE_NAMES})[:12]
+
+    def _is_google_workspace_sso_diagnostic_url(self, value) -> bool:
+        metadata = self._safe_network_url_metadata(value)
+        if metadata is None:
+            return False
+        if metadata["host"] in self._GOOGLE_SSO_DIAGNOSTIC_HOSTS:
+            return True
+
+        try:
+            configured_idp_host = urlparse(get_google_meet_sign_in_url()).hostname
+        except Exception:
+            configured_idp_host = None
+        return bool(configured_idp_host and metadata["host"] == configured_idp_host.lower())
+
+    def log_google_workspace_sso_network_diagnostics(self) -> None:
+        """Log a bounded SSO response summary for an explicitly requested debug run.
+
+        Chrome performance logs can contain request URLs, redirect locations, and
+        Set-Cookie headers. This method intentionally keeps only response status,
+        host/path, query *key names*, redirect metadata, and cookie *names*.
+        Values such as SAML assertions, cookies, state, request headers, and
+        email addresses never enter application logs. For the allowed-domains
+        mitigation we additionally record only whether Chrome reported the
+        documented header as present on a request, never its value.
+        """
+        if not getattr(self, "google_workspace_sso_network_diagnostics_enabled", False):
+            return
+
+        try:
+            raw_entries = self.driver.get_log("performance")
+        except Exception as exc:
+            logger.warning("Google Workspace SSO network diagnostics were unavailable: %s", exc)
+            return
+
+        responses_by_request_id = {}
+        headers_by_request_id = {}
+        latest_requests_by_request_id = {}
+        request_header_observed_ids = set()
+        allowed_domains_header_present_by_request_id = {}
+        for raw_entry in raw_entries:
+            try:
+                message = json.loads(raw_entry.get("message", "{}"))["message"]
+                method = message.get("method")
+                params = message.get("params", {})
+            except (AttributeError, KeyError, TypeError, ValueError):
+                continue
+
+            request_id = params.get("requestId")
+            if method == "Network.responseReceived":
+                response = params.get("response", {})
+                if request_id and self._is_google_workspace_sso_diagnostic_url(response.get("url")):
+                    responses_by_request_id.setdefault(request_id, []).append(
+                        {
+                            "status": int(response.get("status", 0)),
+                            "url": self._safe_network_url_metadata(response.get("url")),
+                            "headers": response.get("headers") or {},
+                            "request": latest_requests_by_request_id.get(request_id),
+                        }
+                    )
+            elif method == "Network.requestWillBeSent":
+                redirect_response = params.get("redirectResponse") or {}
+                if request_id and self._is_google_workspace_sso_diagnostic_url(redirect_response.get("url")):
+                    responses_by_request_id.setdefault(request_id, []).append(
+                        {
+                            "status": int(redirect_response.get("status", 0)),
+                            "url": self._safe_network_url_metadata(redirect_response.get("url")),
+                            "headers": redirect_response.get("headers") or {},
+                            "request": latest_requests_by_request_id.get(request_id),
+                        }
+                    )
+                request = self._safe_network_request_metadata(params.get("request"))
+                if request_id and request and self._is_google_workspace_sso_diagnostic_url(params.get("request", {}).get("url")):
+                    latest_requests_by_request_id[request_id] = request
+            elif method == "Network.responseReceivedExtraInfo" and request_id:
+                headers_by_request_id.setdefault(request_id, []).append(params.get("headers") or {})
+            elif method == "Network.requestWillBeSentExtraInfo" and request_id:
+                request_header_observed_ids.add(request_id)
+                allowed_domains_header_present_by_request_id[request_id] = (
+                    self._header_value(params.get("headers") or {}, self._GOOGLE_ALLOWED_DOMAINS_HEADER) is not None
+                )
+
+        summaries = []
+        for request_id, responses in responses_by_request_id.items():
+            extra_headers = headers_by_request_id.get(request_id, [])
+            for response_index, response in enumerate(responses):
+                headers = response["headers"] or (extra_headers[response_index] if response_index < len(extra_headers) else {})
+                summary = {"status": response["status"], "url": response["url"]}
+                if response["request"]:
+                    request_metadata = dict(response["request"])
+                    if request_id in request_header_observed_ids:
+                        request_metadata["allowed_domains_header_present"] = allowed_domains_header_present_by_request_id.get(request_id, False)
+                    summary["request"] = request_metadata
+                location = self._header_value(headers, "location")
+                if location:
+                    summary["redirect"] = self._safe_network_url_metadata(location)
+                cookie_names = self._set_cookie_names(self._header_value(headers, "set-cookie"))
+                if cookie_names:
+                    summary["set_cookie_names"] = cookie_names
+                summaries.append(summary)
+                if len(summaries) >= self._GOOGLE_SSO_NETWORK_DIAGNOSTIC_LIMIT:
+                    break
+            if len(summaries) >= self._GOOGLE_SSO_NETWORK_DIAGNOSTIC_LIMIT:
+                break
+
+        if summaries:
+            logger.warning("Google Workspace SSO network diagnostics: %s", json.dumps(summaries, sort_keys=True, separators=(",", ":")))
+        else:
+            logger.warning("Google Workspace SSO network diagnostics captured no matching Google or configured-IdP responses")
+
+    def log_google_login_timeout_diagnostics(self) -> None:
+        """Log bounded, privacy-safe page state to diagnose non-interactive SSO failures."""
+        try:
+            title = self.driver.title or ""
+            visible_text = self.driver.find_element(By.TAG_NAME, "body").text or ""
+            visible_text = " ".join(visible_text.split())
+            visible_text = re.sub(r"\b[\w.+-]+@[\w.-]+\.\w+\b", "<redacted-email>", visible_text)
+            visible_text = visible_text[:500]
+        except Exception as exc:
+            logger.warning(
+                "Google login timeout page diagnostics could not be collected (location=%s error=%s)",
+                self._safe_browser_location_for_log(),
+                exc,
+            )
+        else:
+            logger.warning(
+                "Google login timeout page diagnostics (location=%s title=%r visible_text=%r)",
+                self._safe_browser_location_for_log(),
+                title[:200],
+                visible_text,
+            )
+        finally:
+            self.log_google_workspace_sso_network_diagnostics()
+
     def locate_element(self, step, condition, wait_time_seconds=60):
         try:
             element = WebDriverWait(self.driver, wait_time_seconds).until(condition)
@@ -214,6 +620,61 @@ class GoogleMeetUIMethods:
         if join_button:
             return True
         return False
+
+    def google_meet_green_room_is_loading(self) -> bool:
+        """Return whether Meet is still initializing its pre-join preview.
+
+        ``OQ2Y6`` is a Meet Green Room loading layer. It is deliberately kept
+        out of the Google SSO control flow: while it is active, the correct
+        action is to wait for Meet initialization rather than remove the layer
+        or activate an underlying control through the keyboard/DOM.
+        """
+        try:
+            loading_elements = self.driver.find_elements(
+                By.CSS_SELECTOR,
+                self._GOOGLE_MEET_GREEN_ROOM_LOADING_SELECTOR,
+            )
+            for element in loading_elements:
+                if not element.is_displayed():
+                    continue
+                try:
+                    active_state = element.get_attribute("data-active")
+                except (StaleElementReferenceException, WebDriverException):
+                    active_state = None
+                if active_state != "false":
+                    return True
+
+            body_text = self.driver.find_element(By.TAG_NAME, "body").text or ""
+        except (NoSuchElementException, StaleElementReferenceException, WebDriverException):
+            return False
+
+        normalized_text = self._normalized_google_control_text(body_text)
+        return all(marker in normalized_text for marker in self._GOOGLE_MEET_GREEN_ROOM_LOADING_MARKERS)
+
+    def wait_for_google_meet_preview_initialization(self, wait_time_seconds=60):
+        """Wait for Meet's Green Room to finish before touching join controls."""
+        logger.info("Waiting for Google Meet pre-join preview initialization...")
+        try:
+            WebDriverWait(self.driver, wait_time_seconds).until(
+                lambda driver: not self.google_meet_green_room_is_loading()
+            )
+        except TimeoutException as exc:
+            try:
+                body_text = " ".join((self.driver.find_element(By.TAG_NAME, "body").text or "").split())[:500]
+            except (NoSuchElementException, StaleElementReferenceException, WebDriverException):
+                body_text = ""
+            logger.warning(
+                "Google Meet pre-join preview remained in its loading state (location=%s body=%r)",
+                self._safe_browser_location_for_log(),
+                body_text,
+            )
+            raise UiCouldNotLocateElementException(
+                "Google Meet pre-join preview did not finish initializing",
+                "google_meet_preview_initialization",
+                exc,
+            ) from exc
+
+        logger.info("Google Meet pre-join preview initialization completed")
 
     def retrieve_name_input_element(self):
         return WebDriverWait(self.driver, 1).until(EC.presence_of_element_located((By.CSS_SELECTOR, 'input[type="text"][aria-label="Your name"]')))
@@ -573,7 +1034,9 @@ class GoogleMeetUIMethods:
 
     def login_to_google_meet_account_with_retries(self):
         # Blanket guard against transient errors on Google's side
-        num_attempts = 3
+        # An explicitly requested debug run should preserve the first failure's
+        # network trace rather than retrying the same SSO transaction repeatedly.
+        num_attempts = 1 if getattr(self, "google_workspace_sso_network_diagnostics_enabled", False) else 3
         for attempt_index in range(num_attempts):
             try:
                 self.login_to_google_meet_account()
@@ -585,61 +1048,682 @@ class GoogleMeetUIMethods:
                 logger.warning(f"Error logging in to Google Meet account. Clearing cookies and retrying... Attempts remaining: {num_attempts - attempt_index - 1}")
                 self.driver.delete_all_cookies()
 
-    # This is safer because it prevents the browser from navigating to an untrusted url.
-    # It is a bit less robust though and requires SITE_DOMAIN to be set correctly.
-    # So not making it the default, as self-hosters don't need it.
-    def safely_navigate_to_gmail_domain_url(self):
-        gmail_service_url = f"https://www.google.com/a/{self.google_meet_bot_login_session.get('login_domain')}/ServiceLogin?service=mail"
-        # Make a request to this url and get the redirect header
-        logger.info(f"Making request to gmail service url: {gmail_service_url}")
-        response = requests.get(gmail_service_url, allow_redirects=False)
-        redirect_url_from_google = response.headers.get("Location")
+    def google_workspace_sso_entry_url(self, login_domain: str, meeting_url: str | None = None) -> str:
+        """Return the service entry point for the assigned Meet bot account.
 
-        # If the redirect url's host is not SITE_DOMAIN, the login failed
-        redirect_url_from_google_host = None
-        try:
-            redirect_url_from_google_host = urlparse(redirect_url_from_google).hostname
-        except Exception:
-            pass
+        Free-license Meet bot accounts are provisioned for Meet only. Their
+        browser transaction must therefore start at the target Meet URL, after
+        the facade has written the opaque SSO session cookie in the same browser
+        context. Keeping the target URL preserves Google's Meet service context
+        through the account-identifier and SAML redirect steps; starting at the
+        public product root can leave a fresh profile on a generic identifier
+        form that does not submit the Meet SSO request. A domain ServiceLogin
+        URL is retained only as an explicitly configured compatibility path for
+        older deployments.
+        """
+        entrypoint = os.getenv(
+            "GOOGLE_MEET_SSO_ENTRYPOINT",
+            self._GOOGLE_SSO_ENTRYPOINT_MEET,
+        ).strip().lower()
+        if entrypoint == self._GOOGLE_SSO_ENTRYPOINT_MEET:
+            meeting_location = urlparse(str(meeting_url or ""))
+            if (
+                meeting_location.scheme == "https"
+                and meeting_location.hostname
+                and meeting_location.hostname.lower() in self._GOOGLE_MEET_HOSTS
+                and meeting_location.path not in {"", "/"}
+            ):
+                return meeting_url
+            return "https://meet.google.com/"
+        if entrypoint == self._GOOGLE_SSO_ENTRYPOINT_DOMAIN_SERVICE_LOGIN:
+            login_domain = self._normalized_workspace_domain(login_domain)
+            if login_domain is None:
+                raise UiLoginAttemptFailedException(
+                    "Allocated Google Workspace domain is invalid",
+                    "google_workspace_sso_entry_url",
+                )
+            return f"https://www.google.com/a/{login_domain}/ServiceLogin"
+        raise UiLoginAttemptFailedException(
+            "Google Workspace SSO entry point is invalid",
+            "google_workspace_sso_entry_url",
+        )
 
-        if redirect_url_from_google_host != settings.SITE_DOMAIN:
-            logger.error(f"Redirect url's host is not SITE_DOMAIN. Redirect url: {redirect_url_from_google}. Redirect url's host: {redirect_url_from_google_host}. SITE_DOMAIN: {settings.SITE_DOMAIN}")
-            raise UiLoginAttemptFailedException("Redirect url's host is not SITE_DOMAIN", "safe_navigate_to_gmail_domain_url")
+    # This prevents the browser from navigating to an untrusted URL. Google now
+    # uses an internal accounts.google.com/samlredirect hop before the configured
+    # IdP, so the whole redirect chain must be validated rather than its first hop.
+    def safely_navigate_to_google_workspace_sso_entry(self):
+        session = self.google_meet_bot_login_session or {}
+        login_domain = self._normalized_workspace_domain(session.get("login_domain"))
+        if login_domain is None:
+            raise UiLoginAttemptFailedException("Allocated Google Workspace domain is invalid", "safe_navigate_to_google_workspace_sso_entry")
 
-        logger.info(f"redirect_url_from_google_host = {redirect_url_from_google_host}")
+        expected_idp_url = urlparse(get_google_meet_sign_in_url())
+        if expected_idp_url.scheme != "https" or not expected_idp_url.hostname:
+            raise UiLoginAttemptFailedException("Configured Google Workspace IdP URL is invalid", "safe_navigate_to_google_workspace_sso_entry")
 
-        self.driver.get(redirect_url_from_google)
+        google_service_url = self.google_workspace_sso_entry_url(login_domain)
+        current_url = google_service_url
+        logger.info("Resolving the trusted Google Workspace SSO redirect chain")
+        http_session = requests.Session()
 
-    def navigate_to_gmail_domain_url(self):
-        if os.getenv("USE_SAFE_NAVIGATION_FOR_SIGNED_IN_GOOGLE_MEET_BOTS", "false") == "true":
-            self.safely_navigate_to_gmail_domain_url()
+        for redirect_index in range(self._GOOGLE_SSO_MAX_REDIRECTS):
+            try:
+                response = http_session.get(current_url, allow_redirects=False, timeout=15)
+            except requests.RequestException as exc:
+                raise UiLoginAttemptFailedException("Could not resolve Google Workspace SSO redirect", "safe_navigate_to_google_workspace_sso_entry", exc) from exc
+
+            location = response.headers.get("Location")
+            if response.status_code not in {301, 302, 303, 307, 308} or not location:
+                logger.error(
+                    "Google Workspace SSO redirect chain stopped before the configured IdP (hop=%s status=%s host=%s path=%s)",
+                    redirect_index,
+                    response.status_code,
+                    urlparse(current_url).hostname,
+                    urlparse(current_url).path,
+                )
+                break
+
+            next_url = urljoin(current_url, location)
+            next_url_parts = urlparse(next_url)
+            if next_url_parts.scheme != "https" or not next_url_parts.hostname:
+                logger.error("Google Workspace SSO redirect contained an invalid target")
+                break
+
+            if next_url_parts.hostname == expected_idp_url.hostname:
+                if next_url_parts.netloc != expected_idp_url.netloc or next_url_parts.path != expected_idp_url.path:
+                    logger.error("Google Workspace SSO redirect did not target the configured IdP sign-in endpoint")
+                    break
+                logger.info("Resolved Google Workspace SSO redirect chain to the configured IdP")
+                # Use the server-side session only to validate the redirect chain.
+                # Chrome starts at the same verified domain entry point so its
+                # browser-owned state follows the validated path.
+                self.driver.get(google_service_url)
+                return
+
+            if next_url_parts.hostname not in self._GOOGLE_SSO_REDIRECT_HOSTS:
+                logger.error("Google Workspace SSO redirect left the trusted Google/IdP host set")
+                break
+            current_url = next_url
+
+        raise UiLoginAttemptFailedException("Google Workspace SSO redirect did not reach the configured IdP", "safe_navigate_to_google_workspace_sso_entry")
+
+    def navigate_to_google_workspace_sso_entry(self):
+        entrypoint = os.getenv(
+            "GOOGLE_MEET_SSO_ENTRYPOINT",
+            self._GOOGLE_SSO_ENTRYPOINT_MEET,
+        ).strip().lower()
+        if entrypoint == self._GOOGLE_SSO_ENTRYPOINT_MEET:
+            entry_url = self.google_workspace_sso_entry_url(None, getattr(self, "meeting_url", None))
+            logger.info(
+                "Navigating to the Google Meet service entry point (target=%s)",
+                self._safe_network_url_metadata(entry_url),
+            )
+            self.driver.get(entry_url)
+            logger.info(
+                "Google Meet service entry navigation completed (location=%s)",
+                self._safe_browser_location_for_log(),
+            )
+            # When no target is available (for example in a standalone SSO
+            # diagnostic), the public Meet root can resolve to Google's product
+            # landing page. Follow its stable account link only in that fallback
+            # case; a target meeting URL already carries the Meet service
+            # context and must not be replaced by the generic product route.
+            current_location = urlparse(str(getattr(self.driver, "current_url", "") or ""))
+            current_host = current_location.hostname
+            if entry_url != "https://meet.google.com/" and current_host and current_host.lower() in self._GOOGLE_MEET_HOSTS:
+                # A direct target URL preserves Meet's service context, but a
+                # fresh profile still shows Meet's account sign-in link before
+                # Google can issue the SAML AuthnRequest. Follow that link in
+                # the same browser context; do not replace the target with the
+                # generic product root.
+                if self.click_google_meet_product_sign_in_if_needed():
+                    return
+                # An unauthenticated profile can render a meeting-specific
+                # "can't join" shell without a sign-in control. In that state
+                # the public Meet entry page is the stable, service-scoped
+                # recovery path and exposes the same Google ServiceLogin
+                # destination. Keep this fallback data-driven rather than
+                # matching localized Meet copy.
+                logger.info("Google Meet target did not expose a sign-in link; falling back to the public Meet entry page")
+                self.driver.get(self._GOOGLE_MEET_HOME_URL)
+                current_location = urlparse(str(getattr(self.driver, "current_url", "") or ""))
+                current_host = current_location.hostname
+                if current_host and current_host.lower() not in self._GOOGLE_MEET_HOSTS:
+                    if not self.click_google_meet_product_sign_in_if_needed():
+                        logger.info("Google Meet fallback page did not expose a usable product sign-in link")
+            if entry_url == "https://meet.google.com/" and current_host and current_host.lower() not in self._GOOGLE_MEET_HOSTS:
+                already_in_google_sso = (
+                    current_host.lower() in self._GOOGLE_SSO_REDIRECT_HOSTS
+                    and "/signin/" in current_location.path
+                )
+                if not already_in_google_sso and not self.click_google_meet_product_sign_in_if_needed():
+                    logger.info("Google Meet root did not expose a usable product sign-in link; navigating to the Meet home page for SSO")
+                    self.driver.get(self._GOOGLE_MEET_HOME_URL)
             return
 
-        gmail_domain_url = f"https://mail.google.com/a/{self.google_meet_bot_login_session.get('login_domain')}"
-        logger.info(f"Navigating to gmail domain url: {gmail_domain_url}")
-        self.driver.get(gmail_domain_url)
+        if entrypoint == self._GOOGLE_SSO_ENTRYPOINT_DOMAIN_SERVICE_LOGIN and os.getenv(
+            "USE_SAFE_NAVIGATION_FOR_SIGNED_IN_GOOGLE_MEET_BOTS", "true"
+        ).strip().lower() in {"1", "true", "yes", "on"}:
+            self.safely_navigate_to_google_workspace_sso_entry()
+            return
+
+        login_domain = self._normalized_workspace_domain((self.google_meet_bot_login_session or {}).get("login_domain"))
+        if login_domain is None:
+            raise UiLoginAttemptFailedException("Allocated Google Workspace domain is invalid", "navigate_to_google_workspace_sso_entry")
+        google_service_url = self.google_workspace_sso_entry_url(login_domain)
+        logger.info("Navigating to Google Workspace SSO entry point")
+        self.driver.get(google_service_url)
+
+    def click_google_meet_product_sign_in_if_needed(self) -> bool:
+        """Follow Meet's product-page sign-in link for a fresh browser profile.
+
+        ``https://meet.google.com/`` can resolve to the public Meet product page
+        before Google has established an account session. The product page's
+        sign-in link carries the Meet service context into Google's identifier
+        flow. Select the link by its destination, not by rendered text, so the
+        flow remains independent of browser language and region.
+        """
+        current_url = str(getattr(self.driver, "current_url", "") or "")
+        current_location = urlparse(current_url)
+
+        def find_product_sign_in_link(driver):
+            for selector in self._GOOGLE_PRODUCT_SIGN_IN_LINK_SELECTORS:
+                for element in driver.find_elements(By.CSS_SELECTOR, selector):
+                    try:
+                        if element.is_displayed() and element.is_enabled():
+                            return element
+                    except (StaleElementReferenceException, WebDriverException):
+                        continue
+            return False
+
+        try:
+            sign_in_link = WebDriverWait(self.driver, 3).until(find_product_sign_in_link)
+            sign_in_link.click()
+        except (TimeoutException, ElementNotInteractableException, NoSuchElementException, StaleElementReferenceException, WebDriverException) as exc:
+            logger.info("Google Meet product page did not expose a stable account sign-in link: %s", exc.__class__.__name__)
+            return False
+
+        try:
+            WebDriverWait(self.driver, 5).until(
+                lambda driver: str(getattr(driver, "current_url", "") or "") != current_url
+            )
+        except TimeoutException:
+            logger.info("Google Meet product sign-in link did not navigate away from the product page")
+            return False
+
+        logger.info("Followed the Google Meet sign-in link into the account SSO flow")
+        return True
+
+    def clear_google_workspace_sso_allowed_domains_header(self) -> None:
+        """Stop sending the SSO-only header to Meet assets after handoff.
+
+        ``Network.setExtraHTTPHeaders`` applies to every subsequent request in
+        the profile. Keeping ``X-GoogApps-AllowedDomains`` on fonts and Meet
+        RPCs causes cross-origin preflight failures, so it must be removed once
+        Google has completed the account handoff.
+        """
+        try:
+            self.driver.execute_cdp_cmd("Network.setExtraHTTPHeaders", {"headers": {}})
+        except Exception as exc:
+            logger.warning("Could not clear the Google Workspace SSO allowed-domains header: %s", exc.__class__.__name__)
+            return
+        logger.info("Cleared the Google Workspace SSO allowed-domains header after handoff")
+
+    def verify_google_meet_sso_session_cookie(self, session_id: str) -> None:
+        """Require the opaque SSO session to exist in this browser before redirecting.
+
+        The SAML facade deliberately uses a browser-owned HttpOnly cookie. A
+        failed facade response must not be mistaken for a Google login failure:
+        continuing without this cookie can reach Google's account chooser and
+        produce an opaque timeout with no useful indication that the first hop
+        was lost.
+        """
+        try:
+            cookie = self.driver.get_cookie(self._GOOGLE_MEET_SSO_SESSION_COOKIE)
+        except Exception as exc:
+            raise UiLoginAttemptFailedException(
+                "Could not inspect the Google Meet SSO session cookie",
+                "verify_google_meet_sso_session_cookie",
+                exc,
+            ) from exc
+
+        if not isinstance(cookie, dict) or cookie.get("value") != session_id:
+            logger.warning(
+                "Google Meet SSO session cookie was not written by the facade (location=%s cookie_present=%s)",
+                self._safe_browser_location_for_log(),
+                bool(cookie),
+            )
+            raise UiLoginAttemptFailedException(
+                "Google Meet SSO session cookie was not written",
+                "verify_google_meet_sso_session_cookie",
+            )
+
+        logger.info("Google Meet SSO session cookie is present in the browser context")
+
+    def submit_google_meet_account_identifier_if_needed(self) -> bool:
+        """Submit the allocated Meet account identifier on Google's generic sign-in page.
+
+        The Meet-only entry flow may first land on Google's account identifier
+        page before it can select the configured Workspace SAML provider. The
+        account is allocated server-side with the short-lived SSO session, so
+        submitting only its identifier is enough; no password or Gmail service
+        is involved. Stable input names are used so this remains independent of
+        the page language.
+        """
+        session = self.google_meet_bot_login_session or {}
+        login_email = session.get("login_email")
+        if not isinstance(login_email, str) or not login_email.strip():
+            logger.warning("Google Meet account identifier is unavailable for the Meet SSO flow")
+            return False
+
+        current_url = str(getattr(self.driver, "current_url", "") or "")
+        current_location = urlparse(current_url)
+        if current_location.hostname not in {"accounts.google.com", "www.google.com"} or "/v3/signin/identifier" not in current_location.path:
+            return False
+
+        def find_identifier_input(driver):
+            elements = driver.find_elements(By.CSS_SELECTOR, "input[name='identifier'], input[type='email']")
+            return next((element for element in elements if element.is_displayed() and element.is_enabled()), False)
+
+        try:
+            identifier_input = WebDriverWait(self.driver, 5).until(find_identifier_input)
+            identifier_input.clear()
+            identifier_input.send_keys(login_email.strip())
+            # Keep the browser's native input event path in sync as well. Some
+            # Google account-page revisions use a controlled input: WebDriver
+            # can update the DOM value while the page-side validation state is
+            # still empty, leaving Next visually enabled but inert.
+            try:
+                self.driver.execute_script(
+                    """
+                    const field = arguments[0];
+                    const value = arguments[1];
+                    const descriptor = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+                    if (descriptor && descriptor.set && field.value !== value) {
+                        descriptor.set.call(field, value);
+                    }
+                    field.dispatchEvent(new Event('input', {bubbles: true}));
+                    field.dispatchEvent(new Event('change', {bubbles: true}));
+                    field.blur();
+                    """,
+                    identifier_input,
+                    login_email.strip(),
+                )
+            except (StaleElementReferenceException, WebDriverException):
+                pass
+
+            def find_next_button(driver):
+                for selector in self._GOOGLE_IDENTIFIER_CONTINUE_SELECTORS:
+                    elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                    for element in elements:
+                        try:
+                            if not element.is_displayed() or not element.is_enabled():
+                                continue
+                            if str(element.get_attribute("aria-disabled") or "").strip().lower() == "true":
+                                continue
+                            return element
+                        except (StaleElementReferenceException, WebDriverException):
+                            continue
+                return False
+
+            next_button = WebDriverWait(self.driver, 5).until(find_next_button)
+            logger.info(
+                "Google account identifier control is ready (input_value_length=%s button_id=%s button_jsname=%s button_aria_disabled=%s)",
+                len(str(identifier_input.get_attribute("value") or "")),
+                next_button.get_attribute("id"),
+                next_button.get_attribute("jsname"),
+                next_button.get_attribute("aria-disabled"),
+            )
+            # Google enables the control after its client-side input validation.
+            # Blur the field once so the same validation path is exercised as a
+            # real user tabbing from the identifier field.
+            try:
+                identifier_input.send_keys(Keys.TAB)
+            except (StaleElementReferenceException, WebDriverException):
+                pass
+            next_button.click()
+            # Google has changed this page between a native button and a
+            # client-side continuation control.  Keep the stable button click,
+            # then submit the same form from the identifier field as a
+            # browser-native fallback.  If the click already navigated, the
+            # element becomes stale and the fallback is naturally skipped.
+            if str(getattr(self.driver, "current_url", "") or "") == current_url:
+                try:
+                    ActionChains(self.driver).move_to_element(next_button).click().perform()
+                except (AttributeError, StaleElementReferenceException, WebDriverException):
+                    pass
+            if str(getattr(self.driver, "current_url", "") or "") == current_url:
+                try:
+                    self.driver.execute_script("arguments[0].click();", next_button)
+                except (StaleElementReferenceException, WebDriverException):
+                    pass
+            if str(getattr(self.driver, "current_url", "") or "") == current_url:
+                try:
+                    identifier_input.send_keys(Keys.ENTER)
+                except (StaleElementReferenceException, WebDriverException):
+                    pass
+            if str(getattr(self.driver, "current_url", "") or "") == current_url:
+                try:
+                    self.driver.execute_script(
+                        """
+                        const field = arguments[0];
+                        const submitControl = arguments[1];
+                        const form = field && field.closest ? field.closest('form') : null;
+                        if (form && typeof form.requestSubmit === 'function') {
+                            form.requestSubmit(submitControl || undefined);
+                        } else if (submitControl) {
+                            submitControl.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window}));
+                        }
+                        """,
+                        identifier_input,
+                        next_button,
+                    )
+                except (StaleElementReferenceException, WebDriverException):
+                    pass
+            if str(getattr(self.driver, "current_url", "") or "") == current_url:
+                try:
+                    # Last-resort browser-native submission. This preserves the
+                    # hidden form fields and redirect target while avoiding a
+                    # dependency on a particular Google client-side handler.
+                    self.driver.execute_script(
+                        """
+                        const field = arguments[0];
+                        const form = field && field.closest ? field.closest('form') : null;
+                        if (form) {
+                            HTMLFormElement.prototype.submit.call(form);
+                        }
+                        """,
+                        identifier_input,
+                    )
+                except (StaleElementReferenceException, WebDriverException):
+                    pass
+        except (TimeoutException, ElementNotInteractableException, NoSuchElementException, StaleElementReferenceException, WebDriverException) as exc:
+            logger.warning("Google Meet account identifier page did not expose a usable continuation control: %s", exc.__class__.__name__)
+            return False
+
+        self._google_meet_identifier_initial_url = current_url
+        try:
+            WebDriverWait(self.driver, 8).until(self.google_meet_identifier_flow_advanced)
+        except TimeoutException:
+            logger.warning(
+                "Google Meet account identifier continuation did not advance the browser (location=%s)",
+                self._safe_browser_location_for_log(),
+            )
+            self.log_google_login_timeout_diagnostics()
+            return False
+
+        if self.google_meet_identifier_input_is_visible():
+            logger.warning(
+                "Google account identifier page is still visible after continuation (location=%s)",
+                self._safe_browser_location_for_log(),
+            )
+            self.log_google_login_timeout_diagnostics()
+            return False
+
+        logger.info("Submitted the allocated Google Meet account identifier to continue SAML sign-in")
+        return True
+
+    def google_meet_identifier_input_is_visible(self) -> bool:
+        """Return whether Google is still showing the account identifier form."""
+        try:
+            elements = self.driver.find_elements(By.CSS_SELECTOR, "input[name='identifier'], input[type='email']")
+        except (StaleElementReferenceException, WebDriverException):
+            return False
+        return any(
+            element.is_displayed() and element.is_enabled()
+            for element in elements
+            if element is not None
+        )
+
+    def google_meet_identifier_flow_advanced(self, driver) -> bool:
+        """Wait for a real Google sign-in state change, not only a URL change."""
+        if str(getattr(driver, "current_url", "") or "") != self._google_meet_identifier_initial_url:
+            return True
+        if not self.google_meet_identifier_input_is_visible():
+            return True
+        page_text = self._google_sso_page_text()
+        return any(marker in page_text for marker in self._GOOGLE_SSO_IDENTITY_MARKERS) or any(marker in page_text for marker in self._GOOGLE_SSO_PASSKEY_MARKERS)
+
+    @staticmethod
+    def _normalized_google_control_text(value) -> str:
+        if not isinstance(value, str):
+            return ""
+        return " ".join(value.replace("’", "'").split()).casefold()
+
+    def _google_sso_page_text(self) -> str:
+        try:
+            page_text = self.driver.find_element(By.TAG_NAME, "body").text or ""
+        except (NoSuchElementException, StaleElementReferenceException, WebDriverException):
+            return ""
+        return self._normalized_google_control_text(page_text)
+
+    def _find_google_sso_control(self, selectors, labels):
+        for selector in selectors:
+            try:
+                elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+            except (StaleElementReferenceException, WebDriverException):
+                continue
+            for element in elements:
+                try:
+                    if (
+                        element.is_displayed()
+                        and element.is_enabled()
+                        and element.get_attribute("aria-disabled") != "true"
+                    ):
+                        return element
+                except (StaleElementReferenceException, WebDriverException):
+                    continue
+
+        try:
+            elements = self.driver.find_elements(By.CSS_SELECTOR, "button, [role='button'], a, input[type='submit']")
+        except (StaleElementReferenceException, WebDriverException):
+            return None
+
+        for element in elements:
+            try:
+                if (
+                    not element.is_displayed()
+                    or not element.is_enabled()
+                    or element.get_attribute("aria-disabled") == "true"
+                ):
+                    continue
+                control_text = self._normalized_google_control_text(
+                    element.text or element.get_attribute("aria-label") or element.get_attribute("value")
+                )
+                if control_text in labels:
+                    return element
+            except (StaleElementReferenceException, WebDriverException):
+                continue
+        return None
+
+    def advance_google_workspace_sso_interstitial_if_needed(self) -> bool:
+        """Advance Google account confirmation pages that do not require a password.
+
+        Workspace SSO accounts can show an identity confirmation and then a
+        passkey-enrollment offer even when the OU policy skips password entry.
+        These pages are part of Google's account UI, not Meet's join UI. Use
+        page state plus stable control attributes first, with localized labels
+        only as a narrow fallback.
+        """
+        current_location = urlparse(str(getattr(self.driver, "current_url", "") or ""))
+        if current_location.hostname not in self._GOOGLE_SSO_REDIRECT_HOSTS:
+            return False
+
+        page_text = self._google_sso_page_text()
+        passkey_page = any(marker in page_text for marker in self._GOOGLE_SSO_PASSKEY_MARKERS) or "webauthn" in current_location.path.lower()
+        identity_page = current_location.path.endswith(self._GOOGLE_SAML_CONFIRMATION_PATH_SUFFIX) or any(
+            marker in page_text for marker in self._GOOGLE_SSO_IDENTITY_MARKERS
+        )
+
+        if passkey_page:
+            control = self._find_google_sso_control(self._GOOGLE_SSO_SKIP_SELECTORS, self._GOOGLE_SSO_SKIP_LABELS)
+            if control is None:
+                logger.info("Google passkey prompt is visible but no safe skip control was found yet")
+                return False
+            try:
+                self.click_element(control, "skip_google_passkey_enrollment")
+            except UiCouldNotClickElementException:
+                logger.info("Google passkey skip control is not interactable yet; waiting for the account page to settle")
+                return False
+            logger.info("Skipped the optional Google passkey enrollment prompt")
+            return True
+
+        if identity_page:
+            control = self._find_google_sso_control(self._GOOGLE_SSO_CONTINUE_SELECTORS, self._GOOGLE_SSO_CONTINUE_LABELS)
+            if control is None:
+                logger.info("Google identity confirmation is visible but no safe continue control was found yet")
+                return False
+            try:
+                self.click_element(control, "continue_google_identity_confirmation")
+            except UiCouldNotClickElementException:
+                logger.info("Google identity confirmation control is not interactable yet; waiting for the account page to settle")
+                return False
+            logger.info("Continued past the Google identity confirmation page")
+            return True
+
+        return False
+
+    def google_workspace_sso_browser_flow_completed(self) -> bool:
+        """Return whether Google's SSO handoff has returned to the Meet host."""
+        current_location = urlparse(str(getattr(self.driver, "current_url", "") or ""))
+        return current_location.hostname in self._GOOGLE_MEET_HOSTS
+
+    def submit_google_meet_saml_confirmation_if_needed(self) -> bool:
+        """Confirm Google's account-to-Workspace SAML handoff when shown.
+
+        Google may display an account confirmation page after the identifier is
+        submitted. Its button label is localized, while the confirmation page
+        exposes stable button semantics (`confirm`, `jsname`, or submit type).
+        Restrict this action to Google's SAML confirmation route and use those
+        semantics instead of matching translated text.
+        """
+        current_url = str(getattr(self.driver, "current_url", "") or "")
+        current_location = urlparse(current_url)
+        if current_location.hostname not in {"accounts.google.com", "www.google.com"}:
+            return False
+        if not current_location.path.endswith(self._GOOGLE_SAML_CONFIRMATION_PATH_SUFFIX):
+            return False
+
+        selectors = (
+            "#confirm",
+            "button[jsname='LgbsSe']",
+            "[role='button'][jsname='LgbsSe']",
+            "button[type='submit']",
+            "input[type='submit']",
+        )
+
+        def find_confirmation_control(driver):
+            for selector in selectors:
+                for element in driver.find_elements(By.CSS_SELECTOR, selector):
+                    try:
+                        if element.is_displayed() and element.is_enabled():
+                            return element
+                    except (StaleElementReferenceException, WebDriverException):
+                        continue
+            return False
+
+        try:
+            confirmation_control = WebDriverWait(self.driver, 3).until(find_confirmation_control)
+            confirmation_control.click()
+        except (TimeoutException, ElementNotInteractableException, NoSuchElementException, StaleElementReferenceException, WebDriverException) as exc:
+            logger.warning("Google SAML account confirmation page did not expose a usable continuation control: %s", exc.__class__.__name__)
+            return False
+
+        logger.info("Confirmed the allocated Google account on Google's SAML confirmation page")
+        return True
 
     def login_to_google_meet_account(self):
-        self.google_meet_bot_login_session = self.create_google_meet_bot_login_session_callback()
+        # A login retry is a retry of the same bot/account, not an instruction to
+        # rotate through the account pool. Reusing the short-lived SSO session
+        # avoids turning one transient Google challenge into several account
+        # sign-ins from the same runtime.
+        if self.google_meet_bot_login_session is None:
+            self.google_meet_bot_login_session = self.create_google_meet_bot_login_session_callback()
+        if not self.google_meet_bot_login_session:
+            raise UiLoginAttemptFailedException("No Google Meet bot login session was allocated", "create_google_meet_bot_login_session")
         logger.info("Logging in to Google Meet account")
         session_id = self.google_meet_bot_login_session.get("session_id")
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise UiLoginAttemptFailedException("Google Meet SSO session id is missing", "login_to_google_meet_account")
         google_meet_set_cookie_url = get_google_meet_set_cookie_url(session_id)
-        logger.info(f"Navigating to Google Meet set cookie URL: {google_meet_set_cookie_url}")
+        logger.info("Navigating to Google Meet set-cookie URL")
         self.driver.get(google_meet_set_cookie_url)
+        self.verify_google_meet_sso_session_cookie(session_id)
 
-        self.navigate_to_gmail_domain_url()
-
-        # Wait for cookies indicating that we have logged in successfully
+        # Google evaluates the allowed-domain hint while the ServiceLogin
+        # request is created. Install it before the Meet/root navigation, then
+        # remove it after the SSO handoff so it never leaks into Meet RPCs.
+        self.configure_google_workspace_sso_allowed_domains_header()
+        self.navigate_to_google_workspace_sso_entry()
+        # Once the identifier form is visible, the managed-domain hint has
+        # already served its purpose. Remove it before the native Next submit
+        # so Google's account/IdP navigation is not polluted by a custom
+        # cross-origin request header.
+        self.clear_google_workspace_sso_allowed_domains_header()
+        identifier_submitted = self.submit_google_meet_account_identifier_if_needed()
+        current_location = urlparse(str(getattr(self.driver, "current_url", "") or ""))
+        if (
+            current_location.hostname in {"accounts.google.com", "www.google.com"}
+            and "/v3/signin/identifier" in current_location.path
+            and not identifier_submitted
+        ):
+            raise UiLoginAttemptFailedException(
+                "Google account identifier did not advance the SSO flow",
+                "submit_google_meet_account_identifier_if_needed",
+            )
+        # Continue through Google's interactive confirmation pages until the
+        # browser has actually returned to Meet. Auth cookies can be written
+        # before the speedbump/passkey redirect finishes, so cookies alone are
+        # not a safe handoff boundary.
         start_waiting_at = time.time()
-        while not self.has_google_cookies_that_indicate_logged_in(self.driver):
+        try:
+            sso_handoff_timeout_seconds = max(
+                30,
+                int(os.getenv("GOOGLE_MEET_SSO_HANDOFF_TIMEOUT_SECONDS", str(self._GOOGLE_SSO_HANDOFF_TIMEOUT_SECONDS))),
+            )
+        except ValueError:
+            sso_handoff_timeout_seconds = self._GOOGLE_SSO_HANDOFF_TIMEOUT_SECONDS
+        auth_cookies_seen = False
+        meet_handoff_observed_at = None
+        next_interstitial_action_at = 0.0
+        while True:
+            auth_cookies_seen = self.has_google_cookies_that_indicate_logged_in(self.driver) or auth_cookies_seen
+            now = time.monotonic()
+            browser_is_on_meet = self.google_workspace_sso_browser_flow_completed()
+            if auth_cookies_seen and browser_is_on_meet:
+                if meet_handoff_observed_at is None:
+                    meet_handoff_observed_at = now
+                    logger.info(
+                        "Google SSO handoff reached Meet; waiting for the browser location to remain stable"
+                    )
+                elif now - meet_handoff_observed_at >= self._GOOGLE_SSO_MEET_STABILITY_SECONDS:
+                    break
+            else:
+                # Google can briefly expose the Meet host while an unconfirmed
+                # SAML speedbump is still redirecting. Reset the stability
+                # window whenever the browser leaves Meet so a transient URL
+                # observation can never complete authentication.
+                meet_handoff_observed_at = None
+                if now >= next_interstitial_action_at:
+                    interstitial_advanced = self.advance_google_workspace_sso_interstitial_if_needed()
+                    if interstitial_advanced:
+                        # Give a successful native click time to navigate before
+                        # trying the same control again. Intercepted clicks return
+                        # False and are retried on the next polling iteration.
+                        next_interstitial_action_at = now + self._GOOGLE_SSO_INTERSTITIAL_RETRY_SECONDS
+            logger.info(
+                "Waiting for Google SSO handoff to return to Meet (auth_cookies=%s location=%s)",
+                auth_cookies_seen,
+                self._safe_browser_location_for_log(),
+            )
+            if time.time() - start_waiting_at > sso_handoff_timeout_seconds:
+                logger.warning("Google SSO handoff timed out after %s seconds (auth_cookies=%s location=%s)", sso_handoff_timeout_seconds, auth_cookies_seen, self._safe_browser_location_for_log())
+                self.log_google_login_timeout_diagnostics()
+                raise UiLoginAttemptFailedException("Google SSO did not return to Meet after authentication", "login_to_google_meet_account")
             time.sleep(1)
-            logger.info(f"Waiting for cookies indicating that we have logged in successfully. Current URL: {self.driver.current_url}")
-            if time.time() - start_waiting_at > 30:
-                # We'll raise an exception if it's not logged in after 30 seconds
-                logger.warning(f"Login timed out, after 30 seconds, no Google auth cookies were present. Current URL: {self.driver.current_url}")
-                raise UiLoginAttemptFailedException("No Google auth cookies were present", "login_to_google_meet_account")
 
-        logger.info(f"After waiting, URL is {self.driver.current_url}")
+        self.clear_google_workspace_sso_allowed_domains_header()
+        logger.info("Google SSO handoff returned to Meet with auth cookies (location=%s)", self._safe_browser_location_for_log())
 
     def has_google_cookies_that_indicate_logged_in(self, driver) -> bool:
         google_auth_cookie_names = {
@@ -661,19 +1745,20 @@ class GoogleMeetUIMethods:
         logger.warning(f"Cookie names: {names}. Any Google auth cookies present: {any_google_auth_cookies_present}.")
         return any_google_auth_cookies_present
 
-    # returns nothing if succeeded, raises an exception if failed
-    def attempt_to_join_meeting(self):
-        if self.google_meet_bot_login_is_available and self.google_meet_bot_login_should_be_used:
-            self.login_to_google_meet_account_with_retries()
+    def grant_google_meet_browser_permissions(self):
+        """Grant Meet media permissions before SSO and again on the target page."""
+        meeting_location = urlparse(str(getattr(self, "meeting_url", "") or ""))
+        if meeting_location.scheme != "https" or not meeting_location.netloc:
+            raise UiLoginAttemptFailedException(
+                "Google Meet meeting URL is invalid",
+                "grant_google_meet_browser_permissions",
+            )
 
-        layout_to_select = self.get_layout_to_select()
-
-        self.driver.get(self.meeting_url)
-
+        meeting_origin = f"{meeting_location.scheme}://{meeting_location.netloc}"
         self.driver.execute_cdp_cmd(
             "Browser.grantPermissions",
             {
-                "origin": self.meeting_url,
+                "origin": meeting_origin,
                 "permissions": [
                     "geolocation",
                     "audioCapture",
@@ -682,8 +1767,24 @@ class GoogleMeetUIMethods:
                 ],
             },
         )
+        logger.info("Granted Google Meet browser media permissions origin=%s", meeting_origin)
+
+    # returns nothing if succeeded, raises an exception if failed
+    def attempt_to_join_meeting(self):
+        self.grant_google_meet_browser_permissions()
+
+        if self.google_meet_bot_login_is_available and self.google_meet_bot_login_should_be_used:
+            self.login_to_google_meet_account_with_retries()
+
+        layout_to_select = self.get_layout_to_select()
+
+        self.driver.get(self.meeting_url)
+
+        self.grant_google_meet_browser_permissions()
 
         self.check_if_meeting_is_found()
+
+        self.wait_for_google_meet_preview_initialization()
 
         self.fill_out_name_input()
 
