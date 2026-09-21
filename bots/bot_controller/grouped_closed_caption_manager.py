@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta
 from typing import Dict, Optional
+from bots.recording_ready import RecordingNotReadyError
 
 
 class CaptionEntry:
@@ -119,16 +120,20 @@ class GroupedClosedCaptionManager:
 
                 if participant:
                     # Save as an utterance
-                    self.save_utterance_callback(
-                        {
-                            **participant,
-                            "timestamp_ms": int(group.created_at.timestamp() * 1000),
-                            "duration_ms": int((group.modified_at - group.created_at).total_seconds() * 1000),
-                            "text": group.get_text(),
-                            "source_uuid_suffix": f"{device_id}-{group.caption_entries[key].caption_data['captionId']}",
-                            "sample_rate": None,
-                        }
-                    )
+                    try:
+                        self.save_utterance_callback(
+                            {
+                                **participant,
+                                "timestamp_ms": int(group.created_at.timestamp() * 1000),
+                                "duration_ms": int((group.modified_at - group.created_at).total_seconds() * 1000),
+                                "text": group.get_text(),
+                                "source_uuid_suffix": f"{device_id}-{group.caption_entries[key].caption_data['captionId']}",
+                                "sample_rate": None,
+                            }
+                        )
+                    except RecordingNotReadyError:
+                        # Keep in memory and retry on the next main-loop tick.
+                        continue
 
                     # Mark as upserted and remove if it hasn't been modified recently
                     group.mark_upserted_to_db()

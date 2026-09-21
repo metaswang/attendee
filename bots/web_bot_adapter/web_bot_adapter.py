@@ -1018,6 +1018,8 @@ class WebBotAdapter(BotAdapter):
             return
 
         self.recording_permission_granted_at = time.time()
+        # BotController delivers BOT_RECORDING_PERMISSION_GRANTED synchronously so the
+        # control plane reaches JOINED_RECORDING before browser media sending starts.
         self.send_message_callback({"message": self.Messages.BOT_RECORDING_PERMISSION_GRANTED})
         self.send_frames = True
         try:
