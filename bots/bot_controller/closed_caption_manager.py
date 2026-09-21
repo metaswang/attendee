@@ -1,6 +1,8 @@
 from datetime import datetime, timedelta
 from typing import Dict, Optional
 
+from bots.recording_ready import RecordingNotReadyError
+
 
 class CaptionEntry:
     def __init__(self, caption_data: dict):
@@ -68,16 +70,20 @@ class ClosedCaptionManager:
 
                 if participant:
                     # Save as an utterance
-                    self.save_utterance_callback(
-                        {
-                            **participant,
-                            "timestamp_ms": int(entry.created_at.timestamp() * 1000),
-                            "duration_ms": int((entry.modified_at - entry.created_at).total_seconds() * 1000),
-                            "text": entry.caption_data.get("text", ""),
-                            "source_uuid_suffix": f"{entry.caption_data['deviceId']}-{entry.caption_data['captionId']}",
-                            "sample_rate": None,
-                        }
-                    )
+                    try:
+                        self.save_utterance_callback(
+                            {
+                                **participant,
+                                "timestamp_ms": int(entry.created_at.timestamp() * 1000),
+                                "duration_ms": int((entry.modified_at - entry.created_at).total_seconds() * 1000),
+                                "text": entry.caption_data.get("text", ""),
+                                "source_uuid_suffix": f"{entry.caption_data['deviceId']}-{entry.caption_data['captionId']}",
+                                "sample_rate": None,
+                            }
+                        )
+                    except RecordingNotReadyError:
+                        # Keep in memory and retry on the next main-loop tick.
+                        continue
 
                     # Mark as upserted and remove if it hasn't been modified recently
                     entry.mark_upserted_to_db()

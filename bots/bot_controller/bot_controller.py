@@ -62,6 +62,11 @@ from bots.websocket_payloads import mixed_audio_websocket_payload, per_participa
 from bots.zoom_oauth_connections_utils import get_zoom_tokens_via_zoom_oauth_app
 from bots.zoom_rtms_adapter.rtms_gstreamer_pipeline import RTMSGstreamerPipeline
 from bots.runtime_api_client import BotRuntimeApiClient
+from bots.recording_ready import (
+    RecordingNotReadyError,
+    is_recording_not_ready_error,
+    post_with_recording_ready_retry,
+)
 from bots.runtime_snapshot import RuntimeBotControlSnapshot, RuntimeBotSnapshot
 
 from .audio_chunk_uploader import AudioChunkUploader
@@ -1564,12 +1569,24 @@ class BotController:
     def post_runtime_caption(self, payload):
         if not self.runtime_api_client:
             raise RuntimeError("Runtime API client is not configured")
-        return self.runtime_api_client.post_caption(payload)
+        # Keep retries short: this runs on the GLib main loop; long sleeps would
+        # delay synchronous PERMISSION_GRANTED delivery. Unready captions stay buffered.
+        return post_with_recording_ready_retry(
+            lambda: self.runtime_api_client.post_caption(payload),
+            what="Caption POST",
+            attempts=2,
+            base_sleep_seconds=0.05,
+        )
 
     def post_runtime_audio_chunk(self, payload):
         if not self.runtime_api_client:
             raise RuntimeError("Runtime API client is not configured")
-        return self.runtime_api_client.post_audio_chunk(payload)
+        return post_with_recording_ready_retry(
+            lambda: self.runtime_api_client.post_audio_chunk(payload),
+            what="Audio chunk POST",
+            attempts=2,
+            base_sleep_seconds=0.05,
+        )
 
     def post_runtime_resource_snapshot(self, payload):
         if not self.runtime_api_client:
@@ -2247,6 +2264,10 @@ class BotController:
             return True
 
         except Exception as e:
+            if is_recording_not_ready_error(e):
+                # Captions/chunks can arrive before JOINED_RECORDING lands; keep the session alive.
+                logger.warning("Recording not ready yet in timeout callback; will retry: %s", e)
+                return True
             logger.warning(f"Error in timeout callback: {e}")
             logger.info("Traceback:")
             logger.info(traceback.format_exc())
@@ -2254,6 +2275,9 @@ class BotController:
             return False
 
     def handle_exception_in_timeout_callback(self, e):
+        if is_recording_not_ready_error(e):
+            logger.warning("Ignoring recording-not-ready error without fatal teardown: %s", e)
+            return
         try:
             self.create_bot_event(
                 event_type=BotEventTypes.FATAL_ERROR,
@@ -2644,7 +2668,35 @@ class BotController:
         return
 
     def on_message_from_adapter(self, message):
+        # JOINED_MEETING and RECORDING_PERMISSION_GRANTED must reach the control plane
+        # before the join thread enables browser media sending; idle_add alone races captions.
+        if message.get("message") in (
+            BotAdapter.Messages.BOT_JOINED_MEETING,
+            BotAdapter.Messages.BOT_RECORDING_PERMISSION_GRANTED,
+        ):
+            self._deliver_adapter_message_synchronously(message)
+            return
         GLib.idle_add(lambda: self.take_action_based_on_message_from_adapter(message))
+
+    def _deliver_adapter_message_synchronously(self, message, timeout_seconds: float = 30.0):
+        """Run take_action on the GLib main loop and block the caller until it finishes."""
+        done = threading.Event()
+        errors: list[BaseException] = []
+
+        def _run():
+            try:
+                self.take_action_based_on_message_from_adapter(message)
+            except BaseException as exc:  # noqa: BLE001 - surface to join thread
+                errors.append(exc)
+            finally:
+                done.set()
+            return False
+
+        GLib.idle_add(_run)
+        if not done.wait(timeout=timeout_seconds):
+            raise TimeoutError(f"Timed out waiting for synchronous adapter message delivery: {message.get('message')}")
+        if errors:
+            raise errors[0]
 
     def flush_utterances(self):
         if self.per_participant_non_streaming_audio_input_manager:
