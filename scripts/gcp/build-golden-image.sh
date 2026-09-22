@@ -22,6 +22,14 @@ REMOTE_REPO_DIR="/opt/voxella-attendee-src"
 BOT_RUNTIME_IMAGE_ALIAS="${BOT_RUNTIME_IMAGE_ALIAS:-attendee-bot-runner:latest}"
 DOCKER_PLATFORM="${DOCKER_PLATFORM:-linux/amd64}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+BUILD_RUNTIME_IMAGE="${BUILD_RUNTIME_IMAGE:-false}"
+PULL_RUNTIME_IMAGE="${PULL_RUNTIME_IMAGE:-true}"
+ATTENDEE_REPO_DIR="${ATTENDEE_REPO_DIR:-/voxella/voxella-attendee}"
+
+if [[ "$BUILD_RUNTIME_IMAGE" != "false" || "$PULL_RUNTIME_IMAGE" != "true" ]]; then
+  echo "Build/push the runtime image on myvps2 first; golden-image builders only pull it." >&2
+  exit 2
+fi
 
 cleanup_files=()
 cleanup() {
@@ -43,8 +51,21 @@ COPYFILE_DISABLE=1 tar -C "$REPO_ROOT" \
   --exclude='node_modules' \
   --exclude='.env' \
   --exclude='.env.*' \
+  --exclude='*.env' \
+  --exclude='*.env.*' \
+  --exclude='*.key' \
+  --exclude='*.pem' \
+  --exclude='data' \
+  --exclude='deploy' \
+  --exclude='staticfiles' \
+  --exclude='*.log' \
   -czf "$archive_file" \
   .
+
+if tar -tzf "$archive_file" | grep -Eq '(^|/)(\.env|[^/]*\.env|[^/]*\.(key|pem))$'; then
+  echo "Refusing to upload an archive containing deployment env or private-key files." >&2
+  exit 2
+fi
 
 echo "Creating attendee golden-image builder ${BUILDER_NAME}"
 echo "  project=${GCP_PROJECT_ID}"
@@ -73,15 +94,23 @@ gcloud compute instances create "$BUILDER_NAME" \
   --scopes cloud-platform
 
 echo "Waiting for SSH on ${BUILDER_NAME}..."
+ssh_ready=0
 for _ in $(seq 1 60); do
   if gcloud compute ssh "$BUILDER_NAME" \
     --project "$GCP_PROJECT_ID" \
     --zone "$ZONE" \
+    --quiet \
+    --ssh-flag=-oConnectTimeout=10 \
     --command "true" >/dev/null 2>&1; then
+    ssh_ready=1
     break
   fi
   sleep 5
 done
+if [[ "$ssh_ready" != "1" ]]; then
+  echo "SSH did not become ready on ${BUILDER_NAME}; no image was published." >&2
+  exit 1
+fi
 
 gcloud compute scp "$archive_file" "${BUILDER_NAME}:${REMOTE_ARCHIVE}" \
   --project "$GCP_PROJECT_ID" \
@@ -89,6 +118,7 @@ gcloud compute scp "$archive_file" "${BUILDER_NAME}:${REMOTE_ARCHIVE}" \
 
 remote_env=(
   "ATTENDEE_REPO_URL=${REMOTE_REPO_DIR}"
+  "ATTENDEE_REPO_DIR=${ATTENDEE_REPO_DIR}"
   "BOT_RUNTIME_IMAGE=${BOT_RUNTIME_IMAGE}"
   "BOT_RUNTIME_IMAGE_ALIAS=${BOT_RUNTIME_IMAGE_ALIAS}"
   "BUILD_RUNTIME_IMAGE=${BUILD_RUNTIME_IMAGE}"

@@ -7,7 +7,7 @@ set -euo pipefail
 #
 #   1. PULL_RUNTIME_IMAGE=true  (default)
 #        Pull a pre-built image from a registry (e.g. Docker Hub). This is
-#        the recommended flow; build is done on myvps so the golden image
+#        the recommended flow; build is done on myvps2 so the golden image
 #        is guaranteed byte-identical to what runs on the VPS fleet.
 #
 #   2. BUILD_RUNTIME_IMAGE=true
@@ -39,7 +39,7 @@ set -euo pipefail
 : "${BOT_RUNTIME_IMAGE:?BOT_RUNTIME_IMAGE is required}"
 
 ATTENDEE_GIT_REF="${ATTENDEE_GIT_REF:-main}"
-ATTENDEE_REPO_DIR="${ATTENDEE_REPO_DIR:-/opt/attendee}"
+ATTENDEE_REPO_DIR="${ATTENDEE_REPO_DIR:-/voxella/voxella-attendee}"
 RUNNER_SCRIPT_SOURCE="${RUNNER_SCRIPT_SOURCE:-scripts/digitalocean/attendee-bot-runner.sh}"
 RUNNER_SERVICE_SOURCE="${RUNNER_SERVICE_SOURCE:-scripts/digitalocean/attendee-bot-runner.service}"
 BUILD_RUNTIME_IMAGE="${BUILD_RUNTIME_IMAGE:-false}"
@@ -148,6 +148,27 @@ install -D -m 0644 "$RUNNER_SERVICE_SOURCE" /etc/systemd/system/attendee-bot-run
 install -D -m 0755 scripts/runtime_agent.py /usr/local/bin/attendee-runtime-agent
 install -D -m 0644 scripts/digitalocean/attendee-runtime-agent.service /etc/systemd/system/attendee-runtime-agent.service
 mkdir -p /etc/attendee /var/log/attendee
+
+# Record the actual browser and source payload, not just a mutable image tag.
+# Use the same source path that host_runtime.runtime_agent_env defaults to.
+CHROME_VERSION="$(docker run --rm --entrypoint google-chrome "$BOT_RUNTIME_IMAGE" --version)"
+CHROMEDRIVER_VERSION="$(docker run --rm --entrypoint chromedriver "$BOT_RUNTIME_IMAGE" --version)"
+find accounts attendee bots scripts static templates manage.py entrypoint.sh pyproject.toml uv.lock version.json \
+  -type f ! -name '*.pyc' ! -name '.DS_Store' ! -name '*.env' ! -name '.env*' ! -name '*.env.*' \
+  ! -name '*.key' ! -name '*.pem' ! -path '*/__pycache__/*' ! -path '*/tests/*' -print0 \
+  | sort -z | xargs -0 sha256sum > /etc/attendee/runtime-source.sha256
+docker run --rm --entrypoint bash \
+  -v /etc/attendee/runtime-source.sha256:/tmp/runtime-source.sha256:ro \
+  "$BOT_RUNTIME_IMAGE" -c 'cd /attendee && sha256sum --check --quiet /tmp/runtime-source.sha256'
+jq -n \
+  --arg image "$BOT_RUNTIME_IMAGE" \
+  --arg image_id "$RUNTIME_IMAGE_ID" \
+  --arg chrome "$CHROME_VERSION" \
+  --arg chromedriver "$CHROMEDRIVER_VERSION" \
+  --arg source_dir "$ATTENDEE_REPO_DIR" \
+  '{image: $image, image_id: $image_id, chrome: $chrome, chromedriver: $chromedriver, source_dir: $source_dir}' \
+  > /etc/attendee/runtime-release.json
+cat /etc/attendee/runtime-release.json
 
 systemctl daemon-reload
 systemctl disable attendee-bot-runner.service >/dev/null 2>&1 || true

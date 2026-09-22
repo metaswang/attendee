@@ -89,5 +89,24 @@ __pycache__/
 local_settings.py
 
 .env
+.env.*
+!.env.example
+*.env
+*.env.*
+!*.env.example
+*.key
+*.pem
+**/.env
+**/.env.*
+**/*.env
+**/*.env.*
+**/*.key
+**/*.pem
+!**/.env.example
+!**/*.env.example
+.git
+.venv
+data
+staticfiles
 db.sqlite3
 core

@@ -29,11 +29,17 @@
 
 ## 推荐自动构建流程
 
-从本地或已配置 `gcloud` 的运维环境执行：
+Docker image 必须先在 `myvps2` 构建并推送。三台 VPS、控制面的
+`BOT_RUNTIME_IMAGE` 与下列参数必须使用同一个 immutable digest；不要分别构建或只比较 `latest` 标签。
+然后从本机已配置的 `gcloud` SDK 执行 VM image 编排（builder 只 pull，不执行 Docker build）：
+
+若仓库的 pyenv/虚拟环境选中了 Python 3.9，先通过 `CLOUDSDK_PYTHON` 指定已安装的
+Python 3.11+（例如 `export CLOUDSDK_PYTHON="$(uv python find 3.11)"`）。否则当前 gcloud
+的 `compute ssh` 子命令可能加载失败，表现为 builder 一直等待 SSH。
 
 ```bash
 GCP_PROJECT_ID=<image-project> \
-BOT_RUNTIME_IMAGE=catblueberry/attendee-bot-runner:latest \
+BOT_RUNTIME_IMAGE=catblueberry/attendee-bot-runner@sha256:<release-digest> \
 scripts/gcp/build-golden-image.sh
 ```
 
@@ -44,6 +50,13 @@ scripts/gcp/build-golden-image.sh
 - base image: `projects/ubuntu-os-cloud/global/images/family/ubuntu-2204-lts`
 - image family: `attendee-bot-golden`
 - storage location: `asia`
+- 源码目录：`/voxella/voxella-attendee`，与控制面 `runtime_agent_env()` 的默认值一致
+- `BUILD_RUNTIME_IMAGE=false`，`PULL_RUNTIME_IMAGE=true`
+
+脚本排除部署 env、私钥和本地诊断数据。准备阶段会将源码清单写入
+`/etc/attendee/runtime-source.sha256`，逐文件核对其与 Docker image 内的内容，并将
+image digest、Chrome/ChromeDriver 版本和源码目录写入 `/etc/attendee/runtime-release.json`。
+任一源码校验不符就停止制作 image。
 
 `diskSizeGb` 会成为后续 GCP host VM 的 source image 最小 boot disk 要求。20GB 允许轻量实例直接使用 20GB；视频会议实例仍由 runtime class 扩展为 30GB 或 50GB。10GB 不作为生产默认值，120GB 这类过大的 builder disk 也应避免。
 
@@ -54,8 +67,8 @@ scripts/gcp/build-golden-image.sh
 ```bash
 sudo ATTENDEE_REPO_URL=https://github.com/<org>/<repo>.git \
   ATTENDEE_GIT_REF=main \
-  BOT_RUNTIME_IMAGE=asia-southeast1-docker.pkg.dev/<project>/<repo>/attendee-bot-runner:latest \
-  BUILD_RUNTIME_IMAGE=true \
+  BOT_RUNTIME_IMAGE=asia-southeast1-docker.pkg.dev/<project>/<repo>/attendee-bot-runner@sha256:<release-digest> \
+  BUILD_RUNTIME_IMAGE=false \
   PULL_RUNTIME_IMAGE=true \
   bash scripts/gcp/prepare-golden-image.sh
 ```
@@ -65,7 +78,7 @@ sudo ATTENDEE_REPO_URL=https://github.com/<org>/<repo>.git \
 - `ATTENDEE_REPO_URL`: 仓库地址，必填
 - `ATTENDEE_GIT_REF`: 构建所用分支或 tag，默认 `main`
 - `BOT_RUNTIME_IMAGE`: 需要预置到 golden image 的 runtime image，必填
-- `BUILD_RUNTIME_IMAGE`: 是否本机执行 `docker build --platform linux/amd64`，默认 `true`
+- `BUILD_RUNTIME_IMAGE`: 默认 `false`；生产 Docker build/push 只在 `myvps2` 执行
 - `PULL_RUNTIME_IMAGE`: 是否执行 `docker pull`，默认 `true`
 - `DOCKER_PLATFORM`: 默认 `linux/amd64`
 - `PYTHON_BIN`: 预期 Python 解释器；自动构建脚本默认传 `python3`
@@ -76,8 +89,8 @@ sudo ATTENDEE_REPO_URL=https://github.com/<org>/<repo>.git \
 
 1. 安装 Docker、`cloud-init` 和基础工具
 2. 拉取或更新仓库到指定 ref
-3. 执行 `docker build --platform linux/amd64 -f Dockerfile.bot-runtime -t $BOT_RUNTIME_IMAGE .`
-4. 执行 `docker pull $BOT_RUNTIME_IMAGE`
+3. 使用已经在 `myvps2` 构建、推送的 immutable Docker image
+4. 执行 `docker pull $BOT_RUNTIME_IMAGE`，检查 image 内源码与待烘焙源码一致
 5. 安装 `attendee-bot-runner` 和 systemd service
 6. 确保 `attendee-bot-runner.service` 处于 disabled 状态
 7. 输出 `df -h` 与 `/var/lib/docker` 占用，清理 apt cache、临时源码包和 Docker builder cache，再输出清理后的占用
@@ -114,6 +127,11 @@ GCP_BOT_SOURCE_IMAGE_PROJECT=<image-project>
 ```
 
 不要再同时设置固定的 `GCP_BOT_SOURCE_IMAGE`，否则会绕过 family。
+
+`BOT_RUNTIME_REDIS_URL` 必须是 GCP 可达的地址。当前生产使用
+`ad.voxstudio.me:6380/0` 的 TLS 入口，与 VPS 的 `10.88.0.3:6380/0` 为同一个 Redis
+实例；dev 使用 `ad.voxstudio.me:6363/0`。保留现有凭据和 DB，不要把 WireGuard 私网
+地址下发到没有该网段路由的 GCP VM。
 
 ## 当前仓库行为
 

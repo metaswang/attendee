@@ -195,7 +195,7 @@ class TestGCPRuntime(TestCase):
         clear=False,
     )
     @patch("bots.runtime_providers.gcp_compute_engine.compute_v1")
-    def test_startup_script_only_writes_runtime_env_and_restarts_service(self, mock_compute_v1):
+    def test_startup_script_refreshes_runtime_scripts_without_source_bootstrap(self, mock_compute_v1):
         mock_compute_v1.InstancesClient.return_value = MagicMock()
         mock_compute_v1.ZoneOperationsClient.return_value = MagicMock()
 
@@ -214,9 +214,19 @@ class TestGCPRuntime(TestCase):
         self.assertIn("systemctl daemon-reload", startup_script)
         self.assertIn("MEETBOT_RUNTIME_HOST_NAME=attendee-gcp-host-asia-southeast1-test", startup_script)
         self.assertNotIn("export MEETBOT_RUNTIME_HOST_NAME", startup_script)
+        repo_root = Path(__file__).resolve().parents[2]
+        # The host startup refreshes the runner/agent from the control-plane
+        # release. Bootstrap helpers inside the runner are not startup actions.
+        for source, marker in (
+            ("scripts/runtime_agent.py", "EOF_AGENT"),
+            ("scripts/digitalocean/attendee-bot-runner.sh", "EOF_RUNNER"),
+        ):
+            expected = (repo_root / source).read_text()
+            embedded = startup_script.split(f"<<'{marker}'\n", 1)[1].split(f"\n{marker}\n", 1)[0]
+            self.assertEqual(embedded, expected)
+            startup_script = startup_script.replace(embedded, "")
         self.assertNotIn("sync_attendee_source_archive", startup_script)
         self.assertNotIn("sync_attendee_repo", startup_script)
-        self.assertNotIn("attendee-bot-runner <<'EOF_RUNNER'", startup_script)
 
     @patch.dict(
         "os.environ",
