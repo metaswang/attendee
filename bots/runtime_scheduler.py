@@ -13,13 +13,13 @@ from django.utils import timezone
 
 from bots.models import Bot, BotRuntimeLease, BotRuntimeLeaseStatuses, BotRuntimeProviderTypes
 
-from .runtime_providers.host_runtime import runtime_agent_heartbeat_key
-
 logger = logging.getLogger(__name__)
 
 
-DEFAULT_VPS_TARGET_ORDER = ("myvps", "myvps3", "myvps2")
-DEFAULT_VPS_CAPACITY = {"myvps": 4, "myvps2": 2, "myvps3": 4}
+# VPS placement must be explicitly configured for each environment. Without it,
+# leave local slots disabled so the hybrid scheduler can use the cloud provider.
+DEFAULT_VPS_TARGET_ORDER = ()
+DEFAULT_VPS_CAPACITY = {}
 DEFAULT_GCP_VM_SLOT_CAPACITY = 4
 DEFAULT_GCP_IDLE_SHUTDOWN_SECONDS = 300
 DEFAULT_SLOT_TTL_SECONDS = 6 * 60 * 60
@@ -174,6 +174,9 @@ def pop_due_pending_bots(limit: int = 50) -> list[int]:
 
 
 def build_targets_snapshot() -> dict:
+    # Providers also import this scheduler; load the helper after module setup.
+    from .runtime_providers.host_runtime import runtime_agent_heartbeat_key
+
     snapshot = {
         "skip_vps": skip_vps_enabled(),
         "vps_target_order": vps_target_order(),

@@ -109,7 +109,7 @@ def _write_runtime_env(runtime_env: dict[str, str], path: Path) -> None:
 def _apply_host_bot_resource_overrides(runtime_env: dict[str, str]) -> None:
     """
     Per-VPS caps for docker: set on each host in /etc/attendee/runtime-agent.env via systemd.
-    Overrides scheduler payload so the same bot model can run with different CPU/mem on myvps vs myvps2.
+    Overrides scheduler payload with the CPU and memory limits configured for this host.
     """
     cpus = os.getenv("MEETBOT_RUNTIME_HOST_BOT_CPUS", "").strip()
     mem_limit = os.getenv("MEETBOT_RUNTIME_HOST_BOT_MEMORY_LIMIT", "").strip()
